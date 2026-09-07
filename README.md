@@ -124,7 +124,9 @@ python benchmarks/run_context_ttft.py \
 
 ## 2026-09 性能更新：W8A8 vs FP8（同硬件、同 180K 条件）
 
-2026-09-07 在同一台双 2080 Ti 上，把权重从 FP8 换成 W8A8（imatrix），保持 fp8_e4m3 KV + 180K 上下文 + MTP 不变，首字时间对比（与上方 2026-08-25 基线同条件）：
+2026-09-07 在同一台双 2080 Ti 上，把权重从 FP8 换成 W8A8（imatrix），保持 fp8_e4m3 KV + 180K 上下文不变，与上方 2026-08-25 基线同条件对比。W8A8 两列分别为 MTP3 与 MTP5。
+
+**首字时间 TTFT（越低越好）**
 
 | 实际输入 | FP8 + MTP3（上次基线） | W8A8 + MTP3 | W8A8 + MTP5 |
 | :-- | --: | --: | --: |
@@ -134,7 +136,28 @@ python benchmarks/run_context_ttft.py \
 | ~20K tokens | 14.78 s | **10.97 s（-26%）** | 11.35 s（-23%） |
 | ~60K tokens | 53.02 s | **41.11 s（-23%）** | 42.24 s（-20%） |
 
-- **W8A8（imatrix）权重量化是本轮最大单项收益**：首字时间降 19~29%，prefill 升 24~54%（SM75 无 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，W8A8 直接走 INT8 Tensor Core）。
+**Prefill 速度（越高越好）**
+
+| 实际输入 | FP8 + MTP3 | W8A8 + MTP3 | W8A8 + MTP5 |
+| :-- | --: | --: | --: |
+| 2.84K tokens | 1,099.8 tok/s | **1,361（+24%）** | 1,298（+18%） |
+| 5.64K tokens | 1,260.2 | **1,701（+35%）** | 1,652（+31%） |
+| 8.45K tokens | 1,311.2 | **1,855（+41%）** | 1,780（+36%） |
+| ~20K tokens | 1,337.6 | **1,900（+42%）** | 1,836（+37%） |
+| ~60K tokens | 1,117.3 | **1,517（+36%）** | 1,476（+32%） |
+
+**Decode 速度（128-token 流式口径，越高越好）**
+
+| 实际输入 | FP8 + MTP3 | W8A8 + MTP3 | W8A8 + MTP5 |
+| :-- | --: | --: | --: |
+| 2.84K tokens | 97.3 tok/s | 67.9（-30%） | 86.9（-11%） |
+| 5.64K tokens | 94.3 | 67.7（-28%） | 85.5（-9%） |
+| 8.45K tokens | 101.1 | 74.0（-27%） | 77.2（-24%） |
+| ~20K tokens | 101.3 | 78.9（-22%） | 70.7（-30%） |
+| ~60K tokens | 84.4 | 75.3（-11%） | 85.2（+1%） |
+
+- **W8A8（imatrix）权重量化是本轮最大单项收益**：首字时间降 19~29%，prefill 升 18~42%（SM75 无 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，W8A8 直接走 INT8 Tensor Core）。
+- **代价是 decode 略慢**（-11%~-30%，128-token 口径）；MTP5 的 decode 更接近 FP8 基线。长输出优先的场景可看 W4A16（decode 约 2×，TTFT 劣于 W8A8，见 reports）。
 - **MTP3 是甜点位**：MTP5 深层位置接收率坍缩（平均 44.8% vs 62.9%），不建议。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
