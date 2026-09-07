@@ -10,6 +10,7 @@
 | FlashInfer | 0.6.16.post3 | SM75 attention / decode 后端 | https://github.com/flashinfer-ai/flashinfer |
 | FlashQLA | 3ab27d77d8ca01d7a4718903b726add1a8886c0e | Qwen GDN/linear-attention 的 SM70/SM75 legacy prefill | https://github.com/weicj/FlashQLA-SM70-SM75 |
 | NCCL | 2.29.7 | 双卡 Tensor Parallel 通信 | https://github.com/NVIDIA/nccl |
+| Triton-Turing fork | 3.7.0+git82007a85（仅引用，未打包） | 2026-09 优化战役的 SM75 软件流水线 / FA2 实验（端到端 ≤0.4%，无加速，支线标记 OPEN） | https://github.com/Chennesxu/triton-turing（MIT） |
 
 ## 仓库内提供的本地改动
 
@@ -18,6 +19,8 @@
 - scripts/apply_gdn_flashqla_legacy.py：当 git apply 因上游小版本差异无法套用时，用于补充 GDN legacy backend 的辅助脚本。
 
 补丁来自已验证服务的工作树，不是 vLLM、FlashInfer 或 FlashQLA 的官方发布包。升级任一上游组件后必须重新验证。
+
+- reports/2026-09-sm75-optimization/ 收录 2026-09 优化战役的全部报告与原始 JSON（W8A8 / MTP / attention / Triton-Turing fork / W4A16 / INT8 KV 六条支线）。其中引用的 Triton-Turing fork 仅按其公开源码（commit 82007a85）标注版本，本仓库未包含其代码，许可跟随上游（MIT）；FlashQLA-SM70-SM75 同为 MIT。
 
 ## Chat template
 

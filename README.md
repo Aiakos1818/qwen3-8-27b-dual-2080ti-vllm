@@ -47,6 +47,7 @@ patches/      已验证工作树导出的 vLLM / FlashQLA patch
 scripts/      启动、硬件检查、FlashInfer 检查、GDN 辅助脚本
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
+reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
 ~~~
 
 ## 快速开始
@@ -121,6 +122,24 @@ python benchmarks/run_context_ttft.py \
 
 复现时应先锁定 docs/environment-lock.md，再按 benchmarks/README.md 的方法测试。相同硬件的合理验收范围是约 ±10%；显著偏离时按顺序检查：NVLink 是否为 NV2、TP 是否为 2、补丁是否生效、FlashQLA legacy 是否被日志选中、是否使用 FP8 KV、是否有其他 GPU 占用。
 
+## 2026-09 性能更新：W8A8 vs FP8（同硬件、同 180K 条件）
+
+2026-09-07 在同一台双 2080 Ti 上，把权重从 FP8 换成 W8A8（imatrix），保持 fp8_e4m3 KV + 180K 上下文 + MTP 不变，首字时间对比（与上方 2026-08-25 基线同条件）：
+
+| 实际输入 | FP8 + MTP3（上次基线） | W8A8 + MTP3 | W8A8 + MTP5 |
+| :-- | --: | --: | --: |
+| 2.84K tokens | 2.59 s | **2.09 s（-19%）** | 2.19 s（-15%） |
+| 5.64K tokens | 4.48 s | **3.32 s（-26%）** | 3.42 s（-24%） |
+| 8.45K tokens | 6.45 s | **4.56 s（-29%）** | 4.75 s（-26%） |
+| ~20K tokens | 14.78 s | **10.97 s（-26%）** | 11.35 s（-23%） |
+| ~60K tokens | 53.02 s | **41.11 s（-23%）** | 42.24 s（-20%） |
+
+- **W8A8（imatrix）权重量化是本轮最大单项收益**：首字时间降 19~29%，prefill 升 24~54%（SM75 无 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，W8A8 直接走 INT8 Tensor Core）。
+- **MTP3 是甜点位**：MTP5 深层位置接收率坍缩（平均 44.8% vs 62.9%），不建议。
+- 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
+- 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
+- **W8A8 未做业务侧质量回归，切换前请先评测。**
+
 ## 完整加载参数与用途
 
 | 参数 | 当前值 | 用途 |
@@ -178,9 +197,9 @@ sudo systemctl status qwen3.8-27b-vllm --no-pager
 
 - 模型权重不在本仓库内。请从拥有相应许可的来源获取模型。
 - 这是 SM75 / 2080 Ti 的特化配置，不能把它当作 H100、4090、A100 或无 NVLink 双卡的通用最优参数。
-- FP8 权重和 FP8 KV Cache 需要自行做业务精度回归，尤其是长上下文、数学、代码和工具调用。
+- FP8 权重和 FP8 KV Cache 需要自行做业务精度回归，尤其是长上下文、数学、代码和工具调用。W8A8 / W4A16 量化 checkpoint 同理（见 reports/2026-09-sm75-optimization/）。
 - 本仓库只公开部署配置和已导出的本地补丁；上游组件遵循各自许可证。
 
 ## 引用与致谢
 
-感谢并请引用：vLLM、PyTorch、Hugging Face Transformers、FlashInfer、FlashQLA-SM70-SM75、NCCL。详细链接和 commit 在 docs/ACCELERATION_AND_ATTRIBUTION.md。
+感谢并请引用：vLLM、PyTorch、Hugging Face Transformers、FlashInfer、FlashQLA-SM70-SM75、NCCL、Triton-Turing（SM75 fork，reports 战役引用）。详细链接、commit 和许可证在 docs/ACCELERATION_AND_ATTRIBUTION.md。

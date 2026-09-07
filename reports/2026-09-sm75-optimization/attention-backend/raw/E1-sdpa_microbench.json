@@ -1,0 +1,110 @@
+{
+  "metadata": {
+    "date": "2026-09-07T09:08:41.818028",
+    "device": "NVIDIA GeForce RTX 2080 Ti",
+    "capability": [
+      7,
+      5
+    ],
+    "head_dim": 256,
+    "note": "seq 59240 matches XL bench prompt tokens"
+  },
+  "tests": [
+    {
+      "ms": 24.525,
+      "tflops": 16.81,
+      "peak_vram_mb": 744,
+      "provider": "flashinfer_gqa24_4",
+      "N_CTX": 8192
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa24_4",
+      "N_CTX": 8192
+    },
+    {
+      "ms": 98.577,
+      "tflops": 16.73,
+      "peak_vram_mb": 968,
+      "provider": "flashinfer_gqa24_4",
+      "N_CTX": 16384
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa24_4",
+      "N_CTX": 16384
+    },
+    {
+      "ms": 390.148,
+      "tflops": 16.91,
+      "peak_vram_mb": 1416,
+      "provider": "flashinfer_gqa24_4",
+      "N_CTX": 32768
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa24_4",
+      "N_CTX": 32768
+    },
+    {
+      "ms": 1284.149,
+      "tflops": 16.79,
+      "peak_vram_mb": 2140,
+      "provider": "flashinfer_gqa24_4",
+      "N_CTX": 59240
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa24_4",
+      "N_CTX": 59240
+    },
+    {
+      "ms": 12.505,
+      "tflops": 16.49,
+      "peak_vram_mb": 632,
+      "provider": "flashinfer_gqa12_2_tp2",
+      "N_CTX": 8192
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa12_2_tp2",
+      "N_CTX": 8192
+    },
+    {
+      "ms": 49.577,
+      "tflops": 16.63,
+      "peak_vram_mb": 744,
+      "provider": "flashinfer_gqa12_2_tp2",
+      "N_CTX": 16384
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa12_2_tp2",
+      "N_CTX": 16384
+    },
+    {
+      "ms": 198.713,
+      "tflops": 16.6,
+      "peak_vram_mb": 968,
+      "provider": "flashinfer_gqa12_2_tp2",
+      "N_CTX": 32768
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa12_2_tp2",
+      "N_CTX": 32768
+    },
+    {
+      "ms": 645.196,
+      "tflops": 16.71,
+      "peak_vram_mb": 1332,
+      "provider": "flashinfer_gqa12_2_tp2",
+      "N_CTX": 59240
+    },
+    {
+      "error": "RuntimeError: No available kernel. Aborting execution.",
+      "provider": "sdpa_mem_eff_gqa12_2_tp2",
+      "N_CTX": 59240
+    }
+  ]
+}

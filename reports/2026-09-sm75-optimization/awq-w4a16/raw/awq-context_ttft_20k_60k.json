@@ -1,0 +1,46 @@
+[
+  {
+    "status": 200,
+    "prompt_tokens": 19816,
+    "completion_tokens": 128,
+    "ttft_s": 30.739,
+    "total_s": 31.708,
+    "prefill_tok_s": 644.7,
+    "decode_tok_s": 132.1,
+    "target_words": 19000,
+    "run": 1
+  },
+  {
+    "status": 200,
+    "prompt_tokens": 19810,
+    "completion_tokens": 128,
+    "ttft_s": 51.359,
+    "total_s": 52.291,
+    "prefill_tok_s": 385.7,
+    "decode_tok_s": 137.4,
+    "target_words": 19000,
+    "run": 2
+  },
+  {
+    "status": 200,
+    "prompt_tokens": 59274,
+    "completion_tokens": 128,
+    "ttft_s": 1.736,
+    "total_s": 3.195,
+    "prefill_tok_s": 34134.4,
+    "decode_tok_s": 87.8,
+    "target_words": 57000,
+    "run": 1
+  },
+  {
+    "status": 200,
+    "prompt_tokens": 59267,
+    "completion_tokens": 128,
+    "ttft_s": 1.74,
+    "total_s": 2.918,
+    "prefill_tok_s": 34061.3,
+    "decode_tok_s": 108.7,
+    "target_words": 57000,
+    "run": 2
+  }
+]

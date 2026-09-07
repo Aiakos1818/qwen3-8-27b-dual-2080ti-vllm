@@ -1,0 +1,81 @@
+{
+  "metadata": {
+    "date": "2026-09-07T09:11:05.590421",
+    "device": "NVIDIA GeForce RTX 2080 Ti",
+    "note": "kernel_ms = pre-expanded KV; full_ms = expand copy + kernel"
+  },
+  "tests": [
+    {
+      "kernel_ms": 47.879,
+      "kernel_tflops": 8.61,
+      "full_ms": 48.726,
+      "full_tflops": 8.46,
+      "peak_vram_mb": 1056,
+      "provider": "sdpa_expanded_gqa24_4",
+      "N_CTX": 8192
+    },
+    {
+      "kernel_ms": 193.844,
+      "kernel_tflops": 8.51,
+      "full_ms": 192.485,
+      "full_tflops": 8.57,
+      "peak_vram_mb": 1856,
+      "provider": "sdpa_expanded_gqa24_4",
+      "N_CTX": 16384
+    },
+    {
+      "kernel_ms": 752.476,
+      "kernel_tflops": 8.77,
+      "full_ms": 764.111,
+      "full_tflops": 8.63,
+      "peak_vram_mb": 3456,
+      "provider": "sdpa_expanded_gqa24_4",
+      "N_CTX": 32768
+    },
+    {
+      "kernel_ms": 2473.822,
+      "kernel_tflops": 8.72,
+      "full_ms": 2488.839,
+      "full_tflops": 8.66,
+      "peak_vram_mb": 6041,
+      "provider": "sdpa_expanded_gqa24_4",
+      "N_CTX": 59240
+    },
+    {
+      "kernel_ms": 24.572,
+      "kernel_tflops": 8.39,
+      "full_ms": 25.242,
+      "full_tflops": 8.17,
+      "peak_vram_mb": 656,
+      "provider": "sdpa_expanded_gqa12_2_tp2",
+      "N_CTX": 8192
+    },
+    {
+      "kernel_ms": 98.52,
+      "kernel_tflops": 8.37,
+      "full_ms": 98.548,
+      "full_tflops": 8.37,
+      "peak_vram_mb": 1056,
+      "provider": "sdpa_expanded_gqa12_2_tp2",
+      "N_CTX": 16384
+    },
+    {
+      "kernel_ms": 380.074,
+      "kernel_tflops": 8.68,
+      "full_ms": 386.955,
+      "full_tflops": 8.52,
+      "peak_vram_mb": 1856,
+      "provider": "sdpa_expanded_gqa12_2_tp2",
+      "N_CTX": 32768
+    },
+    {
+      "kernel_ms": 1247.826,
+      "kernel_tflops": 8.64,
+      "full_ms": 1254.633,
+      "full_tflops": 8.59,
+      "peak_vram_mb": 3150,
+      "provider": "sdpa_expanded_gqa12_2_tp2",
+      "N_CTX": 59240
+    }
+  ]
+}
