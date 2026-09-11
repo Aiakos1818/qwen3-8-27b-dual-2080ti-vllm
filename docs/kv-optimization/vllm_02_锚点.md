@@ -124,6 +124,31 @@ revert_J58k → revert_J30k → 相同重放 2：
 调参：`VLLM_MAMBA_CKPT_TOKENS`（cadence，须为 block_size 倍数）、
 `VLLM_MAMBA_CKPT_ANCHORS`（最迟-K 窗口大小，默认 3）。
 
+### 2.3 MTP（eagle drop）下的锚点边界（2026-09 修复）
+
+MTP 推测解码会让 `SpeculativeConfig.use_eagle()` 返回 True，于是
+`FullAttentionManager.find_longest_cache_hit` 在返回前 **多丢一个 block**
+（`hit_length -= min(alignment_tokens, block_size)`）。后果：在 `C` 处截断的请求，
+协调器最终只认到 `C - block_size`，而持久锚点在 `C` 上不可达 → Mamba 组退回更早的状态
+（实测 28800，而不是 32000；restore 后甚至 0）。
+
+修复（本分支）：**每个 cadence 同时保留两个锚点**——`C` 与 `C - block_size`：
+
+1. `scheduler._mamba_block_aligned_split` 额外在 `C - block_size` 停一个 prefill chunk，
+   保证该处有真实 SSM 快照；
+2. `MambaManager` 的持久保留条件改为 `_is_durable_boundary(end_tokens)`：
+   `end_tokens % C == 0` 或 `(end_tokens + block_size) % C == 0`；
+3. 窗口上限内部翻倍（`VLLM_MAMBA_CKPT_ANCHORS × 2`），使该 env 仍表示“近尾覆盖的
+   cadence 数”。
+
+实测（FP8 100k、MTP3）：`p03 control` 常驻截断 `keep=2 → cached=30400`（修复前 28800）。
+
+> **已知限制（restore 后深回退）**：pre-cadence 状态（`C - block_size`）位于 MTP 的
+> speculative-block 复用窗口内，会在被 pin 前就被复用覆盖，因此**不进入保活 entry / spill**。
+> 会话经 RAM/SSD restore 后，`keep=2` 深回退仍为 `cached=0`（退化为整段重算，无正确性问题、
+> sha 一致、0 NaN）；浅回退（`keep=3`）不受影响。需要 restore 后深回退也命中时，应作为
+> 后续工作处理（见 `reports/2026-09-fp8-kv/`）。
+
 ---
 
 ## 3. 语义与约束
@@ -245,7 +270,7 @@ revert_J58k → revert_J30k → 相同重放 2：
 | 环境变量 | 默认 | 含义 |
 |---|---|---|
 | `VLLM_MAMBA_CKPT_TOKENS` | `0`（关） | 锚点节奏（tokens）；须为 mamba block_size 整数倍；推荐 32000 |
-| `VLLM_MAMBA_CKPT_ANCHORS` | `3` | 每请求保留的最迟-K 锚点数（`max(1,·)`；TOKENS=0 时惰性） |
+| `VLLM_MAMBA_CKPT_ANCHORS` | `3` | 每请求保留的“近尾 cadence”数（`max(1,·)`；每个 cadence 实际保留 `C` 与 `C-block_size` 两个锚点，内部上限 ×2；TOKENS=0 时惰性） |
 | `VLLM_SPILL_NO_MAMBA` | `False` | 诊断：spill/保活时不捕获 Mamba 边界状态块 |
 
 指标（Prometheus，细则见 [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md)）：

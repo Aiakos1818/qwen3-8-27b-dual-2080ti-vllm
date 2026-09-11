@@ -6,7 +6,9 @@
 > 结论先行：**KV 优化与权重量化方式无关**。从 AWQ-INT4 换到 FP8 只需改模型路径 +
 > `--quantization fp8`、重标定 KV 池预算、并把 venv 的 `ninja` 放进 PATH（FP8 会启用
 > `norm_quant`/`act_quant` 融合，需 JIT 编译）。**无需改动任何 KV 优化代码**。
-> 唯一行为差异见 §5（restore 后的深回退锚点命中）。
+> 测试中发现并修复了一个 **MTP eagle-drop 导致锚点边界错位**的问题（常驻深回退
+> `keep=2` 由 28800 提升到 30400）；restore 后的深回退仍受 MTP speculative-block
+> 复用限制（详见 §5）。
 
 ## 1. 环境与配置
 
@@ -67,9 +69,9 @@
 
 ### 3.4 锚点（Mamba 深回退）
 
-- `p03 control`（A 常驻 → 截断回退）：`keep=2 → cached=28800`，`keep=3 → cached=46400`。
-  即常驻时锚点在 `32000` 边界附近提供了 **28800 token 的内部复用**（无锚点则为 0）。
-- `p03 test`（A → B 挤出 → A restore → 截断回退）：`keep=2 → cached=0`。
+- `p03 control`（A 常驻 → 截断回退）：`keep=2 → cached=30400`（MTP eagle-drop 后的边界；
+  修复前为 28800，见 §5），`keep=3 → cached=46400`。
+- `p03 test`（A → B 挤出 → A restore → 截断回退）：`keep=2 → cached=0`（restore 限制，见 §5）。
 
 ## 4. Phase 3 — SSD 分块 offload
 
@@ -104,17 +106,45 @@ restore sha 与 baseline 一致 → **SSD 分块 park/resume 字节正确**。
 | no NaN logits | ✓ `nans=0` |
 | **S3 restore + 深回退锚点** | ✗ `keep2=0 keep3=46400`（见 §5） |
 
-## 5. 唯一行为差异：restore 后的深回退锚点
+## 5. 唯一行为差异：restore 后的深回退锚点（已定位根因，常驻侧已修复）
 
 `p03 test` 与矩阵 S3 均显示：**会话经 RAM/SSD restore 后，`keep=2` 的截断回退不再命中
-Mamba 锚点（cached=0），而常驻时可命中（cached=28800）**。
+Mamba 锚点（cached=0）**。
 
-- 这是文档已记录的「restore 后的内部锚点保护弱于常驻」限制的体现；但在本 FP8 运行中比
-  AWQ 时代的记录（`keep2=32000`）更明显，直接表现为 0。
-- 影响：restore 后的深回退会退化为整段重算（**无正确性问题**，sha 仍一致、0 NaN）；
-  **浅回退（keep=3，尾部）仍正常命中**（`cached=46400`）。
-- 如需 restore 后深回退也命中锚点，需要后续排查（锚点随 spill/restore 的登记与
-  connector 重对齐路径）。不影响保活、RAM/SSD park/resume 与浅回退。
+### 5.1 根因（插桩确认）
+
+MTP 推测解码让 `SpeculativeConfig.use_eagle()` 返回 True，于是
+`FullAttentionManager.find_longest_cache_hit` 返回前 **多丢一个 block**
+（`hit_length -= min(alignment_tokens, block_size)`）：
+
+```
+DBG FA find max_len=32136 pre_drop=32000 drop_eagle=True post=30400
+DBG coord group idx=0 FullAttentionSpec new_hit=30400
+DBG coord group idx=1 MambaSpec          max_len=30400 new_hit=28800
+DBG coord final hit=28800
+```
+
+FA 组本来命中了 32000，但 eagle drop 把它压到 **30400**；协调器再拿 30400 去查 Mamba，
+持久锚点在 32000 不可达 → 退回 28800（restore 后连 28800 也没有 → 0）。
+**与 FP8 无关**（`use_eagle()` 只看 `method`，AWQ + MTP 同样如此）。
+
+### 5.2 修复（常驻侧）
+
+每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点：scheduler 额外在
+`C - block_size` 停一个 prefill chunk，`MambaManager` 的持久保留条件同步覆盖该边界，
+窗口上限内部 ×2。见 [`vllm_02_锚点.md`](../../docs/kv-optimization/vllm_02_锚点.md) §2.3。
+
+- `p03 control`（常驻截断）：**`keep=2 → cached=30400`**（修复前 28800），`keep=3 → 46400`。
+
+### 5.3 仍存在的限制
+
+pre-cadence 状态（`C - block_size`）位于 MTP 的 speculative-block 复用窗口内，会在被 pin
+前就被复用覆盖，因此**不进入保活 entry / spill**。所以 **restore + 深回退仍为 `cached=0`**。
+
+- 影响：restore 后的深回退退化为整段重算（**无正确性问题**，sha 仍一致、0 NaN）；
+  **浅回退（keep=3，尾部）正常命中**（`cached=46400`）。
+- 不修复该点需要改动 MTP 的 speculative-block 分配/复用路径，风险较高，留作后续工作。
+  不影响保活、RAM/SSD park/resume、常驻深回退与浅回退。
 
 ## 6. 切换量化类型的适配清单（实测确认）
 

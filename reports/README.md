@@ -28,11 +28,15 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | RAM restore 正确性 | sha `db8b8e836881534b` 与 baseline 一致，0 NaN |
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
 | SSD 真盘 park/resume | `R cached=81600 / 12.7s`，sha 一致，写 6.43 GiB / 读 3.16 GiB |
-| SSD 强制分块矩阵 | **16/17 PASS**（1 soft）；唯一失败：restore 后深回退锚点（`keep2=0`） |
+| SSD 强制分块矩阵 | **16/17 PASS**（1 soft）；唯一失败：restore 后深回退锚点（`keep2=0`，见下） |
 | 单元测试 | 110 passed |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
-唯一行为差异见报告 §5（restore 后深回退锚点）。
+
+测试中发现并修复：MTP 的 `use_eagle()` 让 full-attention finder 多丢一个 block，使 cadence
+锚点不可达。现在每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点，常驻深回退
+`keep=2` 由 28800 提升到 **30400**。restore 后深回退仍为 0（pre-cadence 状态被 MTP 的
+speculative-block 复用覆盖，未进 spill），属已知限制、无正确性影响（报告 §5）。
 
 ## 声明
 

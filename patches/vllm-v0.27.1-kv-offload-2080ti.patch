@@ -1,6 +1,6 @@
 diff --git a/tests/v1/core/test_host_tier_spill.py b/tests/v1/core/test_host_tier_spill.py
 new file mode 100644
-index 0000000..7dac38b
+index 000000000..7dac38bfc
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_spill.py
 @@ -0,0 +1,351 @@
@@ -357,7 +357,7 @@ index 0000000..7dac38b
 +    assert manager.block_pool.get_num_free_blocks() == free_before + 2
 diff --git a/tests/v1/core/test_host_tier_ssd.py b/tests/v1/core/test_host_tier_ssd.py
 new file mode 100644
-index 0000000..dc953f9
+index 000000000..dc953f925
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_ssd.py
 @@ -0,0 +1,344 @@
@@ -706,7 +706,7 @@ index 0000000..dc953f9
 +    store.shutdown()
 +    close_view(buf, view, flat)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
-index 939a2b0..851286a 100644
+index 939a2b08f..851286a15 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
 @@ -70,6 +70,12 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
@@ -723,7 +723,7 @@ index 939a2b0..851286a 100644
  
  @dataclass
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
-index fecce3d..b5c235d 100644
+index fecce3d28..b5c235dfd 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
 @@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
@@ -840,7 +840,7 @@ index fecce3d..b5c235d 100644
                  logger.debug(
                      "Skipping stale completed job %d (pre-reset counter: %d)",
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
-index 2119032..2267657 100644
+index 211903242..2267657a3 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
 @@ -329,6 +329,15 @@ class OffloadingConnectorWorker:
@@ -860,7 +860,7 @@ index 2119032..2267657 100644
          for job_id, entry in metadata.store_jobs.items():
              if not self._is_store_writer:
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-index a32d5d9..8cabdc7 100644
+index a32d5d9cc..8cabdc72c 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 @@ -67,6 +67,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -911,7 +911,7 @@ index a32d5d9..8cabdc7 100644
          assert self.connector_scheduler is not None
          self.connector_scheduler.update_connector_output(connector_output)
 diff --git a/vllm/envs.py b/vllm/envs.py
-index eb369a4..3f3a675 100755
+index eb369a4f1..3f3a67506 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -231,6 +231,39 @@ if TYPE_CHECKING:
@@ -1004,7 +1004,7 @@ index eb369a4..3f3a675 100755
      "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
          os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index a64b7e3..4cb11ad 100644
+index a64b7e321..4cb11ad9f 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -711,7 +711,13 @@ class BlockPool:
@@ -1081,7 +1081,7 @@ index a64b7e3..4cb11ad 100644
      def reset_prefix_cache(self) -> bool:
 diff --git a/vllm/v1/core/host_tier_ssd.py b/vllm/v1/core/host_tier_ssd.py
 new file mode 100644
-index 0000000..ea19854
+index 000000000..ea19854ea
 --- /dev/null
 +++ b/vllm/v1/core/host_tier_ssd.py
 @@ -0,0 +1,585 @@
@@ -1671,7 +1671,7 @@ index 0000000..ea19854
 +                logger.warning("HostTierSSDStore: region cleanup failed", exc_info=True)
 +            self._region = None
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 70cd267..e2ac02b 100644
+index 70cd26750..e2ac02b34 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
 @@ -168,7 +168,7 @@ class KVCacheCoordinator(ABC):
@@ -1717,7 +1717,7 @@ index 70cd267..e2ac02b 100644
  
      def allocate_new_computed_blocks(
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index fcb6772..82739c1 100644
+index fcb67726a..82739c1d0 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,19 +2,26 @@
@@ -2433,7 +2433,7 @@ index fcb6772..82739c1 100644
          self,
          request_id: str,
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 9aea061..8adaf23 100644
+index 9aea06109..8adaf23dd 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -122,6 +122,10 @@ class KVCacheBlock:
@@ -2448,7 +2448,7 @@ index 9aea061..8adaf23 100644
      # when the block is full and cached.
      _block_hash: BlockHashWithGroupId | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b4521a2..ed6a278 100644
+index b4521a2e1..5397393fc 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -2574,7 +2574,7 @@ index b4521a2..ed6a278 100644
  
          self.use_pp = self.parallel_config.pipeline_parallel_size > 1
          self.use_v2_model_runner = vllm_config.use_v2_model_runner
-@@ -414,6 +500,24 @@ class Scheduler(SchedulerInterface):
+@@ -414,6 +500,33 @@ class Scheduler(SchedulerInterface):
              if self.mamba_partial_cache_hit
              else 0
          )
@@ -2596,19 +2596,30 @@ index b4521a2..ed6a278 100644
 +            )
 +            if next_ckpt >= prefill_end:
 +                next_ckpt = 0
++        # MTP (speculative decoding) makes the full-attention finder drop one
++        # block (`use_eagle`), so a request that would reuse the cadence anchor
++        # at ``cadence`` is reconciled down to ``cadence - block_size`` and needs
++        # an SSM state exactly there. Materialize that pre-cadence boundary too
++        # (it is retained as a durable anchor by the MambaManager) so both the
++        # eagle-dropped and the plain lookup can reuse an anchor.
++        pre_ckpt = 0
++        if next_ckpt and next_ckpt - block_size > 0:
++            pre_ckpt = next_ckpt - block_size
          stops = (
              # Same invariant: a chunk starting mid-block stops at the boundary
              # rather than running past it.
-@@ -425,6 +529,8 @@ class Scheduler(SchedulerInterface):
+@@ -425,6 +538,10 @@ class Scheduler(SchedulerInterface):
              tail_boundary
              if last_cache_position < tail_boundary < request.num_prompt_tokens
              else 0,
 +            # Durable Mamba snapshot cadence boundary (see above).
 +            next_ckpt,
++            # Pre-cadence boundary for the MTP eagle drop (see above).
++            pre_ckpt,
              # Marconi shared-prefix junction, block-floored (a sub-block
              # junction's state is not separately cacheable): cache its state
              # so sibling requests sharing the prefix can reuse it.
-@@ -741,10 +847,31 @@ class Scheduler(SchedulerInterface):
+@@ -741,10 +858,31 @@ class Scheduler(SchedulerInterface):
                  connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                  did_prefix_cache_lookup = False
  
@@ -2640,7 +2651,7 @@ index b4521a2..ed6a278 100644
                      # Get locally-cached tokens.
                      if self.connector is not None:
                          # A KV connector transfers the missing suffix, which needs a
-@@ -765,6 +892,13 @@ class Scheduler(SchedulerInterface):
+@@ -765,6 +903,13 @@ class Scheduler(SchedulerInterface):
                              request.shared_prefix_boundary,
                          ) = self.kv_cache_manager.get_computed_blocks(request)
  
@@ -2654,7 +2665,7 @@ index b4521a2..ed6a278 100644
                      # Get externally-cached tokens if using a KVConnector.
                      if self.connector is not None:
                          # Present a block-aligned local hit to the connector so
-@@ -810,7 +944,11 @@ class Scheduler(SchedulerInterface):
+@@ -810,7 +955,11 @@ class Scheduler(SchedulerInterface):
                          else:
                              num_external_computed_tokens = ext_tokens
  
@@ -2667,7 +2678,7 @@ index b4521a2..ed6a278 100644
                              # No external tokens back the deeper local hit, so its
                              # resume boundary would have no valid Mamba state.
                              # Reconcile to the boundary every group agrees on.
-@@ -970,6 +1108,36 @@ class Scheduler(SchedulerInterface):
+@@ -970,6 +1119,36 @@ class Scheduler(SchedulerInterface):
                      # avoid deadlock and predictable preemptions.
                      reserved_blocks = self._inflight_prefill_reserved_blocks()
  
@@ -2704,7 +2715,7 @@ index b4521a2..ed6a278 100644
                  new_blocks = self.kv_cache_manager.allocate_slots(
                      request,
                      num_new_tokens,
-@@ -1916,6 +2084,11 @@ class Scheduler(SchedulerInterface):
+@@ -1916,6 +2095,11 @@ class Scheduler(SchedulerInterface):
  
              if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                  request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -2716,7 +2727,7 @@ index b4521a2..ed6a278 100644
  
              # Get prompt logprobs for this request.
              prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-@@ -2328,9 +2501,41 @@ class Scheduler(SchedulerInterface):
+@@ -2328,9 +2512,41 @@ class Scheduler(SchedulerInterface):
  
      def _free_blocks(self, request: Request):
          assert request.is_finished()
@@ -2758,7 +2769,7 @@ index b4521a2..ed6a278 100644
      @property
      def pause_state(self) -> PauseState:
          return self._pause_state
-@@ -2516,7 +2721,7 @@ class Scheduler(SchedulerInterface):
+@@ -2516,7 +2732,7 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.data if kv_connector_stats else None
          )
@@ -2767,7 +2778,7 @@ index b4521a2..ed6a278 100644
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
              num_skipped_waiting_reqs=len(self.skipped_waiting),
-@@ -2528,7 +2733,47 @@ class Scheduler(SchedulerInterface):
+@@ -2528,7 +2744,47 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -2815,7 +2826,7 @@ index b4521a2..ed6a278 100644
  
      def make_spec_decoding_stats(
          self,
-@@ -2553,6 +2798,12 @@ class Scheduler(SchedulerInterface):
+@@ -2553,6 +2809,12 @@ class Scheduler(SchedulerInterface):
          logger.debug_once("[shutdown] Scheduler: start")
          if self.kv_event_publisher:
              self.kv_event_publisher.shutdown()
@@ -2828,7 +2839,7 @@ index b4521a2..ed6a278 100644
          if self.connector is not None:
              self.connector.shutdown()
  
-@@ -2611,16 +2862,40 @@ class Scheduler(SchedulerInterface):
+@@ -2611,16 +2873,40 @@ class Scheduler(SchedulerInterface):
  
          return self.connector.request_finished_all_groups(request, block_ids)
  
@@ -2874,7 +2885,7 @@ index b4521a2..ed6a278 100644
              num_tokens_main_model=full_num_tokens,
              apply_admission_cap=True,
          )
-@@ -2632,6 +2907,732 @@ class Scheduler(SchedulerInterface):
+@@ -2632,6 +2918,732 @@ class Scheduler(SchedulerInterface):
              self._request_remaining_blocks(req) for req in self._inflight_prefills
          )
  
@@ -3607,7 +3618,7 @@ index b4521a2..ed6a278 100644
      def _update_waiting_for_remote_kv(self, request: Request) -> None:
          """
          KV Connector: update request state after async recv is finished.
-@@ -2724,6 +3725,7 @@ class Scheduler(SchedulerInterface):
+@@ -2724,6 +3736,7 @@ class Scheduler(SchedulerInterface):
  
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)
@@ -3616,7 +3627,7 @@ index b4521a2..ed6a278 100644
          # KV Connector:: update recv and send status from last step.
          for req_id in kv_connector_output.finished_recving or ():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75cf97f..3d8ad9d 100644
+index 75cf97f4f..0a86db2d5 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,8 @@ from collections import defaultdict
@@ -3654,7 +3665,7 @@ index 75cf97f..3d8ad9d 100644
  
      def _has_partial_local_hit(
          self,
-@@ -1275,6 +1287,31 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1275,6 +1287,34 @@ class MambaManager(SingleTypeKVCacheManager):
              # into a private cow_block; we record that block for connector
              # offload (see _pending_partial_tail_offloads).
              self._producer_partial_tail_reqs: dict[str, int] = {}
@@ -3680,13 +3691,16 @@ index 75cf97f..3d8ad9d 100644
 +            # one so the net in-flight footprint of this request stays flat.
 +            # That bounded footprint is what prevents the ~1.04x-concurrency
 +            # pool from being drained mid-prefill (which previously deadlocked
-+            # a single long prefill at small cadences).
-+            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS)
++            # a single long prefill at small cadences). Each cadence now keeps
++            # two anchors (``cadence`` and ``cadence - block_size``), so the
++            # cap is doubled to keep ``VLLM_MAMBA_CKPT_ANCHORS`` meaning
++            # "cadences of near-tail coverage".
++            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
 +            self._durable_win: dict[str, list[KVCacheBlock]] = {}
  
      @classmethod
      def find_longest_cache_hit(
-@@ -1440,9 +1477,55 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1440,9 +1480,73 @@ class MambaManager(SingleTypeKVCacheManager):
              ):
                  blocks = self.req_to_blocks[request_id]
                  if blocks[last_state_block_idx] != self._null_block:
@@ -3700,19 +3714,10 @@ index 75cf97f..3d8ad9d 100644
 +                    # this boundary can resume from it.
 +                    end_tokens = (last_state_block_idx + 1) * self.block_size
 +                    if (
-+                        self._ckpt_tokens
-+                        and end_tokens % self._ckpt_tokens == 0
-+                        and end_tokens <= processed_computed_tokens
++                        end_tokens <= processed_computed_tokens
++                        and self._is_durable_boundary(end_tokens)
 +                    ):
-+                        self.block_pool.pin_block(blk)
-+                        win = self._durable_win.setdefault(request_id, [])
-+                        win.append(blk)
-+                        if len(win) > self._ckpt_anchors:
-+                            # Keep the MOST RECENT anchors (reverts target the
-+                            # tail); retire the oldest one to keep this
-+                            # request's in-flight footprint flat.
-+                            oldest = win.pop(0)
-+                            self._release_durable_anchor(oldest)
++                        self._retain_durable_anchor(request_id, blk)
 +                    else:
 +                        self.block_pool.free_blocks([blk])
                      blocks[last_state_block_idx] = self._null_block
@@ -3725,6 +3730,33 @@ index 75cf97f..3d8ad9d 100644
 +        pinned forever and permanently shrink the pool."""
 +        self.block_pool.unpin_block(blk)
 +        self.block_pool.free_blocks([blk])
++
++    def _is_durable_boundary(self, end_tokens: int) -> bool:
++        """True at a durable snapshot boundary: the cadence itself, or one
++        block before it (MTP sets ``use_eagle``, so the full-attention finder
++        drops one block and a truncation at ``cadence`` needs the state at
++        ``cadence - block_size``)."""
++        if not self._ckpt_tokens:
++            return False
++        return (
++            end_tokens % self._ckpt_tokens == 0
++            or (end_tokens + self.block_size) % self._ckpt_tokens == 0
++        )
++
++    def _retain_durable_anchor(
++        self, request_id: str, blk: KVCacheBlock
++    ) -> None:
++        """Pin ``blk`` and hand it to this request's durable window (newest
++        last), retiring the oldest anchor past the cap. No-op if the block is
++        already in the window (avoids a duplicate unpin at finish)."""
++        win = self._durable_win.setdefault(request_id, [])
++        if any(b is blk for b in win):
++            return
++        self.block_pool.pin_block(blk)
++        win.append(blk)
++        if len(win) > self._ckpt_anchors:
++            oldest = win.pop(0)
++            self._release_durable_anchor(oldest)
 +
 +    def take_durable_window(self, request_id: str) -> list[KVCacheBlock]:
 +        """Hand over this request's surviving durable anchors to the caller
@@ -3743,7 +3775,7 @@ index 75cf97f..3d8ad9d 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          cascade attention is not supported by mamba
-@@ -1468,6 +1551,18 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1468,6 +1572,18 @@ class MambaManager(SingleTypeKVCacheManager):
              # To put it in the next step, we return num_gpu_blocks + 1 so
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
@@ -3762,7 +3794,7 @@ index 75cf97f..3d8ad9d 100644
              return self.block_pool.num_gpu_blocks + 1
          if self.mamba_cache_mode != "align":
              # Allocate extra `num_speculative_blocks` blocks for
-@@ -1655,6 +1750,13 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1655,6 +1771,13 @@ class MambaManager(SingleTypeKVCacheManager):
              self._allocated_block_reqs.discard(request_id)
              self.last_state_block_idx.pop(request_id, None)
              self._producer_partial_tail_reqs.pop(request_id, None)
@@ -3777,7 +3809,7 @@ index 75cf97f..3d8ad9d 100644
              # not reach the connector: its unpin hook (free) has already run.
              self._pending_partial_tail_offloads = [
 diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
-index 40b57ac..2886c89 100644
+index 40b57ac86..2886c8960 100644
 --- a/vllm/v1/kv_offload/cpu/gpu_worker.py
 +++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
 @@ -143,9 +143,9 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
@@ -3806,7 +3838,7 @@ index 40b57ac..2886c89 100644
                  )
  
 diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
-index 290c0d5..525e4ca 100644
+index 290c0d510..525e4ca28 100644
 --- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
 +++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
 @@ -69,9 +69,9 @@ class SharedOffloadRegion:
@@ -3822,7 +3854,7 @@ index 290c0d5..525e4ca 100644
          except FileExistsError:
              self.fd = os.open(self.mmap_path, os.O_RDWR)
 diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
-index 054bf34..21f7228 100644
+index 054bf3406..21f722817 100644
 --- a/vllm/v1/kv_offload/cpu/spec.py
 +++ b/vllm/v1/kv_offload/cpu/spec.py
 @@ -146,6 +146,23 @@ class CPUOffloadingSpec(OffloadingSpec):
@@ -3850,7 +3882,7 @@ index 054bf34..21f7228 100644
          mmap_region: SharedOffloadRegion | None = None
          # num_blocks == 0 would size the region to zero bytes, which cannot be
 diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
-index 692106c..e36fe3e 100644
+index 692106cf3..e36fe3ec8 100644
 --- a/vllm/v1/metrics/loggers.py
 +++ b/vllm/v1/metrics/loggers.py
 @@ -629,6 +629,216 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -4142,7 +4174,7 @@ index 692106c..e36fe3e 100644
                  self.spec_decoding_prom.observe(
                      scheduler_stats.spec_decoding_stats, engine_idx
 diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
-index 3956f7e..6466d5b 100644
+index 3956f7e44..6466d5bb8 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
 @@ -206,6 +206,32 @@ class SchedulerStats:
@@ -4179,7 +4211,7 @@ index 3956f7e..6466d5b 100644
      running_lora_adapters: dict[str, int] = field(default_factory=dict)
  
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
-index c02c335..d58fa0d 100644
+index c02c3350d..d58fa0de6 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/vllm/v1/spec_decode/llm_base_proposer.py
 @@ -8,6 +8,7 @@ import numpy as np
