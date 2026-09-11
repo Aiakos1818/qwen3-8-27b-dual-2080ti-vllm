@@ -1,0 +1,107 @@
+[PASS] server alive 
+metrics@start {'vllm:host_tier_ssd_sessions': 0.0, 'vllm:host_tier_ssd_bytes_used': 0.0, 'vllm:host_tier_ssd_quota_bytes': 0.0, 'vllm:host_tier_ssd_stores_total': 0.0, 'vllm:host_tier_ssd_stores_created': 1789154926.570753, 'vllm:host_tier_ssd_restores_total': 0.0, 'vllm:host_tier_ssd_restores_created': 1789154926.5707717, 'vllm:host_tier_ssd_evictions_total': 0.0, 'vllm:host_tier_ssd_evictions_created': 1789154926.5707874, 'vllm:host_tier_ssd_drops_total': 0.0, 'vllm:host_tier_ssd_drops_created': 1789154926.5708022, 'vllm:host_tier_ssd_write_bytes_total': 0.0, 'vllm:host_tier_ssd_write_bytes_created': 1789154926.5708168, 'vllm:host_tier_ssd_read_bytes_total': 0.0, 'vllm:host_tier_ssd_read_bytes_created': 1789154926.571025}
+
+===== S3 test: p03_restore_revert.py test =====
+[A full resident] prompt=48160 cached=0 wall=40.0s
+[B full (forces A spill)] prompt=64187 cached=0 wall=58.4s
+[A resume (restore)] prompt=48160 cached=46400 wall=2.1s
+[revert keep=2 after restore] prompt=32137 cached=0 wall=25.9s
+[revert keep=3 after restore] prompt=48164 cached=46400 wall=2.1s
+P03-DONE
+
+===== S3 test rc=0 wall=137s =====
+[FAIL] S3 SSD restore + deep revert keep2=0 keep3=46400
+
+===== S1 baseline: correctness_check.py baseline =====
+{"name": "S", "prompt": 48142, "cached": 0, "out_tokens": 1, "sha": "e3b0c44298fc1c14", "head": ""}
+{"name": "R-resident", "prompt": 48152, "cached": 46400, "out_tokens": 55, "sha": "db8b8e836881534b", "head": "\n\nOK"}
+RESULT {"mode": "baseline", "sha": "db8b8e836881534b"}
+
+===== S1 baseline rc=0 wall=55s =====
+[PASS] S1 baseline ran sha=db8b8e836881534b
+[PASS] S1 baseline sha expected db8b8e836881534b != db8b8e836881534b
+
+===== S2 offload: correctness_check.py offload =====
+{"name": "S", "prompt": 48142, "cached": 46400, "out_tokens": 1, "sha": "e3b0c44298fc1c14", "head": ""}
+{"name": "T", "prompt": 60133, "cached": 0, "out_tokens": 1, "sha": "e3b0c44298fc1c14", "head": ""}
+{"name": "R-restored", "prompt": 48152, "cached": 46400, "out_tokens": 55, "sha": "db8b8e836881534b", "head": "\n\nOK"}
+RESULT {"mode": "offload", "sha": "db8b8e836881534b"}
+
+===== S2 offload rc=0 wall=69s =====
+[PASS] S2 SSD park/resume ran sha=db8b8e836881534b
+[PASS] S2 sha matches baseline db8b8e836881534b vs db8b8e836881534b
+[PASS] S2 used the SSD tier restores+=1.0
+[PASS] S2 restored from cache cached=46400
+[quota-21 fill] prompt=48127 cached=0 wall=39.4s
+[quota-22 fill] prompt=48127 cached=0 wall=38.9s
+[quota-23 fill] prompt=48127 cached=0 wall=39.1s
+[quota-24 fill] prompt=48127 cached=0 wall=39.0s
+[quota-25 fill] prompt=48127 cached=0 wall=39.2s
+metrics@quota {'vllm:host_tier_ssd_sessions': 1.0, 'vllm:host_tier_ssd_bytes_used': 2005401600.0, 'vllm:host_tier_ssd_quota_bytes': 3000000000.0, 'vllm:host_tier_ssd_stores_total': 5.0, 'vllm:host_tier_ssd_stores_created': 1789154926.570753, 'vllm:host_tier_ssd_restores_total': 1.0, 'vllm:host_tier_ssd_restores_created': 1789154926.5707717, 'vllm:host_tier_ssd_evictions_total': 3.0, 'vllm:host_tier_ssd_evictions_created': 1789154926.5707874, 'vllm:host_tier_ssd_drops_total': 5.0, 'vllm:host_tier_ssd_drops_created': 1789154926.5708022, 'vllm:host_tier_ssd_write_bytes_total': 9525657600.0, 'vllm:host_tier_ssd_write_bytes_created': 1789154926.5708168, 'vllm:host_tier_ssd_read_bytes_total': 1838284800.0, 'vllm:host_tier_ssd_read_bytes_created': 1789154926.571025}
+[PASS] S4 quota stores stores+=3.0
+[PASS] S4 quota LRU eviction evictions+=2.0
+[PASS] S4 quota sessions bounded sessions=1.0
+[quota-21 resume after eviction] prompt=48127 cached=0 wall=39.0s
+[PASS] S4 resume after eviction 
+
+===== S5 concurrency: p15_concurrent.py =====
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+PASS 1 cold_cached=[0, 0, 0, 0]
+PASS 1 warm_cached=[33600, 33600, 33600, 33600]
+PASS 1 warm_sha=['e3b0c44298fc1c14', 'e3b0c44298fc1c14', 'e3b0c44298fc1c14', 'e3b0c44298fc1c14']
+[call] prompt=36099 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36099 cached=0 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+[call] prompt=36114 cached=33600 sha=e3b0c44298fc1c14
+PASS 2 cold_cached=[33600, 33600, 0, 0]
+PASS 2 warm_cached=[33600, 33600, 33600, 33600]
+PASS 2 warm_sha=['e3b0c44298fc1c14', 'e3b0c44298fc1c14', 'e3b0c44298fc1c14', 'e3b0c44298fc1c14']
+P15-BAD []
+P15-DONE
+
+===== S5 concurrency rc=0 wall=208s =====
+[PASS] S5 concurrency ran 
+[PASS] S5 concurrency no mismatch 
+
+===== S3 control: p03_restore_revert.py control =====
+[A full resident] prompt=48160 cached=0 wall=44.2s
+[revert keep=2 (expect anchor ~32k)] prompt=32137 cached=0 wall=25.9s
+[revert keep=3 (expect ~48k)] prompt=48164 cached=46400 wall=2.0s
+P03-DONE
+
+===== S3 control rc=0 wall=81s =====
+[SOFT] S3 control revert keep2=0 keep3=46400
+[PASS] no NaN logits in trace nans=0
+[PASS] server still alive 
+metrics@end {'vllm:host_tier_ssd_sessions': 1.0, 'vllm:host_tier_ssd_bytes_used': 1838284800.0, 'vllm:host_tier_ssd_quota_bytes': 3000000000.0, 'vllm:host_tier_ssd_stores_total': 14.0, 'vllm:host_tier_ssd_stores_created': 1789154926.570753, 'vllm:host_tier_ssd_restores_total': 6.0, 'vllm:host_tier_ssd_restores_created': 1789154926.5707717, 'vllm:host_tier_ssd_evictions_total': 7.0, 'vllm:host_tier_ssd_evictions_created': 1789154926.5707874, 'vllm:host_tier_ssd_drops_total': 14.0, 'vllm:host_tier_ssd_drops_created': 1789154926.5708022, 'vllm:host_tier_ssd_write_bytes_total': 23117824000.0, 'vllm:host_tier_ssd_write_bytes_created': 1789154926.5708168, 'vllm:host_tier_ssd_read_bytes_total': 8801484800.0, 'vllm:host_tier_ssd_read_bytes_created': 1789154926.571025}
+
+===== SSD MATRIX SUMMARY =====
+PASS  server alive  
+FAIL  S3 SSD restore + deep revert  keep2=0 keep3=46400
+PASS  S1 baseline ran  sha=db8b8e836881534b
+PASS  S1 baseline sha expected  db8b8e836881534b != db8b8e836881534b
+PASS  S2 SSD park/resume ran  sha=db8b8e836881534b
+PASS  S2 sha matches baseline  db8b8e836881534b vs db8b8e836881534b
+PASS  S2 used the SSD tier  restores+=1.0
+PASS  S2 restored from cache  cached=46400
+PASS  S4 quota stores  stores+=3.0
+PASS  S4 quota LRU eviction  evictions+=2.0
+PASS  S4 quota sessions bounded  sessions=1.0
+PASS  S4 resume after eviction  
+PASS  S5 concurrency ran  
+PASS  S5 concurrency no mismatch  
+SOFT  S3 control revert  keep2=0 keep3=46400
+PASS  no NaN logits in trace  nans=0
+PASS  server still alive  
+SSD-MATRIX-FAILED (16/17; 1 soft)

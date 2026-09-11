@@ -37,10 +37,19 @@
 ## 相关入口
 
 - 启动脚本：`scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh`、`scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh`
+- FP8 权重 profile：`scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh`（见下）
 - 观测面板：`scripts/monitor_host_tier.py`
 - 验证脚本：`scripts/ssd_matrix.py`、`scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、`scripts/correctness_check.py`
-- 环境变量样例：`config/vllm-435k-ssd.env.example`
+- 环境变量样例：`config/vllm-435k-ssd.env.example`、`config/vllm-fp8-100k.env.example`
 - 打补丁步骤：`docs/PATCHING.md`
+
+## 与权重量化无关（FP8 实测）
+
+KV 优化操作的是 KV 块，与权重是 AWQ-INT4 / FP8 无关。FP8 权重 100K 全流程实测
+（RAM + SSD）见 [`reports/2026-09-fp8-kv/`](../../reports/2026-09-fp8-kv/)。切换量化类型
+只需：改 `--quantization` + 模型路径、重标定 `KV_CACHE_MEMORY_BYTES`（权重变大）、把
+venv 的 `ninja` 放进 PATH（FP8 启用 `norm_quant`/`act_quant` 融合）。唯一行为差异：
+restore 后的深回退锚点命中（见报告 §5）。
 
 > 文档中按名称提到的 `probe_*` / `revert_*` / `resident_*` 等脚本为开发期定向探测，
 > 未随本仓库发布；结论已全部写入上述专题文档。

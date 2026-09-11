@@ -1,0 +1,10 @@
+[s1] prompt=50238 cached=0 wall=46.8s
+[s2] prompt=50238 cached=0 wall=43.6s
+[resume-s1] prompt=50255 cached=48000 wall=2.9s
+[s3] prompt=50238 cached=0 wall=46.7s
+[resume-s2] prompt=50255 cached=0 wall=44.2s
+[resume-s3] prompt=50255 cached=48000 wall=2.8s
+[resume-s1b] prompt=50255 cached=48000 wall=2.8s
+[small] prompt=2151 cached=0 wall=1.5s
+[resume-s2b] prompt=50255 cached=0 wall=44.4s
+MATRIX-DONE

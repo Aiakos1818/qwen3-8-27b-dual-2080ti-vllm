@@ -1,0 +1,32 @@
+=== Phase 1 (RAM parking) engine startup ===
+INFO 09-12 01:33:06 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-12 01:34:57 [qwen3_5_mtp.py:106] VLLM_QWOPUS_MTP_BF16_DRAFT=1: loading Qwen3.5 MTP draft fc without the target quantization config when needed; draft layer quantization=fp8
+INFO 09-12 01:35:08 [interface.py:911] Setting attention block size to 1600 tokens to ensure that attention page size is >= mamba page size.
+INFO 09-12 01:35:08 [interface.py:935] Padding mamba page size by 0.25% to ensure that mamba page size and attention page size are exactly equal.
+INFO 09-12 01:35:08 [model_runner.py:329] Model loading took 14.96 GiB and 69.489783 seconds
+INFO 09-12 01:35:08 [model_runner.py:329] Model loading took 14.96 GiB and 69.490381 seconds
+INFO 09-12 01:35:18 [flashinfer.py:823] FlashInfer resolved query dtypes: prefill=torch.float16, decode=torch.float16, decode_backend=flashinfer-native, kv_cache_dtype=torch.float8_e4m3fn, arch=sm75
+INFO 09-12 01:35:18 [gpu_worker.py:491] Initial free memory 20.59 GiB, reserved 2.14 GiB memory for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling. This does not respect the gpu_memory_utilization config. Only use kv_cache_memory_bytes config when you want manual control of KV cache memory size. If OOM'ed, check the difference of initial free memory between the current run and the previous run where kv_cache_memory_bytes is suggested and update it correspondingly.
+INFO 09-12 01:35:18 [gpu_worker.py:491] Initial free memory 21.11 GiB, reserved 2.14 GiB memory for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling. This does not respect the gpu_memory_utilization config. Only use kv_cache_memory_bytes config when you want manual control of KV cache memory size. If OOM'ed, check the difference of initial free memory between the current run and the previous run where kv_cache_memory_bytes is suggested and update it correspondingly.
+INFO 09-12 01:35:18 [kv_cache_utils.py:2239] GPU KV cache size: 106,288 tokens
+INFO 09-12 01:35:21 [qwen_triton_warmup.py:270] Warming up Qwen Triton kernels for model_type=qwen3_5_text.
+INFO 09-12 01:35:40 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+(Worker_TP1 pid=844049) INFO 09-12 01:35:21 [qwen_triton_warmup.py:270] Warming up Qwen Triton kernels for model_type=qwen3_5_text.
+
+=== Phase 3 (real-NVMe SSD) engine startup ===
+INFO 09-12 02:25:40 [kv_cache_utils.py:2239] GPU KV cache size: 106,288 tokens
+INFO 09-12 02:25:40 [shared_offload_region.py:71] Created mmap file /dev/shm/vllm_offload_a5bb526d-c94e-4b54-8f2b-96993b075dda.mmap (3.68 GiB)
+INFO 09-12 02:26:07 [host_tier_ssd.py:126] HostTierSSDStore: root=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv/a5bb526d-c94e-4b54-8f2b-96993b075dda_02fe1f20e381/sessions quota=8.00GiB O_DIRECT=True
+INFO 09-12 02:26:07 [scheduler.py:2938] HostTierSSD: staging_slots=71 chunk_slots=35 evict_small=32000 block_size=1600
+
+=== Matrix (tmpfs forced chunk) engine startup ===
+INFO 09-12 03:28:04 [kv_cache_utils.py:2239] GPU KV cache size: 128,324 tokens
+INFO 09-12 03:28:40 [host_tier_ssd.py:126] HostTierSSDStore: root=/dev/shm/ssd_test/03f3acb0-c07c-46ca-ba7b-6091993ef9b0_dc35236143b2/sessions quota=2.79GiB O_DIRECT=True
+INFO 09-12 03:28:40 [scheduler.py:2938] HostTierSSD: staging_slots=17 chunk_slots=8 evict_small=32000 block_size=1600
+INFO 09-12 03:33:10 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-8a1960d6f10e27a1-ad8dc6ef (52800 tokens, 1838284800 bytes)
+INFO 09-12 03:35:28 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-8f293c03749d83fa-b3e99706 (52800 tokens, 1838284800 bytes)
+INFO 09-12 03:36:46 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-83a4bb0b2b6a5aee-86db4ec9 (57600 tokens, 2005401600 bytes)
+INFO 09-12 03:38:11 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-920ef6df2997d44b-8b25428c (57600 tokens, 2005401600 bytes)
+INFO 09-12 03:39:31 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-b77249beae4da30f-a46581a9 (57600 tokens, 2005401600 bytes)
+INFO 09-12 03:42:24 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-a86015bd2df8a484-afb42684 (40000 tokens, 1392640000 bytes)
+INFO 09-12 03:42:24 [host_tier_ssd.py:288] HostTierSSDStore: evicted session chatcmpl-af854de1362b309f-ba427435 (40000 tokens, 1392640000 bytes)

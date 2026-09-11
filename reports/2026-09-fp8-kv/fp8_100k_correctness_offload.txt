@@ -1,0 +1,4 @@
+{"name": "S", "prompt": 48142, "cached": 46400, "out_tokens": 1, "sha": "e3b0c44298fc1c14", "head": ""}
+{"name": "T", "prompt": 60133, "cached": 0, "out_tokens": 1, "sha": "e3b0c44298fc1c14", "head": ""}
+{"name": "R-restored", "prompt": 48152, "cached": 46400, "out_tokens": 55, "sha": "db8b8e836881534b", "head": "\n\nOK"}
+RESULT {"mode": "offload", "sha": "db8b8e836881534b"}

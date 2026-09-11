@@ -61,6 +61,9 @@ def run(name, msgs, max_tokens):
 
 
 TAIL = "请只回答：OK"
+# Some checkpoints spend the first tokens in the thinking channel, so a small cap
+# can leave `content` empty (and the sha meaningless). Override when needed.
+MAX_OUT = int(os.environ.get("KV_CHECK_MAX_TOKENS", "32"))
 
 
 def main():
@@ -69,12 +72,12 @@ def main():
     R = build(7, 3, 16000, tail=TAIL)
     if mode == "baseline":
         run("S", S, 1)
-        out = run("R-resident", R, 32)
+        out = run("R-resident", R, MAX_OUT)
     elif mode == "offload":
         T = build(8, 4, 15000)      # ~62k, bigger than free -> spills S
         run("S", S, 1)
         run("T", T, 1)
-        out = run("R-restored", R, 32)
+        out = run("R-restored", R, MAX_OUT)
     else:
         raise SystemExit("mode: baseline|offload")
     print("RESULT", json.dumps({"mode": mode, "sha": out["sha"]}))
