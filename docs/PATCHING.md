@@ -9,9 +9,14 @@ git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout v0.27.1
 git apply /path/to/qwen3-8-27b-dual-2080ti-vllm/patches/vllm-v0.27.1-sm75-qwen3.8.patch
+git apply /path/to/qwen3-8-27b-dual-2080ti-vllm/patches/vllm-v0.27.1-kv-offload-2080ti.patch
 python -m pip install -U pip
 python -m pip install -e .
 ~~~
+
+`vllm-v0.27.1-kv-offload-2080ti.patch` 是 **KV 优化补丁**（会话保活、Mamba 锚点、
+GPU↔RAM/SSD 分层 offload 与分块流式、指标面板），必须**在基础补丁之后**应用。
+设计与实测见 `docs/kv-optimization/`。
 
 本次验证环境：Python 3.12.3 + PyTorch 2.13.0+cu130。
 

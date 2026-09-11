@@ -41,10 +41,11 @@
 ## 目录
 
 ~~~text
-config/       环境变量样例
+config/       环境变量样例（含 100K / 435K-SSD KV 优化 profile）
 docs/         打补丁、加速组件和引用说明
-patches/      已验证工作树导出的 vLLM / FlashQLA patch
-scripts/      启动、硬件检查、FlashInfer 检查、GDN 辅助脚本
+docs/kv-optimization/  KV 优化专题（保活 / 锚点 / RAM+SSD offload / 面板）
+patches/      已验证工作树导出的 vLLM / FlashQLA patch（含 KV 优化补丁）
+scripts/      启动、硬件检查、KV 启动 profile、监控与验证脚本
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
 reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
@@ -163,6 +164,47 @@ python benchmarks/run_context_ttft.py \
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**
 
+## KV 优化：长会话保活 / Mamba 锚点 / GPU↔SSD 分层 offload
+
+上面是**基础部署**（180K 单请求）。在其之上，本仓库还公开一套面向**长上下文多会话 agent**
+场景的 KV 缓存优化分支，补丁为 `patches/vllm-v0.27.1-kv-offload-2080ti.patch`
+（在基础补丁 `vllm-v0.27.1-sm75-qwen3.8.patch` **之后**应用）。
+
+解决的问题：`max-num-seqs=1` 下，前缀缓存池满时旧会话整链被驱逐，下次重发**全量重算**；
+从历史中间 revert/截断重发也会整段重算。
+
+| 机制 | 作用 | 文档 |
+| --- | --- | --- |
+| **会话保活（keep-alive pin）** | 结束且 ≥16k token 的会话整链 pin 出可驱逐池；准入放不下时按“缓存最小的先出”释放，回来仍全命中。 | [vllm_01_保活](docs/kv-optimization/vllm_01_保活.md) |
+| **Mamba/GDN 锚点** | 按 cadence（默认 32k）落持久状态快照；中间分叉从最近锚点续跑，最迟-K 窗口防卡死。 | [vllm_02_锚点](docs/kv-optimization/vllm_02_锚点.md) |
+| **GPU↔RAM/SSD 分层 offload** | 会话整链 park 到 RAM 或 SSD，回来 restore；**分块流式**使会话大小不再受 CPU staging 限制。 | [vllm_03 RAM](docs/kv-optimization/vllm_03_offload_ram.md) · [vllm_04 SSD](docs/kv-optimization/vllm_04_offload_ssd.md) |
+| **观测面板** | Prometheus 指标 + `scripts/monitor_host_tier.py` 实时面板（保活 / 锚点 / RAM+SSD 池 / I/O）。 | [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md) |
+
+启动 profile：
+
+~~~bash
+# 100K 池，小尺度实验台（RAM parking；SSD 可选）
+bash scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh
+
+# 435K 上下文，SSD-only 两层 offload（分块流式，无会话大小上限）
+cp config/vllm-435k-ssd.env.example .env   # 填 MODEL_PATH / VLLM_PYTHON / VLLM_SSD_ROOT
+bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
+~~~
+
+实测（2×RTX 2080Ti 22GB，TP=2，AWQ-INT4 + fp8_e4m3 KV，KV 池 9e9 B → 489,789 tokens）：
+
+- 435K 会话（281 slot ≈ 13.8 GiB，9 个 chunk）park→resume：**cached=390,400，sha 一致，0 NaN**；
+  真 NVMe 写 **27.1 GiB** / 读 **13.3 GiB**，写 0.93 GiB/s、读 1.68 GiB/s。
+- 保活开启后，55k 会话被挤压仍 **52,800/52,800 全命中**（旧行为为 0/全量重算）。
+- 深回退从锚点续跑：72k 截断 cached=64,000（整段重算需 43s）。
+- 写中 SIGKILL 原子性、分块流式功能矩阵 17/17（1 soft）通过。
+
+复现/验证脚本：`scripts/monitor_host_tier.py`、`scripts/ssd_matrix.py`、
+`scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、
+`scripts/correctness_check.py`。指标与 env 总表见 [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md)。
+
+> 文档中的字节一律 1024（`GiB`/`MiB/s`），token 一律 1000（`k=1000`）。
+
 ## 完整加载参数与用途
 
 | 参数 | 当前值 | 用途 |
@@ -226,3 +268,5 @@ sudo systemctl status qwen3.8-27b-vllm --no-pager
 ## 引用与致谢
 
 感谢并请引用：vLLM、PyTorch、Hugging Face Transformers、FlashInfer、FlashQLA-SM70-SM75、NCCL、Triton-Turing（SM75 fork，reports 战役引用）。详细链接、commit 和许可证在 docs/ACCELERATION_AND_ATTRIBUTION.md。
+
+本 fork 在其上追加了 **KV 优化分支**（会话保活 / Mamba 锚点 / GPU↔RAM/SSD 分层 offload 与观测面板，见 `docs/kv-optimization/` 与 `patches/vllm-v0.27.1-kv-offload-2080ti.patch`），由 [Aiakos1818](https://github.com/Aiakos1818) 贡献，按本仓库 MIT 许可发布。
