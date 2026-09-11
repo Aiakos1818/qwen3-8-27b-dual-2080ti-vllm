@@ -1,18 +1,18 @@
 # 运行环境锁定清单
 
-这是 2026-08-24 正在运行服务的关键 Python/CUDA 包版本。优先保持这些版本不变，直到先跑通基准。
+这是本 fork 运行服务的关键 Python/CUDA 包版本（Intel Xeon E5-2696 v3 / 15 GiB 机器）。优先保持这些版本不变，直到先跑通基准。
 
 ~~~text
 Python                 3.12.3
-NVIDIA Driver          580.159.03
+NVIDIA Driver          580.173.02
 Driver CUDA Runtime    13.0
 torch                  2.13.0+cu130
-vllm                   0.27.1
-transformers           5.15.1
+vllm                   0.27.2.dev0+g6e448d0ea
+transformers           5.16.1
 flashinfer-python      0.6.16.post3
 triton                 3.7.1
 numpy                  2.3.5
-tokenizers             0.22.2
+tokenizers             0.23.1
 safetensors            0.8.0
 xgrammar               0.2.3
 nvidia-nccl-cu13       2.29.7

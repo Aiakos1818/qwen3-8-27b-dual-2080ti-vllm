@@ -1,12 +1,28 @@
-# Qwen3.8-27B：双 RTX 2080 Ti 22GB + NVLink 的 vLLM 抄作业配置
+# Qwen3.8-27B：双 RTX 2080 Ti 22GB + NVLink 的 vLLM 部署（含 KV 优化）
+
+> **本 fork 在基础部署之上新增 KV 优化分支**：长会话保活（keep-alive pin）/ Mamba 锚点 /
+> GPU↔RAM/SSD 分块流式 offload（435K 上下文，无会话大小上限）+ 观测面板。
+> 详见 [`docs/kv-optimization/`](docs/kv-optimization/README.md)。
 
 这是一个独立的开源部署项目，面向 2 张魔改 RTX 2080 Ti 22GB、并且两卡之间已连接双 NVLink 的用户。
 
-目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
+目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里；并额外公开面向**长上下文多会话 agent** 的 KV 缓存优化。
 
-适合：单机双卡、单请求优先、180K 上下文、个人/小团队 API、长文档与代码任务。
+适合：单机双卡、单请求优先、180K / 435K 上下文、个人/小团队 API、长文档与代码任务。
 
 不包含：模型权重、API Key、内网地址、个人目录、SSH 或隧道配置。
+
+## 本 fork 新增
+
+在基础部署之上，本 fork（[Aiakos1818](https://github.com/Aiakos1818)）追加了 **KV 缓存优化**，面向长上下文多会话 agent：
+
+- **会话保活（keep-alive pin）**：结束的长会话整链 pin 出可驱逐池；准入放不下时按“缓存最小的先出”释放，回来仍全命中。
+- **Mamba/GDN 锚点**：按 cadence（默认 32k）落持久状态快照，中间分叉从最近锚点续跑，最迟-K 窗口防卡死。
+- **GPU↔RAM/SSD 分层 offload**：会话整链 park/restore，**分块流式**使会话大小不再受 CPU staging 限制。
+- **观测面板**：Prometheus 指标 + `scripts/monitor_host_tier.py` 实时面板。
+
+补丁 `patches/vllm-v0.27.1-kv-offload-2080ti.patch` 必须在基础补丁 `patches/vllm-v0.27.1-sm75-qwen3.8.patch` **之后**应用。完整设计与实测见
+[`docs/kv-optimization/`](docs/kv-optimization/README.md)，启动 profile 见下方「KV 优化」一节。
 
 ## 已验证环境
 
@@ -15,16 +31,16 @@
 | GPU | 2 × NVIDIA GeForce RTX 2080 Ti 22GB（22,528 MiB / 卡） |
 | GPU 架构 | Turing / SM75 / Compute Capability 7.5 |
 | GPU 互联 | NV2：每张卡 2 条 NVLink；单条实测约 25.781 GB/s |
-| CPU | AMD Ryzen 7 5700X，8 核 16 线程 |
-| 内存 | 32 GiB |
-| OS / Kernel | Ubuntu 24.04.4 LTS / Linux 6.17.0-29-generic |
-| NVIDIA Driver | 580.159.03 |
+| CPU | Intel Xeon E5-2696 v3，18 核 36 线程 @2.30GHz |
+| 内存 | 15 GiB（swap 64 GiB） |
+| OS / Kernel | Ubuntu 24.04.4 LTS / Linux 7.0.0-31-generic |
+| NVIDIA Driver | 580.173.02 |
 | CUDA Runtime | 13.0 |
 | Python | 3.12.3 |
 | PyTorch | 2.13.0+cu130 |
-| vLLM | 0.27.1，上游 v0.27.1 commit 6e448d0ea9bf3d88d898b65449ca6dc2aec170ac + 本仓库 patch |
-| Transformers / Triton | 5.15.1 / 3.7.1 |
-| FlashInfer | 0.6.16 |
+| vLLM | 0.27.2.dev0+g6e448d0ea（上游 commit 6e448d0ea9bf3d88d898b65449ca6dc2aec170ac，即 v0.27.1 + 本仓库 patch） |
+| Transformers / Triton | 5.16.1 / 3.7.1 |
+| FlashInfer | 0.6.16.post3 |
 | NCCL | 2.29.7 |
 
 ## 这套配置的目标
@@ -96,6 +112,11 @@ bash scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
 ## 跑通后的性能验收
+
+> **数据来源**：本节及下一节（含 `reports/`）的实测数据来自原项目（zyYuc）在其机器
+> （AMD Ryzen 7 5700X / 32 GiB）上的运行；本 fork 的运行机器为 Intel Xeon E5-2696 v3 / 15 GiB，
+> 硬件不同，下列数字仅供形态参考，未在本机复测。本 fork 自己的实测见
+> [`docs/kv-optimization/`](docs/kv-optimization/README.md)。
 
 这一步是“AI 能否真的帮你跑到相近速度”的关键，而不是只看到服务能启动。这里的首字时间严格按模型流式输出的第一个思考字符或答案字符计算；Qwen 开始输出 think 中第一个字符，就视为首字。
 
@@ -234,7 +255,7 @@ bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
 
 | 环境变量 | 值 | 作用 |
 | --- | --- | --- |
-| OMP_NUM_THREADS | 8 | 与 5700X 物理核心数匹配。 |
+| OMP_NUM_THREADS | 8 | 本机 Xeon E5-2696 v3 为 18 核 36 线程，取 8 以控制线程开销。 |
 | VLLM_USE_DEEP_GEMM | 0 | 关闭此配置未使用的 DeepGEMM 路径。 |
 | VLLM_USE_FLASHINFER_SAMPLER | 0 | 关闭 FlashInfer top-k/top-p sampler。 |
 | VLLM_QWOPUS_MTP_BF16_DRAFT | 1 | Qwen3.5 MTP draft 层兼容设置。 |
