@@ -2,7 +2,29 @@
 
 以下步骤锁定的是这套服务实测使用的提交。先在测试机验证，再替换生产服务。
 
-## vLLM
+## 方式 A：直接用已推送的 fork 分支（最省事）
+
+本 fork 的改动已推送为可直接克隆的分支：
+
+~~~bash
+# vLLM：base(sm75/qwen3.8) + KV 优化两个提交，基于 v0.27.1
+git clone -b sm75-qwen3.8-kv https://github.com/Aiakos1818/vllm.git
+cd vllm
+python -m pip install -U pip
+python -m pip install -e .
+
+# FlashQLA-SM70-SM75：SM75 本地改动
+git clone -b sm75-qwen3.8 https://github.com/Aiakos1818/FlashQLA-SM70-SM75.git
+cd FlashQLA-SM70-SM75
+python -m pip install -e .
+~~~
+
+- `Aiakos1818/vllm@sm75-qwen3.8-kv`（Apache-2.0）
+- `Aiakos1818/FlashQLA-SM70-SM75@sm75-qwen3.8`（MIT）
+
+## 方式 B：从上游 + 本仓库 patch 构建
+
+### vLLM
 
 ~~~bash
 git clone https://github.com/vllm-project/vllm.git
@@ -20,7 +42,7 @@ GPU↔RAM/SSD 分层 offload 与分块流式、指标面板），必须**在基�
 
 本次验证环境：Python 3.12.3 + PyTorch 2.13.0+cu130。
 
-## FlashQLA-SM70-SM75
+### FlashQLA-SM70-SM75
 
 ~~~bash
 git clone https://github.com/weicj/FlashQLA-SM70-SM75.git
