@@ -1,6 +1,6 @@
-INFO 09-12 02:30:41 [host_tier_ssd.py:126] HostTierSSDStore: root=/dev/shm/ssd_crash/crash_2fc7f1452374/sessions quota=1024.00GiB O_DIRECT=False
+INFO 09-12 12:33:51 [host_tier_ssd.py:126] HostTierSSDStore: root=/dev/shm/ssd_crash/crash_2fc7f1452374/sessions quota=1024.00GiB O_DIRECT=False
 after kill: finals=19 temps=1
 partial session dir present: True
-INFO 09-12 02:30:46 [host_tier_ssd.py:126] HostTierSSDStore: root=/dev/shm/ssd_crash/crash_2fc7f1452374/sessions quota=0.00GiB O_DIRECT=False
+INFO 09-12 12:33:56 [host_tier_ssd.py:126] HostTierSSDStore: root=/dev/shm/ssd_crash/crash_2fc7f1452374/sessions quota=0.00GiB O_DIRECT=False
 files after clean_start: 0
 SSD-CRASH-OK

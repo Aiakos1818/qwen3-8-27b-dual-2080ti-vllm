@@ -1,6 +1,6 @@
-[A full resident] prompt=48160 cached=46400 wall=2.6s
-[B full (forces A spill)] prompt=64187 cached=0 wall=59.3s
-[A resume (restore)] prompt=48160 cached=46400 wall=2.4s
-[revert keep=2 after restore] prompt=32137 cached=0 wall=25.8s
+[A full resident] prompt=48160 cached=0 wall=40.6s
+[B full (forces A spill)] prompt=64187 cached=0 wall=58.1s
+[A resume (restore)] prompt=48160 cached=46400 wall=2.1s
+[revert keep=2 after restore] prompt=32137 cached=30400 wall=1.8s
 [revert keep=3 after restore] prompt=48164 cached=46400 wall=2.0s
 P03-DONE

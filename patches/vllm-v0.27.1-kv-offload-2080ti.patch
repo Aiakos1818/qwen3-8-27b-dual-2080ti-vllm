@@ -705,6 +705,52 @@ index 000000000..dc953f925
 +    store.discard("s")
 +    store.shutdown()
 +    close_view(buf, view, flat)
+diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
+index 31671caf7..58f69e88e 100644
+--- a/tests/v1/core/test_mamba_align_chunk_split.py
++++ b/tests/v1/core/test_mamba_align_chunk_split.py
+@@ -209,6 +209,41 @@ def test_poisoning_is_block_size_independent(
+     assert _prefill(prompt_len, budgets=budgets) > 0
+ 
+ 
++def test_durable_boundaries_survive_head_free(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The head-prefix free must not drop durable snapshot boundaries.
++
++    `remove_skipped_blocks` frees the whole skipped range before the manager's
++    retention logic runs, so a state block sitting at `cadence - block_size`
++    (the pre-cadence anchor MTP needs) was freed before it could be pinned.
++    A restored request then found no anchor and replayed the prefix.
++    """
++    from vllm import envs
++
++    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
++    manager = _make_hybrid_kv_cache_manager()
++    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++    assert mamba._ckpt_tokens == 2 * MAMBA_BLOCK_SIZE
++
++    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
++    _run_chunked_prefill(manager, request, [])
++    assert request.num_computed_tokens == 3602
++
++    # A later step frees the head prefix up to the prompt end.
++    mamba.remove_skipped_blocks(request.request_id, 3602, 3602)
++
++    win = mamba.take_durable_window(request.request_id)
++    assert sorted(b.block_hash_num_tokens for b in win) == [
++        MAMBA_BLOCK_SIZE,
++        2 * MAMBA_BLOCK_SIZE,
++    ]
++    assert all(b.pinned for b in win)
++    # The retained entries are detached from the table like any freed block.
++    blocks = mamba.req_to_blocks[request.request_id]
++    assert blocks[0].is_null and blocks[1].is_null
++
++
+ @pytest.mark.parametrize("partial_hit", [False, True])
+ @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
+ def test_unaligned_resume_never_runs_past_its_block(
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
 index 939a2b08f..851286a15 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
@@ -3627,7 +3673,7 @@ index b4521a2e1..5397393fc 100644
          # KV Connector:: update recv and send status from last step.
          for req_id in kv_connector_output.finished_recving or ():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75cf97f4f..0a86db2d5 100644
+index 75cf97f4f..b1df2dde3 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,8 @@ from collections import defaultdict
@@ -3700,7 +3746,7 @@ index 75cf97f4f..0a86db2d5 100644
  
      @classmethod
      def find_longest_cache_hit(
-@@ -1440,9 +1480,73 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1440,9 +1480,110 @@ class MambaManager(SingleTypeKVCacheManager):
              ):
                  blocks = self.req_to_blocks[request_id]
                  if blocks[last_state_block_idx] != self._null_block:
@@ -3722,6 +3768,43 @@ index 75cf97f4f..0a86db2d5 100644
 +                        self.block_pool.free_blocks([blk])
                      blocks[last_state_block_idx] = self._null_block
  
++    def _remove_blocks_in_range(
++        self,
++        request_id: str,
++        first_block: int,
++        last_block: int,
++    ) -> None:
++        """Head-prefix free that exempts durable snapshot boundaries.
++
++        The base implementation frees the whole ``[first_block, last_block)``
++        run before this manager's own retention logic runs, so a state block
++        at a durable boundary (e.g. ``cadence - block_size``) that happens to
++        sit inside the range would be gone by the time ``remove_skipped_blocks``
++        looks for it. Retain those blocks (pinned, in the durable window)
++        instead of freeing them; the window cap still bounds how many survive.
++        """
++        if not (self.mamba_cache_mode == "align" and self._ckpt_tokens):
++            return super()._remove_blocks_in_range(request_id, first_block, last_block)
++        if request_id not in self.req_to_blocks or first_block >= last_block:
++            return
++        blocks = self.req_to_blocks[request_id]
++        last_block = min(last_block, len(blocks))
++
++        freed: list[KVCacheBlock] = []
++        for i in range(last_block - 1, first_block - 1, -1):
++            if blocks[i] == self._null_block:
++                break
++            blk = blocks[i]
++            if self._is_durable_boundary((i + 1) * self.block_size):
++                # Keep the allocation ref (window / keep-alive drops it later);
++                # do not add it to ``freed`` or the refcount goes negative.
++                self._retain_durable_anchor(request_id, blk)
++            else:
++                freed.append(blk)
++            blocks[i] = self._null_block
++        if freed:
++            self.block_pool.free_blocks(freed)
++
 +    def _release_durable_anchor(self, blk: KVCacheBlock) -> None:
 +        """Turn a durable (pinned during its owner's run) anchor back into an
 +        ordinary cached block: drop the keep-alive hold and free the block so
@@ -3775,7 +3858,7 @@ index 75cf97f4f..0a86db2d5 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          cascade attention is not supported by mamba
-@@ -1468,6 +1572,18 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1468,6 +1609,18 @@ class MambaManager(SingleTypeKVCacheManager):
              # To put it in the next step, we return num_gpu_blocks + 1 so
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
@@ -3794,7 +3877,7 @@ index 75cf97f4f..0a86db2d5 100644
              return self.block_pool.num_gpu_blocks + 1
          if self.mamba_cache_mode != "align":
              # Allocate extra `num_speculative_blocks` blocks for
-@@ -1655,6 +1771,13 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1655,6 +1808,13 @@ class MambaManager(SingleTypeKVCacheManager):
              self._allocated_block_reqs.discard(request_id)
              self.last_state_block_idx.pop(request_id, None)
              self._producer_partial_tail_reqs.pop(request_id, None)

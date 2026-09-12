@@ -1,6 +1,6 @@
-{'name': 'S resident', 'prompt': 84241, 'cached': 0, 'wall': 82.09, 'sha': 'e3b0c44298fc1c14'}
-{'name': 'T bigger (forces S spill)', 'prompt': 87217, 'cached': 0, 'wall': 88.03, 'sha': 'e3b0c44298fc1c14'}
-{'name': 'R resumed (SSD restore)', 'prompt': 84251, 'cached': 81600, 'wall': 12.68, 'sha': 'db8b8e836881534b'}
-METRICS {'stores': 2.0, 'restores': 1.0, 'write_bytes': 6907494400.0, 'read_bytes': 3398041600.0}
+{'name': 'S resident', 'prompt': 84241, 'cached': 0, 'wall': 84.16, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'T bigger (forces S spill)', 'prompt': 87217, 'cached': 0, 'wall': 93.44, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'R resumed (SSD restore)', 'prompt': 84251, 'cached': 81600, 'wall': 11.44, 'sha': 'db8b8e836881534b'}
+METRICS {'stores': 3.0, 'restores': 1.0, 'write_bytes': 8745779200.0, 'read_bytes': 3732275200.0}
 DISK_BYTES 0
 SSD-100K-DONE

@@ -1,4 +1,4 @@
-[A full resident] prompt=48160 cached=0 wall=40.5s
-[revert keep=2 (expect anchor ~32k)] prompt=32137 cached=28800 wall=3.6s
-[revert keep=3 (expect ~48k)] prompt=48164 cached=46400 wall=2.2s
+[A full resident] prompt=48160 cached=0 wall=40.7s
+[revert keep=2 (expect anchor ~32k)] prompt=32137 cached=30400 wall=1.9s
+[revert keep=3 (expect ~48k)] prompt=48164 cached=46400 wall=2.1s
 P03-DONE

@@ -143,11 +143,33 @@ MTP 推测解码会让 `SpeculativeConfig.use_eagle()` 返回 True，于是
 
 实测（FP8 100k、MTP3）：`p03 control` 常驻截断 `keep=2 → cached=30400`（修复前 28800）。
 
-> **已知限制（restore 后深回退）**：pre-cadence 状态（`C - block_size`）位于 MTP 的
-> speculative-block 复用窗口内，会在被 pin 前就被复用覆盖，因此**不进入保活 entry / spill**。
-> 会话经 RAM/SSD restore 后，`keep=2` 深回退仍为 `cached=0`（退化为整段重算，无正确性问题、
-> sha 一致、0 NaN）；浅回退（`keep=3`）不受影响。需要 restore 后深回退也命中时，应作为
-> 后续工作处理（见 `reports/2026-09-fp8-kv/`）。
+#### 2.3.1 基类 head-free 先于保留逻辑（restore 后深回退，2026-09 修复）
+
+只保留双锚点还不够：`MambaManager.remove_skipped_blocks` 先调用基类的
+`remove_skipped_blocks`，而基类按 `get_num_skipped_tokens() = num_computed_tokens - 1`
+先把 head 区间整段释放（`_remove_blocks_in_range`，从高到低、遇 null 停），然后 mamba
+自己的保留逻辑才去读 `last_state_block_idx`。于是 `C - block_size` 处的 pre-cadence 状态
+（如 processed=32000 时释放区间 `[0,19)` 顶端的 idx=18/30400）**在被 pin 前就已被释放并置 null**，
+不进保活 entry / spill → 会话经 RAM/SSD restore 后深回退为 `cached=0`。cadence 锚点
+（idx=19）之所以幸存，是因为它上方 idx=20 是 null，基类在到达它之前就 break 了。
+
+修复：`MambaManager` 覆写 `_remove_blocks_in_range`——区间内命中 `_is_durable_boundary()`
+的块改为 `_retain_durable_anchor()`（pin + 入窗）而不是 `free_blocks`，其余保持原语义
+（含 null-break）；只影响 mamba align 组，`RSWAManager`/FA 不受影响。保留的块不进
+`freed`（保持分配 ref=1），结束由 `pin_request_auto` 统一降 ref，避免 ref 变负。
+
+实测（FP8 100k、MTP3、RAM 与真 NVMe SSD）：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `p03 control` keep=2（常驻） | 28800 | **30400** |
+| `p03 test` keep=2（RAM restore） | 0（25.8s 重算） | **30400**（1.8s） |
+| `p03 test` keep=2（真 NVMe SSD restore） | 0 | **30400** |
+| `ssd_matrix` S3 keep=2 / keep=3 | 0 / 46400 | **30400 / 46400** |
+
+回归测试：`tests/v1/core/test_mamba_align_chunk_split.py::test_durable_boundaries_survive_head_free`
+（去掉覆写即失败）。代价：每 cadence 多 pin 一个 pre-cadence 锚点，保活 entry 略大，
+LRU 淘汰顺序变化，但命中总数不变（见 `reports/2026-09-fp8-kv/` §3.3）。
 
 ---
 
@@ -288,4 +310,6 @@ MTP 推测解码会让 `SpeculativeConfig.use_eagle()` 返回 True，于是
 - 日志：`logs/revert_ckpt*.log`、`logs/cmatrix_*.log`、`logs/revert_clean.log`
 - 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`logs/server_100k.log`
 
-测试：`tests/v1/core/test_prefix_caching.py`（89 例）等，`pytest --noconftest` 运行。
+测试：`tests/v1/core/test_prefix_caching.py`（89 例）、
+`tests/v1/core/test_mamba_align_chunk_split.py`（21 例，含 §2.3.1 的
+`test_durable_boundaries_survive_head_free`）等，`pytest --noconftest` 运行。

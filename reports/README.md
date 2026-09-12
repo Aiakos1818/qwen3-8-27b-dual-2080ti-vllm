@@ -27,16 +27,20 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | 权重显存 / KV 容量 | 14.96 GiB/卡；`GPU KV cache size 106,288`（与 AWQ 同池同值） |
 | RAM restore 正确性 | sha `db8b8e836881534b` 与 baseline 一致，0 NaN |
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
-| SSD 真盘 park/resume | `R cached=81600 / 12.7s`，sha 一致，写 6.43 GiB / 读 3.16 GiB |
-| SSD 强制分块矩阵 | **16/17 PASS**（1 soft）；唯一失败：restore 后深回退锚点（`keep2=0`，见下） |
-| 单元测试 | 110 passed |
+| SSD 真盘 park/resume | `R cached=81600 / 11.4s`，sha 一致，写 8.75 GiB / 读 3.73 GiB |
+| SSD 强制分块矩阵 | **17/17 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400` |
+| 单元测试 | 131 passed（含新增回归测试） |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
 
-测试中发现并修复：MTP 的 `use_eagle()` 让 full-attention finder 多丢一个 block，使 cadence
-锚点不可达。现在每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点，常驻深回退
-`keep=2` 由 28800 提升到 **30400**。restore 后深回退仍为 0（pre-cadence 状态被 MTP 的
-speculative-block 复用覆盖，未进 spill），属已知限制、无正确性影响（报告 §5）。
+测试中发现并修复了两个锚点问题（报告 §5）：
+
+1. MTP 的 `use_eagle()` 让 full-attention finder 多丢一个 block，使 cadence 锚点不可达
+   → 每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点，常驻深回退 `keep=2` 由
+   28800 提升到 **30400**。
+2. 基类 head-free 在 mamba 保留逻辑之前释放 head 区间，pre-cadence 状态（`C - block_size`）
+   在被 pin 前就被置 null → 覆写 `MambaManager._remove_blocks_in_range` 保留 durable boundary
+   块。restore 后深回退由 `cached=0` 修复为 **`cached=30400`**（RAM 与真 NVMe SSD 均验证）。
 
 ## 声明
 

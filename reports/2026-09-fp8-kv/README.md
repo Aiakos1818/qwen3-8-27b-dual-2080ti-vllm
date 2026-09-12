@@ -6,9 +6,9 @@
 > 结论先行：**KV 优化与权重量化方式无关**。从 AWQ-INT4 换到 FP8 只需改模型路径 +
 > `--quantization fp8`、重标定 KV 池预算、并把 venv 的 `ninja` 放进 PATH（FP8 会启用
 > `norm_quant`/`act_quant` 融合，需 JIT 编译）。**无需改动任何 KV 优化代码**。
-> 测试中发现并修复了一个 **MTP eagle-drop 导致锚点边界错位**的问题（常驻深回退
-> `keep=2` 由 28800 提升到 30400）；restore 后的深回退仍受 MTP speculative-block
-> 复用限制（详见 §5）。
+> 测试中发现并修复了两个锚点问题（详见 §5）：**MTP eagle-drop 导致锚点边界错位**
+> （常驻深回退 `keep=2` 由 28800 提升到 30400）和 **基类 head-free 先于锚点保留逻辑
+> 释放 pre-cadence 状态**（restore 后深回退由 `cached=0` 修复为 `cached=30400`）。
 
 ## 1. 环境与配置
 
@@ -60,18 +60,21 @@
 |---|---|---|
 | s1 / s2 / s3 | 50238 | 0（冷） |
 | resume-s1 | 50255 | **48000** |
-| resume-s2 | 50255 | 0（被 RAM 满策略丢弃） |
-| resume-s3 | 50255 | **48000** |
-| resume-s1b | 50255 | **48000** |
-| resume-s2b | 50255 | 0（丢弃） |
+| resume-s2 | 50255 | **48000** |
+| resume-s3 | 50255 | 0（被 RAM 满策略丢弃） |
+| resume-s1b | 50255 | 0（被丢弃） |
+| resume-s2b | 50255 | **48000** |
 
 `spills=8, restores=4, evictions=2, drops=2` —— 与 AWQ 文档 §6b 的语义/量级一致。
+修复后每个 cadence 多 pin 一个 pre-cadence 锚点，保活 entry 略大，LRU 淘汰顺序随之改变
+（命中的请求从 s1b 换成 s2b，**命中总数 3/4 不变**）。
 
 ### 3.4 锚点（Mamba 深回退）
 
 - `p03 control`（A 常驻 → 截断回退）：`keep=2 → cached=30400`（MTP eagle-drop 后的边界；
   修复前为 28800，见 §5），`keep=3 → cached=46400`。
-- `p03 test`（A → B 挤出 → A restore → 截断回退）：`keep=2 → cached=0`（restore 限制，见 §5）。
+- `p03 test`（A → B 挤出 → A restore → 截断回退）：`keep=2 → cached=30400`（修复前 0），
+  `keep=3 → cached=46400`（见 §5）。
 
 ## 4. Phase 3 — SSD 分块 offload
 
@@ -82,20 +85,21 @@
 
 | 请求 | prompt | cached | wall | sha |
 |---|---|---|---|---|
-| S resident | 84241 | 0 | 82.1s | — |
-| T bigger（挤出 S） | 87217 | 0 | 88.0s | — |
-| **R resumed（SSD restore）** | 84251 | **81600** | **12.7s** | `db8b8e836881534b` |
+| S resident | 84241 | 0 | 84.2s | — |
+| T bigger（挤出 S） | 87217 | 0 | 93.4s | — |
+| **R resumed（SSD restore）** | 84251 | **81600** | **11.4s** | `db8b8e836881534b` |
 
-`stores=2, restores=1`；写 **6.43 GiB**、读 **3.16 GiB**；restore 后磁盘文件已删（`DISK_BYTES 0`）。
+`stores=3, restores=1`（本次紧跟 `p03 test` 运行，多出的一次 store 来自该测试的会话；
+首次干净运行时为 `stores=2`）；写 **8.75 GiB**、读 **3.73 GiB**；restore 后磁盘文件已删（`DISK_BYTES 0`）。
 restore sha 与 baseline 一致 → **SSD 分块 park/resume 字节正确**。
 
 ### 4.2 中断原子性（`ssd_crash_check.py`）
 
 写中 SIGKILL → `finals=19 temps=1`（无索引引用半成品）；`clean_start` 后目录清空。**`SSD-CRASH-OK`**。
 
-### 4.3 tmpfs 强制分块矩阵（`ssd_matrix.py`，staging 17 / chunk 8）
+### 4.3 tmpfs 强制分块矩阵（`ssd_matrix.py`）
 
-**16/17 PASS（1 soft）**：
+**17/17 PASS（0 soft）**：
 
 | 检查 | 结果 |
 |---|---|
@@ -104,14 +108,16 @@ restore sha 与 baseline 一致 → **SSD 分块 park/resume 字节正确**。
 | S4 配额 LRU | ✓（`stores+3, evictions+2, sessions=1`） |
 | S5 并发（4×36k×2 轮） | ✓ `P15-BAD []`，0 mismatch |
 | no NaN logits | ✓ `nans=0` |
-| **S3 restore + 深回退锚点** | ✗ `keep2=0 keep3=46400`（见 §5） |
+| **S3 restore + 深回退锚点** | ✓ `keep2=30400 keep3=46400`（修复前 `keep2=0`） |
 
-## 5. 唯一行为差异：restore 后的深回退锚点（已定位根因，常驻侧已修复）
+> 复跑注意：`VLLM_SSD_ROOT` 指向 tmpfs 时，若 `CPU_BYTES_TO_USE` 过小（如 `1e9`，
+> staging 17 槽），本机（kernel 7.0 / 驱动 580）上 TP1 的 `cudaHostRegister` 会返回
+> `cudaErrorInvalidValue`，进而毒化 CUDA context 使 warmup 失败。把 staging 调大
+> （`4e9`，71 槽）即可稳定启动；`VLLM_SSD_CHUNK_SLOTS=8` 仍强制分块传输。
 
-`p03 test` 与矩阵 S3 均显示：**会话经 RAM/SSD restore 后，`keep=2` 的截断回退不再命中
-Mamba 锚点（cached=0）**。
+## 5. 两个锚点问题（均已修复）
 
-### 5.1 根因（插桩确认）
+### 5.1 MTP eagle-drop 导致锚点边界错位（常驻深回退）
 
 MTP 推测解码让 `SpeculativeConfig.use_eagle()` 返回 True，于是
 `FullAttentionManager.find_longest_cache_hit` 返回前 **多丢一个 block**
@@ -125,26 +131,51 @@ DBG coord final hit=28800
 ```
 
 FA 组本来命中了 32000，但 eagle drop 把它压到 **30400**；协调器再拿 30400 去查 Mamba，
-持久锚点在 32000 不可达 → 退回 28800（restore 后连 28800 也没有 → 0）。
-**与 FP8 无关**（`use_eagle()` 只看 `method`，AWQ + MTP 同样如此）。
+持久锚点在 32000 不可达 → 退回 28800。**与 FP8 无关**（`use_eagle()` 只看 `method`）。
 
-### 5.2 修复（常驻侧）
-
-每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点：scheduler 额外在
+修复：每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点。scheduler 额外在
 `C - block_size` 停一个 prefill chunk，`MambaManager` 的持久保留条件同步覆盖该边界，
-窗口上限内部 ×2。见 [`vllm_02_锚点.md`](../../docs/kv-optimization/vllm_02_锚点.md) §2.3。
+窗口上限内部 ×2。常驻截断 **`keep=2 → cached=30400`**（修复前 28800）。
 
-- `p03 control`（常驻截断）：**`keep=2 → cached=30400`**（修复前 28800），`keep=3 → 46400`。
+### 5.2 基类 head-free 先于锚点保留逻辑释放 pre-cadence 状态（restore 后深回退）
 
-### 5.3 仍存在的限制
+修复 §5.1 后，`p03 control` 正常，但 `p03 test` / 矩阵 S3（会话经 RAM/SSD restore 后深回退）
+仍为 `cached=0`。插桩确认：pre-cadence 状态块（如 30400 / idx=18）在 `remove_skipped_blocks`
+的 mamba 保留逻辑读它之前就已被置 null。
 
-pre-cadence 状态（`C - block_size`）位于 MTP 的 speculative-block 复用窗口内，会在被 pin
-前就被复用覆盖，因此**不进入保活 entry / spill**。所以 **restore + 深回退仍为 `cached=0`**。
+根因在基类调用顺序：
 
-- 影响：restore 后的深回退退化为整段重算（**无正确性问题**，sha 仍一致、0 NaN）；
-  **浅回退（keep=3，尾部）正常命中**（`cached=46400`）。
-- 不修复该点需要改动 MTP 的 speculative-block 分配/复用路径，风险较高，留作后续工作。
-  不影响保活、RAM/SSD park/resume、常驻深回退与浅回退。
+```
+MambaManager.remove_skipped_blocks()
+ ├─ super().remove_skipped_blocks()      # 先跑，释放 head 区间
+ │    num_skipped = get_num_skipped_tokens() = num_computed_tokens - 1
+ │    _remove_blocks_in_range(0, num_skipped // block_size)   # 从高到低，遇 null 停
+ └─ if align: 读 blocks[last_state_block_idx]   # 后跑，块已被基类释放
+```
+
+processed=32000 时释放区间为 `[0,19)`，pre-cadence 状态块 idx=18（30400）正好在区间顶端
+→ 被基类先 `free_blocks` + `null`，随后 mamba 保留逻辑读到 null 而跳过。cadence 锚点
+idx=19 之所以幸存，是因为它上面的 idx=20 是 null，基类在到达它之前就 break 了。
+
+修复（`MambaManager._remove_blocks_in_range` 覆写）：在该区间内遇到
+`_is_durable_boundary()` 的块时，改为 `_retain_durable_anchor()`（pin + 入窗）而不是释放，
+其余保持原语义（含 null-break）；该覆写只影响 mamba align 组，`RSWAManager` 不受影响。
+
+### 5.3 验证
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `p03 control` keep=2（常驻） | 28800 | **30400** |
+| `p03 test` keep=2（RAM restore） | 0（25.8s 重算） | **30400**（1.8s） |
+| `p03 test` keep=2（真 NVMe SSD restore） | 0 | **30400** |
+| 矩阵 S3 keep=2 / keep=3 | 0 / 46400 | **30400 / 46400** |
+
+正确性不变：`correctness_check.py baseline/offload` sha 均为 `db8b8e836881534b`、
+0 NaN；`ssd_100k_check` restore sha 一致；单元测试新增
+`test_durable_boundaries_survive_head_free`（去掉覆写即失败）。
+
+代价：每 cadence 多 pin 一个 pre-cadence 锚点，保活 entry 略大，LRU 淘汰顺序变化，
+但命中总数不变（见 §3.3）；窗口上限仍为 `VLLM_MAMBA_CKPT_ANCHORS × 2`。
 
 ## 6. 切换量化类型的适配清单（实测确认）
 
@@ -171,23 +202,29 @@ export MODEL_PATH=<fp8 model> SERVED_MODEL_NAME=qwen38-27b \
 python scripts/correctness_check.py baseline
 python scripts/correctness_check.py offload
 python scripts/ssd_100k_check.py
-python scripts/ssd_matrix.py --expected-sha db8b8e836881534b
+python scripts/ssd_matrix.py --expected-sha db8b8e836881534b   # tmpfs root 时 staging 用 4e9，见 §4.3
 python scripts/ssd_crash_check.py
 ```
 
-单元测试（110 passed）：
+单元测试（131 passed，含新增的 pre-cadence 保留回归测试）：
 
 ```bash
 cd zyYuc-sandbox/src/vllm-0271
 python -m pytest tests/v1/core/test_host_tier_ssd.py \
-  tests/v1/core/test_host_tier_spill.py tests/v1/core/test_prefix_caching.py -q --noconftest
+  tests/v1/core/test_host_tier_spill.py tests/v1/core/test_prefix_caching.py \
+  tests/v1/core/test_mamba_align_chunk_split.py -q --noconftest
 ```
 
 ## 8. 已知启动抖动
 
-FP8 路径下 TP worker warmup 偶发 `torch.AcceleratorError: CUDA error: invalid argument`
-（`qwen_triton_warmup`），与 AWQ 的已知 flakiness 相同，重试即可（本次多次重试后成功）；
-重试前清 `/dev/shm/vllm_offload_*.mmap`。与 KV 优化实现无关。
+1. FP8 路径下 TP worker warmup 偶发 `torch.AcceleratorError: CUDA error: invalid argument`
+   （`qwen_triton_warmup`），与 AWQ 的已知 flakiness 相同，重试即可；重试前清
+   `/dev/shm/vllm_offload_*.mmap` 与 `/dev/shm/sem.mp-*`。
+2. `cudaHostRegister`（CPU staging mmap）失败会**毒化 CUDA context**：即使代码只打 warning
+   继续，后续 `torch.full` 等调用也会以同一 `invalid argument` 失败。tmpfs SSD root +
+   过小 staging（`CPU_BYTES_TO_USE=1e9`）在本机稳定触发 rank=1 注册失败；调大 staging
+   或换真 NVMe root 即可（见 §4.3 注）。
+   两者均与 KV 优化实现无关。
 
 ## 9. 结果文件
 

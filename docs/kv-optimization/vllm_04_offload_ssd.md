@@ -192,13 +192,15 @@ export VLLM_SSD_ONLY=1
 | NVMe（Colorful CN600 476 GiB） | **0.93 GiB/s** | **1.68 GiB/s** | 系统盘，171 GiB 空闲 |
 | tmpfs（`/dev/shm`） | 2.51 GiB/s | 5.68 GiB/s | 用于功能矩阵，无磨损 |
 
-### 6.2 单元测试（110 passed）
+### 6.2 单元测试（131 passed，2026-09 更新）
 
 - `tests/v1/core/test_host_tier_ssd.py`：10 例（chunked roundtrip / abort 释放配额 /
   load range 边界 / 两档驱逐）。
 - `tests/v1/core/test_host_tier_spill.py`：11 例（release 部分释放+abort 不重复 unpin /
   hold+release restored blocks / 两档驱逐）。
 - `tests/v1/core/test_prefix_caching.py`：89 例回归。
+- `tests/v1/core/test_mamba_align_chunk_split.py`：21 例（含 `_remove_blocks_in_range`
+  保留 pre-cadence 锚点的回归测试）。
 
 ### 6.3 功能矩阵（tmpfs 假 SSD，强制分块）**17/17（1 soft）**
 
@@ -217,6 +219,10 @@ export VLLM_SSD_ONLY=1
 > 为保住 restore 后 Mamba 锚点存活，最终矩阵把 GPU 池从 106k 提到 128k token（2.77e9），
 > 因此 S2 的 S+T 不再挤出 SSD（soft 项 `restores+0`，属配置放宽，非回归）；SSD park/resume
 > 由 S3/S4 覆盖。矩阵须在**干净池**上先跑 S3，否则前序压力会使锚点检查失败。
+>
+> 注：上表 S3 的 `32000/48000` 为**未开 MTP** 时的边界。部署默认 MTP3（eagle drop）下
+> 边界为 `30400/46400`，见 [`vllm_02_锚点.md`](vllm_02_锚点.md) §2.3；`ssd_matrix.py` 两种
+> 取值均接受。
 
 ### 6.4 真 NVMe 435k 验收（分块流式）**PASS**
 
