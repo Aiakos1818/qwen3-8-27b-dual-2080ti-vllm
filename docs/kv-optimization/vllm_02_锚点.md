@@ -90,7 +90,8 @@ allocator 错误或调度卡死（该崩溃/卡死与其修复见 [`vllm_01_保�
 | revert 截断到 ~30k（低于首个 32k 锚点） | 30,215 | 0 | 21s | 无锚点则该段从 0 重算 |
 | full replay（8 次发散请求后） | 86,319 | 70,400 | — | 引擎存活（尾部缓存被挤，属池压力） |
 
-启用：`VLLM_MAMBA_CKPT_TOKENS=32000`（须为 block_size 的倍数）。
+启用：`VLLM_MAMBA_CKPT_TOKENS=32000`（会**自动向下对齐**到实际 block_size 的整数倍，
+见 §5）。
 
 ### 2.1 cadence 粒度实测定优
 
@@ -121,7 +122,7 @@ revert_J58k → revert_J30k → 相同重放 2：
 | 16000（原卡死） | **77.5s 完成** | 83,200/4.3s | 64,000/9.3s | **48,000**/10.3s（独立探测） |
 | 8000 | **78.2s 完成** | 83,200/4.3s | 64,000/9.3s | — |
 
-调参：`VLLM_MAMBA_CKPT_TOKENS`（cadence，须为 block_size 倍数）、
+调参：`VLLM_MAMBA_CKPT_TOKENS`（cadence，自动向下对齐到 block_size 倍数）、
 `VLLM_MAMBA_CKPT_ANCHORS`（最迟-K 窗口大小，默认 3）。
 
 ### 2.3 MTP（eagle drop）下的锚点边界（2026-09 修复）
@@ -282,13 +283,17 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 - **现状即生效**：会话保活默认开（脚本显式 `VLLM_PIN_MIN_TOKENS=16000`）；崩溃修复
   (touch 守卫) 无条件生效；**Mamba 检查点默认关**（`VLLM_MAMBA_CKPT_TOKENS` 默认 0）。
 - 启用检查点需在 512k 脚本前 export：`VLLM_MAMBA_CKPT_TOKENS=32000`（可加 `ANCHORS`）。
+- **cadence 自动对齐**：`align_ckpt_tokens()` 把 `VLLM_MAMBA_CKPT_TOKENS` **向下取整**到实际
+  block_size 的整数倍（`MambaManager` 与 `scheduler` 用同一值），用户无需知道 block_size。
+  block_size 由引擎自动选（MTP3→1600、MTP1→1584）；启动日志打印
+  `requested/effective/block_size`。故 32000 在 MTP3 下不变、MTP1 下自动变 31680。
 - 锚点成本几乎可忽略：K=16 ≈ 16 slot ≈ ~25 MiB/卡容量；真正约束是**运行中 free slot ≥ K**
   ——512k 现池按 ~1.0x 配，无 slot 余量，需先小步实测（临时加大 bytes 或降 MTP spec 腾位），
   确认满长 prefill + 目标 K 不卡后再定默认值。
 - 待办：①（已完成 §6.1）极细 cadence 中途覆盖；②（已完成 2026-09-13）512k 满长 + 锚点实测：
-  515k 满长不 OOM、SSD 分块恢复 99.6%（sha 一致）；深回退在满池下未命中（池仅剩 ~21k，
-  常驻链被 spill 到 SSD，而 SSD 只认"更长/同链"，见
-  [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)）；③ 若需细粒度，
+  MTP3 下 S 499k 不 OOM、SSD 分块恢复 99.4%（sha 一致）、深回退命中 480000；仅当池贴近
+  上限（MTP1/S=515k、free ~21.6k）时恢复链被 spill 到 SSD，而 SSD 只认"更长/同链" → miss，
+  见 [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)；③ 若需细粒度，
   将“free slot 数”从近似换成引擎真值探针。
 
 ---

@@ -5,14 +5,14 @@ S (--turns x --a-tok, default 32x16000 ~= 515k) fills the pool to the memory
 ceiling. T (default 7x16000 ~= 112k, > the ~21k free) forces S to spill to the
 real NVMe SSD. R resumes S with a tail (chunked restore). V reverts S to the
 --keep-th turn (default 30 -> ~481k); with the durable window holding the last
-K cadences, V must hit the anchor at --anchor (default 475200 = 15 x 31680;
-the 512k profile's mamba block_size is 1584, so the cadence is 31680).
+K cadences, V must hit the anchor at --anchor (default 480000 = 15 x 32000;
+MTP3 selects block_size=1600, cadence 32000).
 
 The offload tier is required: with the pool ~96% full a revert would otherwise
 evict the resident session (instead of reusing it) and recompute from 0.
 
 Usage: ssd_512k_anchor_check.py [--turns 32] [--a-tok 16000] [--keep 30]
-                                [--anchor 475200] [--t-turns 7]
+                                [--anchor 480000] [--t-turns 7]
 """
 import argparse
 import hashlib
@@ -79,7 +79,7 @@ def main() -> int:
     ap.add_argument("--turns", type=int, default=32)
     ap.add_argument("--a-tok", type=int, default=16000)
     ap.add_argument("--keep", type=int, default=30)
-    ap.add_argument("--anchor", type=int, default=475200)
+    ap.add_argument("--anchor", type=int, default=480000)
     ap.add_argument("--t-turns", type=int, default=7)
     args = ap.parse_args()
 

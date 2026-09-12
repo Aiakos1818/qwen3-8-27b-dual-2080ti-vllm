@@ -29,7 +29,7 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
 | SSD 真盘 park/resume | `R cached=81600 / 10.7s`，sha 一致，写 9.34 GiB / 读 2.85 GiB |
 | SSD 强制分块矩阵 | **18/18 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400`、`S3b 二次停车 keep2=30400` |
-| 单元测试 | 136 passed（含新增回归测试与真 LRU 测试） |
+| 单元测试 | 139 passed（含新增回归测试与真 LRU 测试） |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
 
@@ -54,12 +54,12 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 |---|---|
 | 435k 常驻深回退 | `V0 cached=352000` ✅ |
 | 435k SSD 恢复 + 深回退 | `R cached=384000`（sha 一致）→ `V2 cached=352000` ✅ |
-| 512k 满长 prefill | 515,046 token，无 OOM ✅ |
-| 512k SSD 分块恢复 | `R cached=513216`（99.6%，sha 一致，41s vs 重算 1504s）✅ |
-| 512k 深回退 | 满池下未命中（`V=0`）：常驻链被 spill 到 SSD，而 SSD 只认"更长/同链" ⚠️ |
+| 512k 满长 prefill（MTP3） | 499,018 token，无 OOM ✅ |
+| 512k SSD 分块恢复 | `R cached=496000`（99.4%，sha 一致，45.7s vs 重算 1490.7s）✅ |
+| 512k 深回退（MTP3） | `V cached=480000` ✅（MTP1/515k 贴近上限时会 miss，见报告）|
 
-结论：435k 三个修复端到端 PASS；512k 满长与 SSD 恢复 PASS，满池深回退受"内存余量 + SSD
-只认长链"限制（非锚点缺陷）。
+结论：435k 与 512k（MTP3）三个修复端到端全部 PASS；cadence 现自动向下对齐到 block_size，
+用户无需知道 block_size。
 
 ## 声明
 

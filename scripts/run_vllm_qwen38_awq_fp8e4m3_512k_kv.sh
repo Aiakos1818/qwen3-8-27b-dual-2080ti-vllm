@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 512k + KV anchors (AWQ-INT4, fp8_e4m3 KV, MTP=1, batched 1024, pool 9.6e9).
-# OOM fallback ladder vs run_vllm_qwen38_awq_fp8e4m3_512k.sh:
-#   MTP 3 -> 1, batched 4096 -> 1024, plus the KV stack. The pool must leave
-#   >= K free slots at full length (anchor deadlock criterion,
-#   docs/kv-optimization/vllm_02_锚点.md 4.2); 9.6e9 -> 536,624 tokens, ~14
-#   free slots for a 515k session. 9.7e9 OOMs at request time.
+# 512k + KV anchors (AWQ-INT4, fp8_e4m3 KV, MTP=3, pool 9.6e9).
+# Same MTP as the 435k production profile (block_size=1600, cadence 32000).
+# The pool must leave >= K free slots at full length (anchor deadlock criterion,
+# docs/kv-optimization/vllm_02_锚点.md 4.2). Cadence auto-aligns to the block
+# size (floor), so the raw 32000 is valid at 1600 and would floor to 31680 at
+# MTP1's 1584. 9.7e9 OOMs at request time.
 # SSD offload on: the pool is ~96% full, so a revert needs S to spill/restore
 # rather than be evicted.
 export OMP_NUM_THREADS=8
@@ -15,9 +15,8 @@ export VLLM_QWOPUS_MTP_BF16_DRAFT=1
 export VLLM_SM75_SPEC_SYNC_MODE=safe
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_PIN_MIN_TOKENS=16000
-# 512k auto-selects attention/mamba block_size=1584 (vs 1600 at 435k), so the
-# cadence must be a multiple of 1584 or durable mamba snapshots are disabled.
-export VLLM_MAMBA_CKPT_TOKENS=31680
+# Auto-aligned to the block size (MTP3 -> 1600 -> stays 32000).
+export VLLM_MAMBA_CKPT_TOKENS=32000
 export VLLM_MAMBA_CKPT_ANCHORS=3
 # Offload: with the pool ~96% full a revert would otherwise evict the resident
 # session instead of reusing it; the SSD tier lets S spill and be restored.
@@ -53,7 +52,7 @@ exec /home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/venv/bin/python -m vllm.entry
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml \
   --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}' \
   --cpu-offload-gb 0 \
   --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":4000000000}}' \

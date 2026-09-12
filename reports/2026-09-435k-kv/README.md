@@ -32,29 +32,31 @@ SSD 上复跑。
 - 指标：`stores=3`、`restores=2`、写 32.0 GiB、读 25.8 GiB；`nvidia-smi` 峰值 ≤21.8 GiB/卡。
 - 修复前：restore 后深回退 `cached=0`（整段重算，见 FP8 报告 §5）。
 
-## 3. 512k（满长 prefill + SSD 恢复 PASS；深回退未命中）
+## 3. 512k（MTP3：满长 prefill + SSD 恢复 + 深回退全 PASS）
 
-512k profile 的 OOM 回退梯：MTP 3→1、batched 4096→1024、池 `9.6e9`（`9.7e9` 首次请求
-即 OOM）→ 容量 **536,624** token。注意本配置自动选 **mamba/attention block_size=1584**
-（435k 是 1600），故锚点 cadence 必须是 1584 的整数倍：`VLLM_MAMBA_CKPT_TOKENS=31680`
-（32000 会因非整数倍被引擎**整体禁用锚点**并打印 warning）。
+512k profile 现与生产一致用 **MTP3**：block_size 自动选 **1600**，cadence 32000（MTP1 会选
+1584；本分支 cadence 已自动向下对齐到 block_size，32000 在两种情况下都能用）。OOM 回退梯：
+池 `9.6e9`（`9.7e9` 首次请求即 OOM）→ 容量 **525,816** token。
 
 | 请求 | prompt | cached | wall | sha |
 |---|---|---|---|---|
-| S 满长常驻 | 515,046 | 0 | 1504.5s | — |
-| T 小请求（挤出 S） | 114,348 | 0 | 137.5s | — |
-| **R 恢复（SSD 分块）** | 515,056 | **513,216**（99.6%） | 41.1s | `db8b8e836881534b` |
-| V 深回退 keep=30（restore 后） | 482,994 | **0** | 1354.3s | — |
+| S 满长常驻（31 轮） | 499,018 | 0 | 1490.7s | — |
+| T 小请求（挤出 S） | 114,348 | 0 | 137.8s | — |
+| **R 恢复（SSD 分块）** | 499,028 | **496,000**（99.4%） | 45.7s | `db8b8e836881534b` |
+| **V 深回退 keep=30** | 482,994 | **480,000** | 16.6s | — |
 
-- 结论：**满长 515k 不 OOM**；SSD 分块恢复正确（99.6%、sha 一致、41s vs 重算 1504s，约 36×）。
-- **深回退未命中**：池 536,624 对 515,046 只剩 ~21k free。V（482,994）一来，准入压力把
-  常驻链 **spill 到 SSD**；而 SSD 里存的是 515k 的完整链，`find` 只匹配"请求 ≥ 存储链"
-  （更长或同链），**不匹配更短的纯前缀**，故 V 无法 restore，从 0 重算。
-- 对比 435k：池 1.13×、剩 103k，V 不需挤走常驻链，直接在 GPU 前缀缓存命中。
-- 这是"内存余量 + SSD 只认长链"的组合限制，非锚点机制缺陷。可后续改进方向：让 SSD
-  `find` 也接受更短前缀（restore 会多载入尾部，需权衡），或为 revert 预留 headroom。
+- `SSD-512K-ANCHOR-DONE`：满长 prefill 不 OOM；SSD 分块恢复正确（99.4%、sha 一致、45.7s vs
+  重算 1490.7s，约 33×）；**restore 后深回退命中 480000 锚点**（`stores=2`，R 未被 spill）。
+- 深回退能否命中取决于**恢复后常驻链是否仍在 GPU**。MTP3/S=499k 时池剩 ~26.8k slot，R 恢复
+  后仍常驻，V 直接命中其前缀。
+- 对比 MTP1（`awq_512k_anchor_check.txt`，S=515k、池 536,624、仅剩 ~21.6k slot）：V 的准入
+  把常驻链 spill 到 SSD，而 SSD `find` 只认"更长/同链"、不认更短纯前缀 → 重算。即池贴近上限
+  时才会触发该限制。
+- 结论：MTP3 下 512k 全流程 PASS。极上限（S≥515k、free < ~7 slot）仍需 headroom，或后续让
+  SSD 支持"更短前缀"恢复（Phase C）。
 
 ## 4. 结果文件
 
 - `awq_435k_postfix_check.txt`：435k 复跑原始输出。
-- `awq_512k_anchor_check.txt`：512k 复跑原始输出。
+- `awq_512k_anchor_check.txt`：512k **MTP1** 复跑原始输出（深回退未命中）。
+- `awq_512k_mtp3_check.txt`：512k **MTP3** 复跑原始输出（全 PASS）。

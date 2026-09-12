@@ -1,0 +1,9 @@
+nvidia@start [21850, 21300]
+{'name': 'S full-length resident', 'prompt': 499018, 'cached': 0, 'wall': 1490.74, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'T smaller (forces S spill)', 'prompt': 114348, 'cached': 0, 'wall': 137.83, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'R resumed (SSD restore)', 'prompt': 499028, 'cached': 496000, 'wall': 45.69, 'sha': 'db8b8e836881534b'}
+{'name': 'V revert keep=30 (after restore)', 'prompt': 482994, 'cached': 480000, 'wall': 16.63, 'sha': 'e3b0c44298fc1c14'}
+nvidia@end [21950, 21400]
+R cached=496000 vs S prompt=499018 (>=90%: True)
+ANCHOR expect~480000 V=480000 (hit: True)
+SSD-512K-ANCHOR-DONE
