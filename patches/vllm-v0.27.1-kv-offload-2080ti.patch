@@ -1,9 +1,9 @@
 diff --git a/tests/v1/core/test_host_tier_spill.py b/tests/v1/core/test_host_tier_spill.py
 new file mode 100644
-index 000000000..7dac38bfc
+index 000000000..c3a8522a7
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_spill.py
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,395 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the session-level host-tier (RAM) spill/restore helpers.
@@ -86,28 +86,32 @@ index 000000000..7dac38bfc
 +        "tokens": 80_000,
 +        "slots": big_old,
 +        "parked_at": 1.0,
++        "last_used": 1.0,
 +    }
 +    manager._ram_sessions["big_new"] = {
 +        "req_id": "big_new",
 +        "tokens": 90_000,
 +        "slots": big_new,
 +        "parked_at": 2.0,
++        "last_used": 2.0,
 +    }
 +    manager._ram_sessions["small_old"] = {
 +        "req_id": "small_old",
 +        "tokens": 1_000,
 +        "slots": small_old,
 +        "parked_at": 3.0,
++        "last_used": 3.0,
 +    }
 +    manager._ram_sessions["small_new"] = {
 +        "req_id": "small_new",
 +        "tokens": 2_000,
 +        "slots": small_new,
 +        "parked_at": 4.0,
++        "last_used": 4.0,
 +    }
 +    assert manager.ram_slots_free() == 0
 +
-+    # Small tier drains first (oldest-first), then the large tier.
++    # Small tier drains first (LRU-first), then the large tier.
 +    manager.evict_ram_for(1)
 +    assert set(manager._ram_sessions) == {"big_old", "big_new", "small_new"}
 +    manager.evict_ram_for(3)
@@ -118,6 +122,45 @@ index 000000000..7dac38bfc
 +    # Protected session is never dropped, even when nothing else remains.
 +    manager.evict_ram_for(100, protect="big_new")
 +    assert "big_new" in manager._ram_sessions
++
++
++def test_evict_ram_for_uses_last_used_not_park_time() -> None:
++    """A session parked long ago but used recently outlives a newer park."""
++    manager = make_manager()
++    manager.set_ram_capacity(8)
++    old_but_hot = manager.alloc_ram_slots(4)
++    new_but_cold = manager.alloc_ram_slots(4)
++    manager._ram_sessions["old_but_hot"] = {
++        "req_id": "old_but_hot",
++        "tokens": 80_000,
++        "slots": old_but_hot,
++        "parked_at": 1.0,
++        "last_used": 9.0,
++    }
++    manager._ram_sessions["new_but_cold"] = {
++        "req_id": "new_but_cold",
++        "tokens": 90_000,
++        "slots": new_but_cold,
++        "parked_at": 2.0,
++        "last_used": 2.0,
++    }
++    manager.evict_ram_for(4)
++    assert set(manager._ram_sessions) == {"old_but_hot"}
++
++
++def test_find_ram_session_refreshes_recency() -> None:
++    manager = make_manager()
++    manager._ram_sessions["s"] = {
++        "req_id": "s",
++        "tail": b"h2",
++        "tokens": 20,
++        "grp_hashes": [[b"h0", b"h1", b"h2"]],
++        "slots": [0, 1, 2],
++        "parked_at": 1.0,
++        "last_used": 1.0,
++    }
++    assert manager.find_ram_session([b"h0", b"h1", b"h2"]) is not None
++    assert manager._ram_sessions["s"]["last_used"] > 1.0
 +
 +
 +def test_find_ram_session_tail_and_prefix() -> None:
@@ -152,6 +195,7 @@ index 000000000..7dac38bfc
 +                "req_id": req_id,
 +                "tokens": tokens,
 +                "parked_at": parked_at,
++                "last_used": parked_at,
 +                "blocks": [],
 +                "grp_blocks": [],
 +            }
@@ -357,10 +401,10 @@ index 000000000..7dac38bfc
 +    assert manager.block_pool.get_num_free_blocks() == free_before + 2
 diff --git a/tests/v1/core/test_host_tier_ssd.py b/tests/v1/core/test_host_tier_ssd.py
 new file mode 100644
-index 000000000..dc953f925
+index 000000000..e1273e98f
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_ssd.py
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,368 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the two-tier GPU/SSD host tier (``HostTierSSDStore``).
@@ -549,6 +593,30 @@ index 000000000..dc953f925
 +    assert store.find([tail(2)]) is None  # small_new evicted first
 +    assert os.path.exists(store.session_dir("big_old"))
 +    assert not os.path.exists(store.session_dir("small_new"))
++
++    store.shutdown()
++    close_view(buf, view, flat)
++
++
++def test_touch_makes_session_most_recent(tmp_path) -> None:
++    buf, view, flat = make_view(16)
++    store = make_store(tmp_path, view, quota_bytes=2 * 2 * ROW)
++    nbytes = 2 * ROW
++    for i, sid in enumerate(("a", "b")):
++        store.evict_for(nbytes)
++        assert (
++            store.submit_store(
++                sid, [i, i + 1], [[bytes([i]) * 16]], tail(i), 80_000
++            )
++            is not None
++        )
++        wait_n(store, 1)
++
++    # "a" was parked first but is touched afterwards, so "b" is the LRU victim.
++    store.touch("a")
++    store.evict_for(nbytes)
++    assert store.find([tail(0)]) is not None
++    assert store.find([tail(1)]) is None
 +
 +    store.shutdown()
 +    close_view(buf, view, flat)
@@ -1301,7 +1369,7 @@ index a64b7e321..4cb11ad9f 100644
      def reset_prefix_cache(self) -> bool:
 diff --git a/vllm/v1/core/host_tier_ssd.py b/vllm/v1/core/host_tier_ssd.py
 new file mode 100644
-index 000000000..ea19854ea
+index 000000000..c325c86c9
 --- /dev/null
 +++ b/vllm/v1/core/host_tier_ssd.py
 @@ -0,0 +1,585 @@
@@ -1339,15 +1407,15 @@ index 000000000..ea19854ea
 +from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 +
 +
-+def evict_sort_key(tokens: int, age: float) -> tuple[int, float]:
-+    """Host-tier eviction order: small sessions first, oldest within a tier.
++def evict_sort_key(tokens: int, last_used: float) -> tuple[int, float]:
++    """Host-tier eviction order: small sessions first, LRU within a tier.
 +
 +    ``VLLM_HOSTTIER_EVICT_SMALL_TOKENS`` splits sessions into a small tier
-+    (evicted first) and a large tier; both tiers are ordered oldest-first.
-+    A non-positive threshold collapses the two tiers into one (pure oldest).
++    (evicted first) and a large tier; both tiers are ordered least-recently-used
++    first. A non-positive threshold collapses the two tiers into one (pure LRU).
 +    """
 +    small = envs.VLLM_HOSTTIER_EVICT_SMALL_TOKENS
-+    return (1 if 0 < small <= tokens else 0, age)
++    return (1 if 0 < small <= tokens else 0, last_used)
 +
 +logger = init_logger(__name__)
 +
@@ -1937,7 +2005,7 @@ index 70cd26750..e2ac02b34 100644
  
      def allocate_new_computed_blocks(
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index fcb67726a..82739c1d0 100644
+index fcb67726a..53db6d88e 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,19 +2,26 @@
@@ -2078,7 +2146,7 @@ index fcb67726a..82739c1d0 100644
              return None
  
          if (
-@@ -577,6 +658,573 @@ class KVCacheManager:
+@@ -577,6 +658,568 @@ class KVCacheManager:
              self.block_pool.free_blocks(pins)
          self.coordinator.free(request.request_id)
  
@@ -2105,8 +2173,8 @@ index fcb67726a..82739c1d0 100644
 +        # Pin the chain across ALL single-type groups (attention + GDN/mamba):
 +        # a prefix-cache chain only survives if none of its pages is reused, and
 +        # reuse of a page in any group invalidates the whole chain in this build.
-+        # ``block_size`` (per group, may differ) weights the entry size so
-+        # release_pins_smallest can compare sessions by occupied cache tokens.
++        # ``block_size`` (per group, may differ) weights the entry size so the
++        # eviction sort can compare sessions by occupied cache tokens.
 +        for mgr_idx, manager in enumerate(managers):
 +            blocks = manager.req_to_blocks.get(request.request_id, ())
 +            if envs.RAMTRACE:
@@ -2251,6 +2319,7 @@ index fcb67726a..82739c1d0 100644
 +                "num_blocks": len(entries),
 +                "anchors": len(anchor_ids),
 +                "parked_at": time.monotonic(),
++                "last_used": time.monotonic(),
 +            }
 +        )
 +        return len(entries)
@@ -2288,21 +2357,6 @@ index fcb67726a..82739c1d0 100644
 +
 +    def num_ram_sessions(self) -> int:
 +        return len(self._ram_sessions)
-+
-+    def release_pins_smallest(self, need_free_blocks: int) -> int:
-+        """Release keep-alive entries (smallest first) until there are enough
-+        free blocks, or no pinned entries remain.
-+
-+        Returns the number of entries released.
-+        """
-+        released = 0
-+        while self._auto_pin_entries:
-+            if self.block_pool.get_num_free_blocks() >= need_free_blocks:
-+                break
-+            smallest = min(self._auto_pin_entries, key=lambda e: e["tokens"])
-+            self._unpin_entry(smallest)
-+            released += 1
-+        return released
 +
 +    # ------------------------------------------------------------------ #
 +    # Host-tier session spill (RAM parking).                             #
@@ -2366,10 +2420,10 @@ index fcb67726a..82739c1d0 100644
 +        """Move keep-alive entries into spill hold in host-tier eviction order.
 +
 +        Small sessions (< ``VLLM_HOSTTIER_EVICT_SMALL_TOKENS``) are chosen
-+        first, then large ones; within each tier the oldest is chosen first.
-+        Unlike ``release_pins_smallest`` this does NOT unpin/free: blocks stay
-+        pinned until their host store completes (correctness-first ordering),
-+        then are released by ``confirm_spill``. Returns the chosen entries.
++        first, then large ones; within each tier the least recently used is
++        chosen first. This does NOT unpin/free: blocks stay pinned until their
++        host store completes (correctness-first ordering), then are released by
++        ``confirm_spill``. Returns the chosen entries.
 +        """
 +        chosen: list[dict[str, Any]] = []
 +        while self._auto_pin_entries:
@@ -2377,7 +2431,9 @@ index fcb67726a..82739c1d0 100644
 +                break
 +            victim = min(
 +                self._auto_pin_entries,
-+                key=lambda e: evict_sort_key(e["tokens"], e["parked_at"]),
++                key=lambda e: evict_sort_key(
++                    e["tokens"], e.get("last_used", e["parked_at"])
++                ),
 +            )
 +            req_id = victim["req_id"]
 +            self._auto_pin_entries.remove(victim)
@@ -2515,6 +2571,7 @@ index fcb67726a..82739c1d0 100644
 +            "num_blocks": entry["num_blocks"],
 +            "slots": slots or [],
 +            "parked_at": time.monotonic(),
++            "last_used": time.monotonic(),
 +        }
 +        if envs.RAMTRACE:
 +            try:
@@ -2535,10 +2592,10 @@ index fcb67726a..82739c1d0 100644
 +    def evict_ram_for(self, need: int, protect: str | None = None) -> int:
 +        """Free host slots by dropping parked sessions in eviction order.
 +
-+        Small sessions go first, then large ones; within each tier the oldest
-+        parked session is dropped first. ``protect`` (the session being
-+        restored, i.e. X) is never dropped. Returns the number of sessions
-+        dropped.
++        Small sessions go first, then large ones; within each tier the least
++        recently used session (LRU, by ``last_used``) is dropped first.
++        ``protect`` (the session being restored, i.e. X) is never dropped.
++        Returns the number of sessions dropped.
 +        """
 +        dropped = 0
 +        while self.ram_slots_free() < need:
@@ -2551,7 +2608,9 @@ index fcb67726a..82739c1d0 100644
 +                break
 +            victim = min(
 +                candidates,
-+                key=lambda s: evict_sort_key(s["tokens"], s["parked_at"]),
++                key=lambda s: evict_sort_key(
++                    s["tokens"], s.get("last_used", s["parked_at"])
++                ),
 +            )
 +            self._ram_sessions.pop(victim["req_id"], None)
 +            self.free_ram_slots(victim["slots"])
@@ -2597,6 +2656,10 @@ index fcb67726a..82739c1d0 100644
 +            if hit:
 +                best = sess
 +                best_len = n
++        if best is not None:
++            # LRU recency: a session that is being probed for restore counts as
++            # used, so it is not the first victim of the next eviction.
++            best["last_used"] = time.monotonic()
 +        return best
 +
 +    def allocate_restore_blocks(
@@ -2668,7 +2731,7 @@ index 9aea06109..8adaf23dd 100644
      # when the block is full and cached.
      _block_hash: BlockHashWithGroupId | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b4521a2e1..5397393fc 100644
+index b4521a2e1..958bbc1d2 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -3105,7 +3168,7 @@ index b4521a2e1..5397393fc 100644
              num_tokens_main_model=full_num_tokens,
              apply_admission_cap=True,
          )
-@@ -2632,6 +2918,732 @@ class Scheduler(SchedulerInterface):
+@@ -2632,6 +2918,735 @@ class Scheduler(SchedulerInterface):
              self._request_remaining_blocks(req) for req in self._inflight_prefills
          )
  
@@ -3717,6 +3780,9 @@ index b4521a2e1..5397393fc 100644
 +        if sess is None and self._ssd_store is not None:
 +            sess = self._ssd_store.find(request.block_hashes)
 +            ssd_mode = sess is not None
++            if sess is not None:
++                # LRU recency: a probed session counts as used.
++                self._ssd_store.touch(sess["sid"])
 +        if sess is None:
 +            self._ramtrace(
 +                f"restore probe req={request.request_id} "
@@ -3838,7 +3904,7 @@ index b4521a2e1..5397393fc 100644
      def _update_waiting_for_remote_kv(self, request: Request) -> None:
          """
          KV Connector: update request state after async recv is finished.
-@@ -2724,6 +3736,7 @@ class Scheduler(SchedulerInterface):
+@@ -2724,6 +3739,7 @@ class Scheduler(SchedulerInterface):
  
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)

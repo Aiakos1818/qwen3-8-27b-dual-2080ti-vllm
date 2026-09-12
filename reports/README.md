@@ -27,9 +27,9 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | 权重显存 / KV 容量 | 14.96 GiB/卡；`GPU KV cache size 106,288`（与 AWQ 同池同值） |
 | RAM restore 正确性 | sha `db8b8e836881534b` 与 baseline 一致，0 NaN |
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
-| SSD 真盘 park/resume | `R cached=81600 / 11.4s`，sha 一致，写 8.75 GiB / 读 3.73 GiB |
+| SSD 真盘 park/resume | `R cached=81600 / 10.7s`，sha 一致，写 9.34 GiB / 读 2.85 GiB |
 | SSD 强制分块矩阵 | **18/18 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400`、`S3b 二次停车 keep2=30400` |
-| 单元测试 | 133 passed（含新增回归测试） |
+| 单元测试 | 136 passed（含新增回归测试与真 LRU 测试） |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
 
@@ -44,6 +44,22 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 3. 恢复会话的前缀命中只认领恢复点一个状态块，旧锚点成为无主闲置块 → 首次缓存时
    `_adopt_cached_durable_anchors` 把缓存中仍在的 cadence 锚点重新认领进窗口/保活 entry。
    二次停车后深回退由 `cached=0` 修复为 **`cached=30400`**（`p03 test2`）。
+
+## 2026-09-435k-kv（2026-09-13）
+
+[435k / 512k KV 复验报告](2026-09-435k-kv/)。三个锚点修复落地后，用最终代码在真 NVMe SSD 上
+复跑 AWQ-INT4 长上下文：
+
+| 检查 | 结果 |
+|---|---|
+| 435k 常驻深回退 | `V0 cached=352000` ✅ |
+| 435k SSD 恢复 + 深回退 | `R cached=384000`（sha 一致）→ `V2 cached=352000` ✅ |
+| 512k 满长 prefill | 515,046 token，无 OOM ✅ |
+| 512k SSD 分块恢复 | `R cached=513216`（99.6%，sha 一致，41s vs 重算 1504s）✅ |
+| 512k 深回退 | 满池下未命中（`V=0`）：常驻链被 spill 到 SSD，而 SSD 只认"更长/同链" ⚠️ |
+
+结论：435k 三个修复端到端 PASS；512k 满长与 SSD 恢复 PASS，满池深回退受"内存余量 + SSD
+只认长链"限制（非锚点缺陷）。
 
 ## 声明
 

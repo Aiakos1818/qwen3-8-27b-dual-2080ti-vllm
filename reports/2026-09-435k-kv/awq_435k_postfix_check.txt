@@ -1,0 +1,12 @@
+nvidia@start [21353, 20824]
+{'name': 'S resident', 'prompt': 386822, 'cached': 0, 'wall': 786.48, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'V0 revert keep=22 (resident)', 'prompt': 354770, 'cached': 352000, 'wall': 10.38, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'T smaller (forces S spill)', 'prompt': 162430, 'cached': 0, 'wall': 198.79, 'sha': 'e3b0c44298fc1c14'}
+{'name': 'R resumed (SSD restore)', 'prompt': 386832, 'cached': 384000, 'wall': 52.99, 'sha': 'db8b8e836881534b'}
+{'name': 'V2 revert keep=22 (after restore)', 'prompt': 354770, 'cached': 352000, 'wall': 9.9, 'sha': 'e3b0c44298fc1c14'}
+nvidia@end [21773, 21244]
+METRICS {'stores': 3.0, 'restores': 2.0, 'write_bytes': 34370355200.0, 'read_bytes': 27741388800.0, 'sessions': 1.0}
+DISK_BYTES 6628966457
+R cached=384000 vs S prompt=386822 (>=90% prefix restored: True)
+ANCHOR target~352000 V0=352000 V2=352000 (V0 hit: True, V2 hit: True)
+SSD-435K-REVERT-DONE

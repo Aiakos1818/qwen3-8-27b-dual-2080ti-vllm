@@ -254,7 +254,7 @@ host-tier 的所有“挑被驱逐会话”的决策统一为**两档**策略，
 
 - 档 0（`tokens < 阈值`，小会话，重算便宜）：优先驱逐。
 - 档 1（`tokens >= 阈值`）：小会话耗尽后才动。
-- 每档内按**最旧优先**（`parked_at` / `last_used`）。
+- 每档内按 **LRU（最近最少使用，`last_used`）** 优先驱逐。
 
 统一入口 `evict_sort_key(tokens, age)`（`host_tier_ssd.py`），作用于：
 
@@ -265,8 +265,9 @@ host-tier 的所有“挑被驱逐会话”的决策统一为**两档**策略，
 | RAM 空间不足释放 | `kv_cache_manager.evict_ram_for` | `protect`（恢复目标 X）不驱逐 |
 | SSD 配额不足释放 | `HostTierSSDStore.evict_for` | in-flight 会话不驱逐（详见 04） |
 
-年龄字段：GPU 保活条目与 RAM 会话在 park 时写 `parked_at`（`time.monotonic()`）；
-SSD 会话用既有 `last_used`。启动日志
+年龄字段：`last_used` 在 park/store 时初始化（同时保留 `parked_at`）；恢复探测命中时刷新
+（RAM 在 `find_ram_session`，SSD 在 `_maybe_begin_restore` 调 `touch`），故"刚被探过的会话"
+不会成为下一个受害者。启动日志
 `HostTierSSD: staging_slots=.. chunk_slots=.. evict_small=<n> block_size=<n>` 打印生效阈值。
 435k 生产脚本取 `VLLM_HOSTTIER_EVICT_SMALL_TOKENS=32000`（对齐保活 16k / 锚点 32k）。
 

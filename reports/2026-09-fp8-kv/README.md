@@ -53,7 +53,10 @@
 
 ### 3.2 RAM spill/restore 指标
 
-`host_tier_spills=2, restores=1, drops=0, evictions=0`；`keep_alive_entries=1, tokens=52800`。
+P3 代码（真 LRU 淘汰）在干净引擎上复测 `correctness_check.py offload`：`R-restored cached=46400`、
+sha 一致；`host_tier_spills=1, restores=1, evictions=0, drops=1`；`keep_alive_entries=1,
+tokens=62400, anchors=6, anchor_sessions=1`。（修复 1–2 时代的旧值 `spills=2, restores=1,
+drops=0`，随负载/时序略有差异，正确性不变。）
 
 ### 3.3 RAM offload 矩阵（`offload_matrix.py`）
 
@@ -72,6 +75,9 @@
 这是"续聊会话携带锚点"的既定代价（淘汰按时间，见
 `docs/kv-optimization/vllm_02_锚点.md` §2.3.2）；矩阵是 71 槽容量的边界压力测试，
 命中数对 entry 大小敏感，不是正确性指标。单会话生产配置（`max-num-seqs=1`）不受影响。
+
+P3 真 LRU 代码复跑矩阵（`fp8_100k_offload_matrix_p3.txt`）同样 **2/4**：LRU 只改变同档内
+受害者的选择依据（最近使用），不改变"entry 变大 → 满池边界受害者移动"的结果。
 
 ### 3.4 锚点（Mamba 深回退）
 
@@ -247,7 +253,7 @@ python scripts/ssd_crash_check.py
 
 `p03_restore_revert.py` 支持 `control|test|test2` 三种模式（`test2` 为两轮停车/恢复）。
 
-单元测试（133 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领三个回归测试）：
+单元测试（136 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领、真 LRU 三个回归测试）：
 
 ```bash
 cd zyYuc-sandbox/src/vllm-0271

@@ -192,12 +192,12 @@ export VLLM_SSD_ONLY=1
 | NVMe（Colorful CN600 476 GiB） | **0.93 GiB/s** | **1.68 GiB/s** | 系统盘，171 GiB 空闲 |
 | tmpfs（`/dev/shm`） | 2.51 GiB/s | 5.68 GiB/s | 用于功能矩阵，无磨损 |
 
-### 6.2 单元测试（133 passed，2026-09 更新）
+### 6.2 单元测试（136 passed，2026-09 更新）
 
-- `tests/v1/core/test_host_tier_ssd.py`：10 例（chunked roundtrip / abort 释放配额 /
-  load range 边界 / 两档驱逐）。
-- `tests/v1/core/test_host_tier_spill.py`：11 例（release 部分释放+abort 不重复 unpin /
-  hold+release restored blocks / 两档驱逐）。
+- `tests/v1/core/test_host_tier_ssd.py`：11 例（chunked roundtrip / abort 释放配额 /
+  load range 边界 / 两档 LRU 驱逐 / `touch` 刷新 recency）。
+- `tests/v1/core/test_host_tier_spill.py`：13 例（release 部分释放+abort 不重复 unpin /
+  hold+release restored blocks / 两档 LRU 驱逐 / `find` 刷新 recency）。
 - `tests/v1/core/test_prefix_caching.py`：89 例回归。
 - `tests/v1/core/test_mamba_align_chunk_split.py`：23 例（含 `_remove_blocks_in_range`
   保留 pre-cadence 锚点、恢复会话重新认领缓存锚点、抢占后不重认领的回归测试）。
@@ -250,9 +250,11 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 > 降到 `9.0e9` 后容量 489,789 token、峰值 ~20.4GiB，留 ~0.5-0.8GiB 余量。附带结论：本机 fp8 KV
 > 下 **512k 也几乎可行**（按 17.9 KiB/token 只需 ~9.65e9 B = 8.99 GiB 池）。
 
-> **注（2026-09-12）**：上表采集于三个锚点修复（MTP eagle-drop 对齐、head-prefix free 保留、
+> **注（2026-09-13）**：上表采集于三个锚点修复（MTP eagle-drop 对齐、head-prefix free 保留、
 > 恢复会话认领旧锚点）**之前**。修复后的 435k 端到端复跑（含 restore 后深回退锚点命中）
-> 见本仓 `reports/2026-09-fp8-kv/` 的对应结果文件；表内数字如与复跑不一致以复跑为准。
+> 见 [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)：S 386,822 →
+> T 162,430 挤出 → R `cached=384,000`（sha 一致）→ 深回退 `352000`。同报告还含 512k 满长
+> 复验与"深回退未命中"的成因。表内数字如与复跑不一致以复跑为准。
 
 ### 6.5 中断原子性
 
@@ -295,6 +297,12 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 - **O_DIRECT**：tmpfs 在本内核可用（probe=True），不可用时自动回退 buffered。
 - 系统盘与 OS/模型权重共用：独立目录 + 限速，避免影响其他负载。
 - **锚点 cadence**：C=32000/K=3 覆盖近尾 96k；更深的截断重发无锚点可用（见 02）。
+- **cadence 必须是 mamba block_size 的整数倍**：435k 自动选 1600（32000 合法）；512k 自动选
+  **1584**，须用 `VLLM_MAMBA_CKPT_TOKENS=31680`，否则引擎打印 warning 并**禁用锚点**。
+- **满池下深回退**：512k（池 536,624、S 515,046，仅剩 ~21k）时，深回退请求的准入压力会把常驻
+  链 spill 到 SSD；SSD `find` 只匹配"请求 ≥ 存储链"（更长/同链），**更短的纯前缀不 restore**
+  → 重算。435k（池 1.13×、剩 ~100k）无此问题。见
+  [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)。
 - 启动 flakiness（TP warmup CUDA invalid argument）与实现无关；重试前清理
   `/dev/shm/vllm_offload_*.mmap` 残留（失败的 worker 会留下 ~858 MiB 文件，多次失败会拖垮后续启动）。
 
