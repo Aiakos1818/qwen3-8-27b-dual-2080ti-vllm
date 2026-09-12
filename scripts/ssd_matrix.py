@@ -6,6 +6,7 @@ Runs the whole validation matrix against one already-running server:
   S2 SSD park/resume              -> sha matches S1, cached > 0
   S3 deep revert after SSD restore-> keep=2 -> cached=30400, keep=3 -> 46400
                                      (MTP drops one block; 32000/48000 without)
+  S3b double park/restore cycle   -> cycle2 keep=2 still cached=30400
   S4 quota LRU                    -> evictions >= 1, sessions <= 2, resume OK
   S5 concurrency (p15)            -> no corrupted, shas consistent
 Plus a NaN scan of the engine trace log.
@@ -149,6 +150,14 @@ def main() -> int:
     record("S3 SSD restore + deep revert",
            ok_t and t2 in keep2_expected and t3 in keep3_expected,
            f"keep2={t2} keep3={t3}")
+
+    # S3b: two park/restore cycles. The second deep revert only hits its
+    # anchor if the resumed session re-claimed it into its keep-alive entry.
+    ok_t2, out_t2 = run_script("S3b test2", ["p03_restore_revert.py", "test2"])
+    t2b = parse_cached(out_t2, "revert keep=2 cycle2")
+    record("S3b double-cycle deep revert",
+           ok_t2 and t2b in keep2_expected,
+           f"cycle2 keep2={t2b}")
 
     # S1/S2: baseline vs SSD park/resume.
     ok, out_b = run_script("S1 baseline", ["correctness_check.py", "baseline"])

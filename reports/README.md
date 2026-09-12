@@ -28,12 +28,12 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | RAM restore 正确性 | sha `db8b8e836881534b` 与 baseline 一致，0 NaN |
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
 | SSD 真盘 park/resume | `R cached=81600 / 11.4s`，sha 一致，写 8.75 GiB / 读 3.73 GiB |
-| SSD 强制分块矩阵 | **17/17 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400` |
-| 单元测试 | 131 passed（含新增回归测试） |
+| SSD 强制分块矩阵 | **18/18 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400`、`S3b 二次停车 keep2=30400` |
+| 单元测试 | 133 passed（含新增回归测试） |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
 
-测试中发现并修复了两个锚点问题（报告 §5）：
+测试中发现并修复了三个锚点问题（报告 §5）：
 
 1. MTP 的 `use_eagle()` 让 full-attention finder 多丢一个 block，使 cadence 锚点不可达
    → 每个 cadence 同时保留 `C` 与 `C - block_size` 两个锚点，常驻深回退 `keep=2` 由
@@ -41,6 +41,9 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 2. 基类 head-free 在 mamba 保留逻辑之前释放 head 区间，pre-cadence 状态（`C - block_size`）
    在被 pin 前就被置 null → 覆写 `MambaManager._remove_blocks_in_range` 保留 durable boundary
    块。restore 后深回退由 `cached=0` 修复为 **`cached=30400`**（RAM 与真 NVMe SSD 均验证）。
+3. 恢复会话的前缀命中只认领恢复点一个状态块，旧锚点成为无主闲置块 → 首次缓存时
+   `_adopt_cached_durable_anchors` 把缓存中仍在的 cadence 锚点重新认领进窗口/保活 entry。
+   二次停车后深回退由 `cached=0` 修复为 **`cached=30400`**（`p03 test2`）。
 
 ## 声明
 

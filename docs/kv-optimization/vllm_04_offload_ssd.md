@@ -192,15 +192,15 @@ export VLLM_SSD_ONLY=1
 | NVMe（Colorful CN600 476 GiB） | **0.93 GiB/s** | **1.68 GiB/s** | 系统盘，171 GiB 空闲 |
 | tmpfs（`/dev/shm`） | 2.51 GiB/s | 5.68 GiB/s | 用于功能矩阵，无磨损 |
 
-### 6.2 单元测试（131 passed，2026-09 更新）
+### 6.2 单元测试（133 passed，2026-09 更新）
 
 - `tests/v1/core/test_host_tier_ssd.py`：10 例（chunked roundtrip / abort 释放配额 /
   load range 边界 / 两档驱逐）。
 - `tests/v1/core/test_host_tier_spill.py`：11 例（release 部分释放+abort 不重复 unpin /
   hold+release restored blocks / 两档驱逐）。
 - `tests/v1/core/test_prefix_caching.py`：89 例回归。
-- `tests/v1/core/test_mamba_align_chunk_split.py`：21 例（含 `_remove_blocks_in_range`
-  保留 pre-cadence 锚点的回归测试）。
+- `tests/v1/core/test_mamba_align_chunk_split.py`：23 例（含 `_remove_blocks_in_range`
+  保留 pre-cadence 锚点、恢复会话重新认领缓存锚点、抢占后不重认领的回归测试）。
 
 ### 6.3 功能矩阵（tmpfs 假 SSD，强制分块）**17/17（1 soft）**
 

@@ -171,6 +171,36 @@ MTP 推测解码会让 `SpeculativeConfig.use_eagle()` 返回 True，于是
 （去掉覆写即失败）。代价：每 cadence 多 pin 一个 pre-cadence 锚点，保活 entry 略大，
 LRU 淘汰顺序变化，但命中总数不变（见 `reports/2026-09-fp8-kv/` §3.3）。
 
+#### 2.3.2 恢复会话不认领旧锚点（二次停车后深回退，2026-09 修复）
+
+Mamba 前缀命中只认领**一个**状态块（恢复点，如 48000）；更早的持久锚点
+（30400/32000）留在公共缓存里成为"无主闲置块"——不进 `req_to_blocks`、不进窗口、
+不进保活 entry，也不受 K 保护，随时可被普通缓存挤掉。后果：
+
+- 第一次 restore 后深回退仍可能命中（锚点还躺在 GPU 缓存里，best-effort，p03 test 实测如此）；
+- 但该会话再次停车时 entry 里没有锚点（续聊 34 车位 vs 新会话 40），二次 restore 后
+  GPU 上的旧锚点已被挤出 → 深回退退化为整段重算（实测 `cached=0`、43s）。
+
+修复：`MambaManager` 在请求**首次缓存且此前已有前缀命中**时调用
+`_adopt_cached_durable_anchors`——按 hash 从尾向头扫 cadence 边界，把缓存中仍在的
+状态块 `touch`（ref 0→1）→ `_retain_durable_anchor`（pin + 入窗，同一
+`VLLM_MAMBA_CKPT_ANCHORS × 2` 上限）。之后生命周期与新会话锚点完全一致：运行期受
+pin/K 保护，结束由 `take_durable_window` 交给保活 entry（34→40），spill/restore 随链走。
+每请求只认领一次，且仅在**首次调度**（`num_preemptions == 0`）时认领：被抢占后的
+锚点已是该请求自己的空闲块，再 pin 会把它们从空闲队列抽走，导致其下一次分配
+在池边界上饿死（`need=3 avail=1` 活锁；tmpfs 矩阵 S3 实测）。
+
+实测（FP8 100k、MTP3、RAM）：`p03_restore_revert.py test2`
+（A→B→A→revert→B→A→revert）两轮 `keep=2` 均 `cached=30400`（修复前第二轮 `0`）；
+trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点），
+修复前 `[1,1,1,30]`。
+
+回归测试：`test_resumed_session_reclaims_cached_anchors`（去掉认领即失败）与
+`test_preempted_request_does_not_re_adopt_anchors`（去掉 `num_preemptions == 0`
+门控即失败）。
+代价：续聊/回退会话的 entry 由 34 增至 40 车位，RAM 淘汰时机提前；
+`offload_matrix` 的淘汰受害者随之变化（3/4 → 2/4，见 `reports/2026-09-fp8-kv/` §3.3）。
+
 ---
 
 ## 3. 语义与约束
@@ -311,5 +341,7 @@ LRU 淘汰顺序变化，但命中总数不变（见 `reports/2026-09-fp8-kv/` �
 - 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`logs/server_100k.log`
 
 测试：`tests/v1/core/test_prefix_caching.py`（89 例）、
-`tests/v1/core/test_mamba_align_chunk_split.py`（21 例，含 §2.3.1 的
-`test_durable_boundaries_survive_head_free`）等，`pytest --noconftest` 运行。
+`tests/v1/core/test_mamba_align_chunk_split.py`（23 例，含 §2.3.1 的
+`test_durable_boundaries_survive_head_free` 与 §2.3.2 的
+`test_resumed_session_reclaims_cached_anchors`、
+`test_preempted_request_does_not_re_adopt_anchors`）等，`pytest --noconftest` 运行。

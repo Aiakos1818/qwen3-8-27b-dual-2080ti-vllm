@@ -706,10 +706,34 @@ index 000000000..dc953f925
 +    store.shutdown()
 +    close_view(buf, view, flat)
 diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
-index 31671caf7..58f69e88e 100644
+index 31671caf7..acf187343 100644
 --- a/tests/v1/core/test_mamba_align_chunk_split.py
 +++ b/tests/v1/core/test_mamba_align_chunk_split.py
-@@ -209,6 +209,41 @@ def test_poisoning_is_block_size_independent(
+@@ -78,6 +78,8 @@ def _split(
+     num_new_tokens: int,
+     use_eagle: bool = True,
+     partial_hit: bool = False,
++    num_new_local_computed_tokens: int = 0,
++    num_external_computed_tokens: int = 0,
+ ) -> int:
+     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
+     stub = SimpleNamespace(
+@@ -89,7 +91,13 @@ def _split(
+         mamba_partial_cache_hit=partial_hit,
+         hash_block_size=ATTN_BLOCK_SIZE,
+     )
+-    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
++    return Scheduler._mamba_block_aligned_split(
++        stub,
++        request,
++        num_new_tokens,
++        num_new_local_computed_tokens,
++        num_external_computed_tokens,
++    )
+ 
+ 
+ def _run_chunked_prefill(
+@@ -209,6 +217,191 @@ def test_poisoning_is_block_size_independent(
      assert _prefill(prompt_len, budgets=budgets) > 0
  
  
@@ -746,6 +770,156 @@ index 31671caf7..58f69e88e 100644
 +    # The retained entries are detached from the table like any freed block.
 +    blocks = mamba.req_to_blocks[request.request_id]
 +    assert blocks[0].is_null and blocks[1].is_null
++
++
++def test_resumed_session_reclaims_cached_anchors(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A request resuming from the prefix cache re-claims the session's durable
++    anchors instead of leaving them as unowned idle blocks.
++
++    A mamba prefix hit adopts only the single state block at the resume
++    boundary; without the re-claim the older anchors are neither protected by
++    the resumed request's window nor carried into its keep-alive entry, so a
++    second park/restore cycle loses them and a deep revert recomputes.
++    """
++    from vllm import envs
++
++    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
++    manager = _make_hybrid_kv_cache_manager()
++    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++
++    (producer,) = create_requests(
++        1,
++        num_tokens=3602,
++        block_size=ATTN_BLOCK_SIZE,
++        same_prompt=True,
++        req_ids=["producer"],
++    )
++    _run_chunked_prefill(manager, producer, [])
++    mamba.remove_skipped_blocks(producer.request_id, 3602, 3602)
++    anchors = mamba.take_durable_window(producer.request_id)
++    assert sorted(b.block_hash_num_tokens for b in anchors) == [
++        MAMBA_BLOCK_SIZE,
++        2 * MAMBA_BLOCK_SIZE,
++    ]
++    # The session goes to the host tier and comes back: its anchors are
++    # re-loaded as ordinary idle cached blocks (hash kept, no owner).
++    for blk in anchors:
++        mamba._release_durable_anchor(blk)
++    manager.free(producer)
++
++    (consumer,) = create_requests(
++        1,
++        num_tokens=3602,
++        block_size=ATTN_BLOCK_SIZE,
++        same_prompt=True,
++        req_ids=["consumer"],
++    )
++    # The consumer is scheduled in a later step than the producer.
++    manager.new_step_starts()
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
++    assert num_computed >= 2 * MAMBA_BLOCK_SIZE
++    num_new = _split(
++        consumer,
++        consumer.num_tokens - num_computed,
++        num_new_local_computed_tokens=num_computed,
++    )
++    assert (
++        manager.allocate_slots(
++            consumer,
++            num_new,
++            num_new_computed_tokens=num_computed,
++            new_computed_blocks=computed_blocks,
++            num_lookahead_tokens=NUM_SPEC,
++        )
++        is not None
++    )
++
++    win = mamba._durable_win.get(consumer.request_id, [])
++    assert all(b.pinned for b in win)
++    adopted = mamba.take_durable_window(consumer.request_id)
++    assert sorted((b.block_id, b.block_hash_num_tokens) for b in adopted) == sorted(
++        (b.block_id, b.block_hash_num_tokens) for b in anchors
++    )
++
++
++def test_preempted_request_does_not_re_adopt_anchors(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A re-scheduled (preempted) request must not re-claim its own anchors.
++
++    After preemption the cached anchors are this request's own idle blocks;
++    pinning them would withdraw them from the free queue and starve the
++    request's next allocation (pool-boundary livelock).
++    """
++    from vllm import envs
++
++    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
++    manager = _make_hybrid_kv_cache_manager()
++    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++
++    (producer,) = create_requests(
++        1,
++        num_tokens=3602,
++        block_size=ATTN_BLOCK_SIZE,
++        same_prompt=True,
++        req_ids=["producer"],
++    )
++    _run_chunked_prefill(manager, producer, [])
++    mamba.remove_skipped_blocks(producer.request_id, 3602, 3602)
++    for blk in mamba.take_durable_window(producer.request_id):
++        mamba._release_durable_anchor(blk)
++    manager.free(producer)
++
++    (consumer,) = create_requests(
++        1,
++        num_tokens=3602,
++        block_size=ATTN_BLOCK_SIZE,
++        same_prompt=True,
++        req_ids=["consumer"],
++    )
++    manager.new_step_starts()
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
++    assert (
++        manager.allocate_slots(
++            consumer,
++            _split(
++                consumer,
++                consumer.num_tokens - num_computed,
++                num_new_local_computed_tokens=num_computed,
++            ),
++            num_new_computed_tokens=num_computed,
++            new_computed_blocks=computed_blocks,
++            num_lookahead_tokens=NUM_SPEC,
++        )
++        is not None
++    )
++    assert mamba._durable_win.get(consumer.request_id)
++
++    # Preempt: the window and the request's blocks are released.
++    manager.free(consumer)
++    consumer.num_preemptions = 1
++
++    # Re-schedule: the prefix hits again, but the anchors stay unowned.
++    manager.new_step_starts()
++    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
++    assert num_computed >= 2 * MAMBA_BLOCK_SIZE
++    assert (
++        manager.allocate_slots(
++            consumer,
++            _split(
++                consumer,
++                consumer.num_tokens - num_computed,
++                num_new_local_computed_tokens=num_computed,
++            ),
++            num_new_computed_tokens=num_computed,
++            new_computed_blocks=computed_blocks,
++            num_lookahead_tokens=NUM_SPEC,
++        )
++        is not None
++    )
++    assert not mamba._durable_win.get(consumer.request_id)
 +
 +
  @pytest.mark.parametrize("partial_hit", [False, True])
@@ -3673,7 +3847,7 @@ index b4521a2e1..5397393fc 100644
          # KV Connector:: update recv and send status from last step.
          for req_id in kv_connector_output.finished_recving or ():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75cf97f4f..b1df2dde3 100644
+index 75cf97f4f..abdec8d09 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,8 @@ from collections import defaultdict
@@ -3711,7 +3885,7 @@ index 75cf97f4f..b1df2dde3 100644
  
      def _has_partial_local_hit(
          self,
-@@ -1275,6 +1287,34 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1275,6 +1287,38 @@ class MambaManager(SingleTypeKVCacheManager):
              # into a private cow_block; we record that block for connector
              # offload (see _pending_partial_tail_offloads).
              self._producer_partial_tail_reqs: dict[str, int] = {}
@@ -3743,10 +3917,14 @@ index 75cf97f4f..b1df2dde3 100644
 +            # "cadences of near-tail coverage".
 +            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
 +            self._durable_win: dict[str, list[KVCacheBlock]] = {}
++            # Requests whose cached durable anchors were already re-claimed
++            # from the prefix cache (once per request, on its first cache call
++            # after a prefix hit).
++            self._anchor_adopt_reqs: set[str] = set()
  
      @classmethod
      def find_longest_cache_hit(
-@@ -1440,9 +1480,110 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1440,9 +1484,161 @@ class MambaManager(SingleTypeKVCacheManager):
              ):
                  blocks = self.req_to_blocks[request_id]
                  if blocks[last_state_block_idx] != self._null_block:
@@ -3855,10 +4033,61 @@ index 75cf97f4f..b1df2dde3 100644
 +            return []
 +        return self._durable_win.pop(request_id, [])
 +
++    def _adopt_cached_durable_anchors(
++        self, request: Request, num_tokens: int
++    ) -> None:
++        """Re-claim this session's durable snapshots from the prefix cache.
++
++        A mamba prefix hit adopts only the single state block at the resume
++        boundary; the older durable snapshots stay in the shared cache as
++        unowned idle blocks, so they are neither protected by this request's
++        window nor carried into its keep-alive entry (a later park/restore
++        cycle would then lose them and deep reverts would recompute). Claim
++        the cached ones (touch -> pin -> window) so a resumed session keeps
++        its near-tail anchors exactly like a fresh one; the window cap still
++        bounds how many survive.
++        """
++        if not self._ckpt_tokens:
++            return
++        block_hashes = resolve_block_hashes(
++            request.block_hashes,
++            self.block_pool.hash_block_size,
++            self.block_size,
++        )
++        max_idx = min(len(block_hashes), num_tokens // self.block_size) - 1
++        claimed = 0
++        for idx in range(max_idx, -1, -1):
++            if claimed >= self._ckpt_anchors:
++                break
++            if not self._is_durable_boundary((idx + 1) * self.block_size):
++                continue
++            found = self.block_pool.get_cached_block(
++                block_hashes[idx], [self.kv_cache_group_id]
++            )
++            if not found or found[0].block_hash is None:
++                continue
++            win = self._durable_win.get(request.request_id, ())
++            if any(b is found[0] for b in win):
++                continue
++            # ref 0 -> 1: the block joins this request's chain, so the finish
++            # path (window hand-over) drops it back to 0 like a run anchor.
++            self.block_pool.touch(found)
++            self._retain_durable_anchor(request.request_id, found[0])
++            claimed += 1
++            if envs.RAMTRACE:
++                try:
++                    with open(envs.RAMTRACE_LOG, "a") as _f:
++                        _f.write(
++                            f"adopt anchor req={request.request_id} "
++                            f"idx={idx} blk={found[0].block_id}\n"
++                        )
++                except Exception:
++                    pass
++
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          cascade attention is not supported by mamba
-@@ -1468,6 +1609,18 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1468,6 +1664,18 @@ class MambaManager(SingleTypeKVCacheManager):
              # To put it in the next step, we return num_gpu_blocks + 1 so
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
@@ -3877,8 +4106,11 @@ index 75cf97f4f..b1df2dde3 100644
              return self.block_pool.num_gpu_blocks + 1
          if self.mamba_cache_mode != "align":
              # Allocate extra `num_speculative_blocks` blocks for
-@@ -1655,6 +1808,13 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1653,8 +1861,16 @@ class MambaManager(SingleTypeKVCacheManager):
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode == "align":
              self._allocated_block_reqs.discard(request_id)
++            self._anchor_adopt_reqs.discard(request_id)
              self.last_state_block_idx.pop(request_id, None)
              self._producer_partial_tail_reqs.pop(request_id, None)
 +            # Release this request's durable anchors now that it is finished:
@@ -3891,6 +4123,26 @@ index 75cf97f4f..b1df2dde3 100644
              # A hand-off whose request died in this same scheduling pass must
              # not reach the connector: its unpin hook (free) has already run.
              self._pending_partial_tail_offloads = [
+@@ -1682,6 +1898,19 @@ class MambaManager(SingleTypeKVCacheManager):
+         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+         if self.mamba_cache_mode == "align":
++            if request.request_id not in self._anchor_adopt_reqs:
++                # First cache call for this request. A prefix hit (resumed
++                # session) has already set ``num_cached_block``; its older
++                # durable snapshots sit in the prefix cache unowned, so claim
++                # them into this request's window to keep them protected and
++                # carried into its keep-alive entry at finish.
++                self._anchor_adopt_reqs.add(request.request_id)
++                if num_cached_blocks_before > 0 and request.num_preemptions == 0:
++                    # Only on the request's first scheduling: after a
++                    # preemption the cached anchors are this request's own
++                    # idle blocks, and pinning them would starve its next
++                    # allocation (pool-boundary livelock).
++                    self._adopt_cached_durable_anchors(request, num_tokens)
+             partial_hash = self._cache_partial_tail_block(request, num_tokens)
+             if partial_hash is not None:
+                 self.cached_blocks_this_step.add(partial_hash)
 diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
 index 40b57ac86..2886c8960 100644
 --- a/vllm/v1/kv_offload/cpu/gpu_worker.py

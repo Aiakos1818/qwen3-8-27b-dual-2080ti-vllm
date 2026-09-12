@@ -1,0 +1,8 @@
+[A full resident] prompt=48160 cached=46400 wall=2.4s
+[B full (forces A spill)] prompt=64187 cached=0 wall=57.9s
+[A resume cycle1 (restore)] prompt=48160 cached=46400 wall=2.1s
+[revert keep=2 cycle1] prompt=32137 cached=30400 wall=1.8s
+[B2 full (spills A re-parked entry)] prompt=64187 cached=0 wall=59.4s
+[A resume cycle2 (restore)] prompt=48160 cached=46400 wall=2.4s
+[revert keep=2 cycle2 (expect anchor ~32k)] prompt=32137 cached=30400 wall=1.9s
+P03-DONE

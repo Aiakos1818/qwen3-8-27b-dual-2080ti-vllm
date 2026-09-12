@@ -3,8 +3,11 @@
 
 control : A resident, truncated revert (anchor reuse expected ~32k)
 test    : A -> B (forces A spill) -> A resume (restore) -> truncated revert
+test2   : two park/restore cycles: A -> B -> A -> revert -> B -> A -> revert.
+          The second revert only hits its ~32k anchor if the resumed session
+          re-claimed the anchor into its keep-alive entry (34 -> 40 slots).
 
-A is sized to fit the CPU tier (~48k -> 33 slots of 34); B is bigger so it
+A is sized to fit the CPU tier (~48k -> ~40 slots of 71); B is bigger so it
 forces A out of GPU into RAM.
 """
 import os
@@ -39,6 +42,14 @@ elif mode == "test":
     send(A(), "A resume (restore)")
     send(A(keep=2, edited=True), "revert keep=2 after restore")
     send(A(keep=3, edited=True), "revert keep=3 after restore")
+elif mode == "test2":
+    send(A(), "A full resident")
+    send(B(), "B full (forces A spill)")
+    send(A(), "A resume cycle1 (restore)")
+    send(A(keep=2, edited=True), "revert keep=2 cycle1")
+    send(B(), "B2 full (spills A re-parked entry)")
+    send(A(), "A resume cycle2 (restore)")
+    send(A(keep=2, edited=True), "revert keep=2 cycle2 (expect anchor ~32k)")
 else:
-    raise SystemExit("mode: control|test")
+    raise SystemExit("mode: control|test|test2")
 print("P03-DONE", flush=True)
