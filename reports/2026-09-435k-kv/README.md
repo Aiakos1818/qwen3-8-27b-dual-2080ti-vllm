@@ -1,8 +1,9 @@
 # 435k / 512k KV 复验报告（三个锚点修复后）
 
 本报告补充 [`docs/kv-optimization/vllm_04_offload_ssd.md`](../../docs/kv-optimization/vllm_04_offload_ssd.md)
-§6.4：那份 435k 验收采集于三个锚点修复（`c07c1c9` MTP eagle-drop 对齐、head-prefix
-free 保留、恢复会话认领旧锚点）**之前**。这里用最终代码在真 NVMe SSD 上复跑。
+§6.4：那份 435k 验收采集于三个锚点修复（`07bf075` MTP eagle-drop 对齐、`8850f9d`
+head-prefix free 保留、`996970e` 恢复会话认领旧锚点）**之前**。这里用最终代码在真 NVMe
+SSD 上复跑。
 
 ## 1. 环境
 
