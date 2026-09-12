@@ -202,14 +202,15 @@ export VLLM_SSD_ONLY=1
 - `tests/v1/core/test_mamba_align_chunk_split.py`：23 例（含 `_remove_blocks_in_range`
   保留 pre-cadence 锚点、恢复会话重新认领缓存锚点、抢占后不重认领的回归测试）。
 
-### 6.3 功能矩阵（tmpfs 假 SSD，强制分块）**17/17（1 soft）**
+### 6.3 功能矩阵（tmpfs 假 SSD，强制分块）**18/18（1 soft）**
 
-`VLLM_SSD_ROOT=/dev/shm/ssd_test`、quota 3e9、**staging 1e9（17 slot）、chunk 8**
-（强制 50k 会话走 4-5 个 chunk）：
+`VLLM_SSD_ROOT=/dev/shm/ssd_test`、quota 3e9、**staging 4e9（71 slot）、chunk 8**
+（强制 50k 会话走 4-5 个 chunk；1e9 会触发 `cudaHostRegister` 毒化，见下注）：
 
 | 场景 | 结果 |
 |---|---|
 | S3 test：A→B 挤出→SSD 分块存→resume 分块 restore→深回退 | `keep2=32000 keep3=48000` ✅ |
+| S3b test2：两轮停车/恢复 + 深回退 | `cycle2 keep2=32000` ✅ |
 | S1/S2：baseline 与 park/resume sha | `db8b8e836881534b` ✅ |
 | S2 SSD tier 生效 | `restores+1`、`cached=48000` ✅ |
 | S4 配额 LRU | `stores+3`、`evictions+2`、`sessions=1` ✅ |
@@ -218,9 +219,10 @@ export VLLM_SSD_ONLY=1
 
 > 为保住 restore 后 Mamba 锚点存活，最终矩阵把 GPU 池从 106k 提到 128k token（2.77e9），
 > 因此 S2 的 S+T 不再挤出 SSD（soft 项 `restores+0`，属配置放宽，非回归）；SSD park/resume
-> 由 S3/S4 覆盖。矩阵须在**干净池**上先跑 S3，否则前序压力会使锚点检查失败。
+> 由 S3/S3b/S4 覆盖。矩阵须在**干净池**上先跑 S3；S3b 紧随其后、共享前缀缓存，作为回归
+> smoke check（干净的机制验证见 FP8 报告的 RAM/真 NVMe `test2`）。
 >
-> 注：上表 S3 的 `32000/48000` 为**未开 MTP** 时的边界。部署默认 MTP3（eagle drop）下
+> 注：上表 S3/S3b 的 `32000/48000` 为**未开 MTP** 时的边界。部署默认 MTP3（eagle drop）下
 > 边界为 `30400/46400`，见 [`vllm_02_锚点.md`](vllm_02_锚点.md) §2.3；`ssd_matrix.py` 两种
 > 取值均接受。
 
