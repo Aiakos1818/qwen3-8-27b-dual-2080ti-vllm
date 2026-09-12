@@ -271,8 +271,9 @@ python -m pytest tests/v1/core/test_host_tier_ssd.py \
 
 - `fp8_100k_startup.txt`：三套引擎的启动标定日志。
 - `fp8_100k_correctness_baseline.txt` / `fp8_100k_correctness_offload.txt`
-- `fp8_100k_offload_matrix.txt`（修复 1–2 后；修复 3 后见 §3.3 对照）
+- `fp8_100k_offload_matrix.txt`（最终代码、post-gate；修复 1–2 后对照见 §3.3）
 - `fp8_100k_p03_control.txt` / `fp8_100k_p03_test.txt` / `fp8_100k_p03_test2.txt`
+- `fp8_100k_p03_test2_ssd.txt`（真 NVMe SSD 两轮停车/恢复）
 - `fp8_100k_ssd_100k_check.txt`
 - `fp8_100k_ssd_crash_check.txt`
 - `fp8_100k_ssd_matrix.txt`

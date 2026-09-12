@@ -250,6 +250,10 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 > 降到 `9.0e9` 后容量 489,789 token、峰值 ~20.4GiB，留 ~0.5-0.8GiB 余量。附带结论：本机 fp8 KV
 > 下 **512k 也几乎可行**（按 17.9 KiB/token 只需 ~9.65e9 B = 8.99 GiB 池）。
 
+> **注（2026-09-12）**：上表采集于三个锚点修复（MTP eagle-drop 对齐、head-prefix free 保留、
+> 恢复会话认领旧锚点）**之前**。修复后的 435k 端到端复跑（含 restore 后深回退锚点命中）
+> 见本仓 `reports/2026-09-fp8-kv/` 的对应结果文件；表内数字如与复跑不一致以复跑为准。
+
 ### 6.5 中断原子性
 
 `scripts/ssd_crash_check.py`：写中 SIGKILL → 18 个完整 `.bin` + 1 个临时文件（无索引引用）；
@@ -280,9 +284,10 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 
 - **分块流式已解除 staging 容量限制**：CPU 区只需 2 个 chunk；大会话在传输期间逐块释放/占用
   GPU。435k 会话 ≈13.8 GiB，限速 800 MiB/s 下写 ~17s（后台）/读 ~17s（恢复路径）。
-- **restore 后的内部锚点保护弱于常驻**：常驻会话的锚点在 durable window 中 pin 住；restore 后
-  仅靠空闲队列尾部位置保护（分块顺序修复），极端压力下仍可能被驱逐（届时该深回退点退化为
-  重算，无正确性问题）。
+- **restore 后的锚点已随会话认领**（三个锚点修复后）：恢复会话在首次缓存时由
+  `_adopt_cached_durable_anchors` 把仍在缓存中的 cadence 状态块 `touch` 认领进 durable
+  window 与保活 entry，此后生命周期与常驻一致（受 pin/K 保护、随链 spill/restore）。残留
+  限制：若恢复时该锚点已被普通缓存挤出，则无法认领，该深回退点退化为重算（无正确性问题）。
 - **并发抖动**：多个大会话 + 小配额会频繁 LRU（每次 park/resume 数 GB I/O）。建议配额 ≥ 并发
   大会话数，或只对空闲会话落盘。
 - **消费级 NVMe 寿命**：用 `VLLM_SSD_MAX_MBPS` 限速 + 配额兜底；本方案按需 LRU。
@@ -305,7 +310,7 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 # 功能矩阵（tmpfs，强制分块：在 100k 启动配置上加）
 #   VLLM_SSD_ROOT=/dev/shm/ssd_test VLLM_SSD_QUOTA_BYTES=3000000000 \
 #   VLLM_SSD_CHUNK_SLOTS=8 VLLM_SSD_ONLY=1 RAMTRACE=1
-#   --kv-transfer-config ... "cpu_bytes_to_use":1000000000
+#   --kv-transfer-config ... "cpu_bytes_to_use":4000000000
 #   --kv-cache-memory-bytes 2770000000 --max-num-seqs 4
 python scripts/ssd_matrix.py
 
@@ -322,7 +327,8 @@ python scripts/ssd_crash_check.py
 cd zyYuc-sandbox/src/vllm-0271
 python -m pytest tests/v1/core/test_host_tier_ssd.py \
   tests/v1/core/test_host_tier_spill.py \
-  tests/v1/core/test_prefix_caching.py -q --noconftest
+  tests/v1/core/test_prefix_caching.py \
+  tests/v1/core/test_mamba_align_chunk_split.py -q --noconftest
 ```
 
 ---
