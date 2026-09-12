@@ -62,13 +62,13 @@
 | s1 / s2 / s3 | 50238 | 0（冷） |
 | resume-s1 | 50255 | **48000** / **48000** |
 | resume-s2 | 50255 | **48000** / **48000** |
-| resume-s3 | 50255 | 0 / **48000** |
+| resume-s3 | 50255 | 0 / 0 |
 | resume-s1b | 50255 | 0 / 0 |
 | resume-s2b | 50255 | **48000** / 0 |
 
-两个版本各自在**全新引擎**上复跑（`ramtrace_fix6b.log` / `ramtrace_prefix3.log`）。
+两个版本各自在**全新引擎**上复跑（`ramtrace_fix6d.log` / `ramtrace_prefix3.log`）。
 三个锚点修复后保活 entry 变大（新会话 40 车位；续聊会话由 34 增到 40），RAM 满时的
-淘汰受害者随之移动：`resume-s3` 由丢变中、`resume-s2b` 由中变丢，**命中总数 3/4 → 2/4**。
+淘汰受害者随之移动：`resume-s2b` 由中变丢，**命中总数 3/4 → 2/4**。
 这是"续聊会话携带锚点"的既定代价（淘汰按时间，见
 `docs/kv-optimization/vllm_02_锚点.md` §2.3.2）；矩阵是 71 槽容量的边界压力测试，
 命中数对 entry 大小敏感，不是正确性指标。单会话生产配置（`max-num-seqs=1`）不受影响。
@@ -191,7 +191,7 @@ pin/K 保护，结束由 `take_durable_window` 交给保活 entry（34→40）�
 该请求自己的空闲块，再 pin 会把它们从空闲队列抽走，使其下一次分配在池边界上饿死
 （tmpfs 矩阵 S3 实测 `need=3 avail=1` 活锁，加门控后消失）。
 
-实测（RAM、trace `ramtrace_fix6.log`）：`test2` 两轮 `keep=2` 均 `cached=30400`
+实测（RAM、trace `ramtrace_fix6c.log`）：`test2` 两轮 `keep=2` 均 `cached=30400`
 （修复前第二轮 0）；恢复会话 re-park 的 entry 为 `[3,3,3,30]`（3 组各 2 锚点 + 兜底），
 修复前 `[1,1,1,30]`；`adopt anchor` 日志可见每轮恢复认领 6 个锚点。
 

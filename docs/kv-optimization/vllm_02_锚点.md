@@ -190,7 +190,7 @@ pin/K 保护，结束由 `take_durable_window` 交给保活 entry（34→40）�
 锚点已是该请求自己的空闲块，再 pin 会把它们从空闲队列抽走，导致其下一次分配
 在池边界上饿死（`need=3 avail=1` 活锁；tmpfs 矩阵 S3 实测）。
 
-实测（FP8 100k、MTP3、RAM）：`p03_restore_revert.py test2`
+实测（FP8 100k、MTP3、RAM 与真 NVMe SSD）：`p03_restore_revert.py test2`
 （A→B→A→revert→B→A→revert）两轮 `keep=2` 均 `cached=30400`（修复前第二轮 `0`）；
 trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点），
 修复前 `[1,1,1,30]`。
