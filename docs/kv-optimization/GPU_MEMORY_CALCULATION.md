@@ -326,8 +326,12 @@ safe_pool_bytes(max_len) = group_size × page_size × ( ceil(max_len/block_size)
 - 本部署 (MTP3): `group_size=17`、`page_size=1,638,400`、`slot=27,852,800`、
   `block_size=1600`、`mamba_blocks=3×(2+num_spec)=15`。即
   `safe_pool_bytes ≈ 27,852,800 × (ceil(max_len/1600) + 15 + H)`。
-- **H 标定 = 16 块** (25,600 token): 实测 499k 留 16 块 PASS、515k 留 6 块 FAIL
-  (见 `reports/2026-09-435k-kv/`)。更保守可取 20。
+- **锚点模型**: 每个 cadence 只保留 `cadence - block_size` 一个锚点（MTP/eagle 使
+  full-attention 命中器丢一块，复用 cadence 会 reconcile 到 `cadence - block_size`），
+  所以 `K = VLLM_MAMBA_CKPT_ANCHORS` 个锚点覆盖 `K` 个 cadence。
+- **H 启发式**: `H = COW(7) + mamba_groups × K`。默认 (3 组, K=3) → **16 块**，与
+  499k PASS / 515k FAIL 的实测吻合。K<3 覆盖变浅（更深回退重算）；K 过大则 H 变大、
+  池可能装不下。
 - 等价规则: 启动日志 `GPU KV cache size: N tokens` 必须满足
   `N ≥ max_len + H × block_size`。
 
@@ -337,27 +341,38 @@ slots          = floor(pool_bytes / slot_bytes)
 max_safe_len   = (slots − mamba_blocks − H) × block_size
 ```
 
-**工具**: `scripts/kv_pool_sizing.py`（纯标准库，可 `--model-config` 读 config.json；
-支持前向/反向/`--verify-log`/`--self-test`）:
+**工具**: `scripts/kv_pool_sizing.py`（纯标准库；**从 run 脚本读全部参数**，用户只给
+上下文）。支持 `--profile`（前向/查现状）、`--pool-bytes`（反向）、`--feasible`、`--self-test`:
 ```bash
-python scripts/kv_pool_sizing.py --max-len 512000 --num-spec 3   # 推荐池
-python scripts/kv_pool_sizing.py --pool-bytes 9600000000 --check-len 515046
-python scripts/kv_pool_sizing.py --verify-log fp8-kv-work/server_c5.log --pool-bytes 9600000000
+# 正向：该 profile 跑 500k 需要多大池
+python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 500k
+# 查现状：用 profile 的 max-model-len 与池判定
+python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh
+# 反向：给定池能安全跑多长
+python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --pool-bytes 9.6e9
+# 可行性（估非KV）：优先用启动日志自动估，或 --non-kv-gib 精确
+python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh \
+    --max-len 512k --feasible --log fp8-kv-work/server_c5.log
 ```
+`--feasible` 用 `Model loading took X GiB` + 基线(2.0 GiB, 含启动瞬态) 估非KV，判定
+`非KV + 池 ≤ 21.5 GiB`。非KV 也可直接量（运行中 `nvidia-smi` 的 used − 池字节）后用
+`--non-kv-gib` 传入。
 
-**标定示例** (MTP3, H=16):
+**标定示例** (AWQ-512k, MTP3, H=16):
 
 | max_len | 最低池 | 安全池 | 现有 profile | 结论 |
 |---|---|---|---|---|
 | 512,000 | 9.33e9 | **9.78e9** | 9.6e9 | ✗ 本机 9.78e9 启动 OOM；9.6e9 只能安全到 500,800 |
-| 500,000 | 9.13e9 | **9.58e9** | 9.6e9 | ✓ 刚好 |
+| 500,000 | 9.14e9 | **9.58e9** | 9.6e9 | ✓ 刚好 |
 | 435,200 | 7.99e9 | **8.44e9** | 9.0e9 | ✓ 有余量 |
 | 262,144 | 4.99e9 | **5.43e9** | 5.0e9 | ✗ 需提到 5.43e9 |
 | 102,400 | 2.20e9 | **2.65e9** | 2.3e9 | ✗ 需提到 2.65e9 |
 
 > 注: `block_size` 由 MTP `num_spec` 决定、与 `max_len` 无关 (MTP3→1600, MTP1→1584)，
-> 从启动日志 `Setting attention block size to N tokens` 读取。换模型/TP/量化时用
-> `--model-config` 重算 `page_size`/`group_size`/`mamba_blocks`。
+> 从启动日志 `Setting attention block size to N tokens` 读取。换模型/TP/量化时脚本用
+> `--profile` 的 `--model` 读 config.json 重算 `page_size`/`group_size`/`mamba_blocks`。
+> `max-num-seqs>1` 时脚本按 `(N−1)×(attn_blocks+mamba_blocks)` 追加并发余量。
+
 
 ## 5. 各上下文长度内存预算表
 

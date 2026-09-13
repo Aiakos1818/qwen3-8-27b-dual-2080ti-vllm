@@ -32,6 +32,12 @@ SSD 上复跑。
 - 指标：`stores=3`、`restores=2`、写 32.0 GiB、读 25.8 GiB；`nvidia-smi` 峰值 ≤21.8 GiB/卡。
 - 修复前：restore 后深回退 `cached=0`（整段重算，见 FP8 报告 §5）。
 
+**2026-09-14 复验（锚点粒度改为每 cadence 只留 `cadence − block_size` 一个）**：S 386,822 →
+V0 命中 352,000（10.5s）→ T 162,430 → R 恢复 384,000（sha `db8b8e836881534b`，59.7s）→
+V2 命中 352,000（9.9s），`SSD-435K-REVERT-DONE`。RAMTRACE 窗口 = `[318400, 350400, 382400]`
+（K=3 个锚点，较此前 6 个减半），V 的 `diag lookup hits=[352000,352000,352000,352000]`
+（Mamba 组命中）。原始输出 `awq_435k_cblock_check.txt`。
+
 ## 3. 512k（MTP3：满长 prefill + SSD 恢复 + 深回退全 PASS）
 
 512k profile 现与生产一致用 **MTP3**：block_size 自动选 **1600**，cadence 32000（MTP1 会选
@@ -63,5 +69,6 @@ SSD 上复跑。
 ## 4. 结果文件
 
 - `awq_435k_postfix_check.txt`：435k 复跑原始输出。
+- `awq_435k_cblock_check.txt`：435k 复跑原始输出（每 cadence 1 个锚点，2026-09-14）。
 - `awq_512k_anchor_check.txt`：512k **MTP1** 复跑原始输出（深回退未命中）。
 - `awq_512k_mtp3_check.txt`：512k **MTP3** 复跑原始输出（全 PASS）。

@@ -218,6 +218,13 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 
 推荐：**默认 `VLLM_MAMBA_CKPT_TOKENS=32000`、`VLLM_MAMBA_CKPT_ANCHORS=3`**。
 
+> **锚点粒度（2026-09-14 起）**：每个 cadence 只保留 `cadence − block_size` 一个锚点。
+> MTP/eagle 使 full-attention 命中器丢一块，复用 `cadence` 的请求会 reconcile 到
+> `cadence − block_size`；plain/连接器查找同样会 reconcile 到该块。相比早期"cadence 与
+> 其前一块各留"的方案，pin 的块数**减半**、覆盖 cadence 数不变，直接降低深回退所需池余量
+> （H 口径见 `GPU_MEMORY_CALCULATION.md` §4.5）。435k 深回退复验：窗口 `[318400, 350400,
+> 382400]`（K=3），V0/V2 均命中 352000。
+
 ### 3.2 锚点与缓存链“同等保护”
 
 拍板语义：**链被保活则锚点受保护，链随压力释放则锚点一并释放，链不保活则锚点也不保活**；
@@ -275,6 +282,8 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 | R2 | 3.15e9（临时） | 146,470 / 1.43x | ≈31 ≥ 16 | **完成 95.0s，无卡死** |
 
 ⇒ 判据成立：free slot ≥ K（16）则 16 锚点不卡；不足则卡。
+（2026-09-14 起每个 cadence 只留 1 个锚点，窗口持 K 个；判据形式不变，只是同样的 K
+对应 K 个 cadence 而非 K/2 个。）
 
 ---
 
@@ -300,6 +309,7 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
   按 token 位置淘汰（保留近尾 K 个），见
   [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)；③ 若需细粒度，
   将"free slot 数"从近似换成引擎真值探针。
+  （2026-09-14 锚点粒度改为每 cadence 1 个 → pin 减半；435k 深回退复验 V0/V2 均命中 352000。）
 
 ---
 

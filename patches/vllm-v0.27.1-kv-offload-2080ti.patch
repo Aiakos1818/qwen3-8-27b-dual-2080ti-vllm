@@ -774,7 +774,7 @@ index 000000000..e1273e98f
 +    store.shutdown()
 +    close_view(buf, view, flat)
 diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
-index 31671caf7..936caa6a5 100644
+index 31671caf7..4996eec2e 100644
 --- a/tests/v1/core/test_mamba_align_chunk_split.py
 +++ b/tests/v1/core/test_mamba_align_chunk_split.py
 @@ -78,6 +78,8 @@ def _split(
@@ -801,7 +801,7 @@ index 31671caf7..936caa6a5 100644
  
  
  def _run_chunked_prefill(
-@@ -209,6 +217,266 @@ def test_poisoning_is_block_size_independent(
+@@ -209,6 +217,288 @@ def test_poisoning_is_block_size_independent(
      assert _prefill(prompt_len, budgets=budgets) > 0
  
  
@@ -832,7 +832,6 @@ index 31671caf7..936caa6a5 100644
 +    win = mamba.take_durable_window(request.request_id)
 +    assert sorted(b.block_hash_num_tokens for b in win) == [
 +        MAMBA_BLOCK_SIZE,
-+        2 * MAMBA_BLOCK_SIZE,
 +    ]
 +    assert all(b.pinned for b in win)
 +    # The retained entries are detached from the table like any freed block.
@@ -867,8 +866,32 @@ index 31671caf7..936caa6a5 100644
 +        mamba._retain_durable_anchor("r", blk)
 +
 +    kept = sorted(b.block_hash_num_tokens for b in mamba._durable_win["r"])
-+    # Cap 6 (ANCHORS=3, doubled): the six highest boundaries survive.
-+    assert kept == [8000, 9600, 11200, 12800, 14400, 16000]
++    # Cap 3 (ANCHORS=3, one anchor per cadence): the three highest survive.
++    assert kept == [12800, 14400, 16000]
++
++
++def test_only_pre_cadence_is_durable_boundary(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Each cadence retains one anchor at `cadence - block_size`, not two.
++
++    MTP makes the full-attention finder drop a block, so reusing the cadence
++    reconciles down to the pre-cadence anchor; the cadence block itself is not
++    durable. Retaining one anchor per cadence halves the pinned footprint
++    (the pool headroom a deep revert needs).
++    """
++    from vllm import envs
++
++    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 4 * MAMBA_BLOCK_SIZE)
++    manager = _make_hybrid_kv_cache_manager()
++    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++
++    b = MAMBA_BLOCK_SIZE
++    assert mamba._is_durable_boundary(3 * b)  # cadence 4b - b
++    assert not mamba._is_durable_boundary(4 * b)  # the cadence itself
++    assert mamba._is_durable_boundary(7 * b)  # next pre-cadence
++    assert not mamba._is_durable_boundary(2 * b)
++    assert mamba._ckpt_anchors == 3
 +
 +
 +def test_align_ckpt_tokens_floors_to_block_size() -> None:
@@ -944,7 +967,6 @@ index 31671caf7..936caa6a5 100644
 +    anchors = mamba.take_durable_window(producer.request_id)
 +    assert sorted(b.block_hash_num_tokens for b in anchors) == [
 +        MAMBA_BLOCK_SIZE,
-+        2 * MAMBA_BLOCK_SIZE,
 +    ]
 +    # The session goes to the host tier and comes back: its anchors are
 +    # re-loaded as ordinary idle cached blocks (hash kept, no owner).
@@ -2832,7 +2854,7 @@ index 9aea06109..885f7238a 100644
      # when the block is full and cached.
      _block_hash: BlockHashWithGroupId | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b4521a2e1..9cb532d79 100644
+index b4521a2e1..cfcdb58bf 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -2989,9 +3011,9 @@ index b4521a2e1..9cb532d79 100644
 +        # MTP (speculative decoding) makes the full-attention finder drop one
 +        # block (`use_eagle`), so a request that would reuse the cadence anchor
 +        # at ``cadence`` is reconciled down to ``cadence - block_size`` and needs
-+        # an SSM state exactly there. Materialize that pre-cadence boundary too
-+        # (it is retained as a durable anchor by the MambaManager) so both the
-+        # eagle-dropped and the plain lookup can reuse an anchor.
++        # an SSM state exactly there. Materialize that pre-cadence boundary (it
++        # is the durable anchor the MambaManager retains); the plain lookup
++        # reconciles down to it as well.
 +        pre_ckpt = 0
 +        if next_ckpt and next_ckpt - block_size > 0:
 +            pre_ckpt = next_ckpt - block_size
@@ -4020,7 +4042,7 @@ index b4521a2e1..9cb532d79 100644
          # KV Connector:: update recv and send status from last step.
          for req_id in kv_connector_output.finished_recving or ():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75cf97f4f..cb2bc2f04 100644
+index 75cf97f4f..87f8aef94 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,8 @@ from collections import defaultdict
@@ -4066,7 +4088,7 @@ index 75cf97f4f..cb2bc2f04 100644
  
      def _has_partial_local_hit(
          self,
-@@ -1275,6 +1288,41 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1275,6 +1288,40 @@ class MambaManager(SingleTypeKVCacheManager):
              # into a private cow_block; we record that block for connector
              # offload (see _pending_partial_tail_offloads).
              self._producer_partial_tail_reqs: dict[str, int] = {}
@@ -4095,11 +4117,10 @@ index 75cf97f4f..cb2bc2f04 100644
 +            # one so the net in-flight footprint of this request stays flat.
 +            # That bounded footprint is what prevents the ~1.04x-concurrency
 +            # pool from being drained mid-prefill (which previously deadlocked
-+            # a single long prefill at small cadences). Each cadence now keeps
-+            # two anchors (``cadence`` and ``cadence - block_size``), so the
-+            # cap is doubled to keep ``VLLM_MAMBA_CKPT_ANCHORS`` meaning
-+            # "cadences of near-tail coverage".
-+            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
++            # a single long prefill at small cadences). Each cadence keeps a
++            # single anchor (``cadence - block_size``; see ``_is_durable_boundary``),
++            # so the cap equals ``VLLM_MAMBA_CKPT_ANCHORS`` cadences of coverage.
++            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS)
 +            self._durable_win: dict[str, list[KVCacheBlock]] = {}
 +            # Requests whose cached durable anchors were already re-claimed
 +            # from the prefix cache (once per request, on its first cache call
@@ -4108,7 +4129,7 @@ index 75cf97f4f..cb2bc2f04 100644
  
      @classmethod
      def find_longest_cache_hit(
-@@ -1440,9 +1488,189 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1440,9 +1487,191 @@ class MambaManager(SingleTypeKVCacheManager):
              ):
                  blocks = self.req_to_blocks[request_id]
                  if blocks[last_state_block_idx] != self._null_block:
@@ -4177,16 +4198,18 @@ index 75cf97f4f..cb2bc2f04 100644
 +        self.block_pool.free_blocks([blk])
 +
 +    def _is_durable_boundary(self, end_tokens: int) -> bool:
-+        """True at a durable snapshot boundary: the cadence itself, or one
-+        block before it (MTP sets ``use_eagle``, so the full-attention finder
-+        drops one block and a truncation at ``cadence`` needs the state at
-+        ``cadence - block_size``)."""
++        """True at a durable snapshot boundary: one block before the cadence.
++
++        MTP sets ``use_eagle``, so the full-attention finder drops the last
++        matching block: a request that would reuse the state at ``cadence`` is
++        reconciled down to ``cadence - block_size``. Retaining only that
++        pre-cadence block therefore covers both the eagle-dropped and the plain
++        lookup (the latter reconciles down too), halving the anchor footprint
++        versus also pinning the ``cadence`` block.
++        """
 +        if not self._ckpt_tokens:
 +            return False
-+        return (
-+            end_tokens % self._ckpt_tokens == 0
-+            or (end_tokens + self.block_size) % self._ckpt_tokens == 0
-+        )
++        return (end_tokens + self.block_size) % self._ckpt_tokens == 0
 +
 +    def _retain_durable_anchor(
 +        self, request_id: str, blk: KVCacheBlock
@@ -4299,7 +4322,7 @@ index 75cf97f4f..cb2bc2f04 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          cascade attention is not supported by mamba
-@@ -1468,6 +1696,18 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1468,6 +1697,18 @@ class MambaManager(SingleTypeKVCacheManager):
              # To put it in the next step, we return num_gpu_blocks + 1 so
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
@@ -4318,7 +4341,7 @@ index 75cf97f4f..cb2bc2f04 100644
              return self.block_pool.num_gpu_blocks + 1
          if self.mamba_cache_mode != "align":
              # Allocate extra `num_speculative_blocks` blocks for
-@@ -1653,8 +1893,16 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1653,8 +1894,16 @@ class MambaManager(SingleTypeKVCacheManager):
      def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
          if self.mamba_cache_mode == "align":
              self._allocated_block_reqs.discard(request_id)
@@ -4335,7 +4358,7 @@ index 75cf97f4f..cb2bc2f04 100644
              # A hand-off whose request died in this same scheduling pass must
              # not reach the connector: its unpin hook (free) has already run.
              self._pending_partial_tail_offloads = [
-@@ -1682,6 +1930,19 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1682,6 +1931,19 @@ class MambaManager(SingleTypeKVCacheManager):
          super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
          num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
          if self.mamba_cache_mode == "align":
