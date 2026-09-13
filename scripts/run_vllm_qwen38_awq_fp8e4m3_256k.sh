@@ -22,6 +22,8 @@ export VLLM_USE_DEEP_GEMM=0
 export VLLM_QWOPUS_MTP_BF16_DRAFT=1
 export VLLM_SM75_SPEC_SYNC_MODE=safe
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+# API auth: inherit VLLM_API_KEY from the environment (empty = no auth).
+export VLLM_API_KEY="${VLLM_API_KEY:-}"
 # Keep-alive (auto pin finished long sessions).
 export VLLM_PIN_MIN_TOKENS=16000
 # Durable Mamba/GDN checkpoint anchors (deep/truncated revert reuse).
