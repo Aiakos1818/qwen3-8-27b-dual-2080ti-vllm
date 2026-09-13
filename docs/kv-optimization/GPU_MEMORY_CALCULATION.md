@@ -341,22 +341,31 @@ slots          = floor(pool_bytes / slot_bytes)
 max_safe_len   = (slots − mamba_blocks − H) × block_size
 ```
 
-**工具**: `scripts/kv_pool_sizing.py`（纯标准库；**从 run 脚本读全部参数**，用户只给
-上下文）。支持 `--profile`（前向/查现状）、`--pool-bytes`（反向）、`--feasible`、`--self-test`:
+**工具**: `scripts/kv_pool_sizing.py`（纯标准库；**只给启动脚本**，参数全从里面读）。
+默认做两项一致性检查并给建议：
 ```bash
-# 正向：该 profile 跑 500k 需要多大池
-python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 500k
-# 查现状：用 profile 的 max-model-len 与池判定
-python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh
-# 反向：给定池能安全跑多长
-python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --pool-bytes 9.6e9
-# 可行性（估非KV）：优先用启动日志自动估，或 --non-kv-gib 精确
-python scripts/kv_pool_sizing.py --profile run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh \
+# 默认：检查 profile 的池/上下文是否匹配（两项检查）
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh
+# 可选：覆盖上下文 / 池
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 500k
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --pool-bytes 9.6e9
+```
+输出：
+- `[池检查]`：当前池 vs `safe_pool(max-model-len)` → 不足 / 偏小（可启动但满池会自我抢占）/ 符合；不符给推荐池。
+- `[上下文检查]`：`max-model-len` vs `max_safe_len(池)` → 符合 / 超出；不符给推荐上下文。**未定义池则跳过**。
+- 退出码：两项均符合 0，否则 1（便于 CI）。
+
+**`--feasible`（实际部署一次测 OOM）**：用 profile 原样启动一次（日志 `/tmp/kv_pool_sizing_feasible.log`，
+健康探测每 10s，瞬态失败重试 ≤3 次，`CUDA out of memory` 不重试），健康后读 `nvidia-smi` 的
+used − 池字节得**真实非KV**，随即退出部署并清理，再判定 `非KV + 安全池 ≤ 21.5 GiB`。
+```bash
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 512k --feasible
+# 不部署的替代：--log <已有启动日志>（估算）或 --non-kv-gib <实测值>
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh \
     --max-len 512k --feasible --log fp8-kv-work/server_c5.log
 ```
-`--feasible` 用 `Model loading took X GiB` + 基线(2.0 GiB, 含启动瞬态) 估非KV，判定
-`非KV + 池 ≤ 21.5 GiB`。非KV 也可直接量（运行中 `nvidia-smi` 的 used − 池字节）后用
-`--non-kv-gib` 传入。
+`--log` 用 `Model loading took X GiB` + 基线(2.0 GiB) 估非KV；`--non-kv-gib` 直接给实测值
+（= 运行中 `nvidia-smi` used − 池字节）。
 
 **标定示例** (AWQ-512k, MTP3, H=16):
 

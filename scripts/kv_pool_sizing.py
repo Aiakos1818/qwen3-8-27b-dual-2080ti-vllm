@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""Recommend a vLLM KV-cache pool size from a launch profile and a context.
+"""Diagnose a vLLM launch profile's KV-cache pool against its context length.
 
 The vLLM startup check sizes the attention group exactly to ``--max-model-len``,
 leaving no room for the durable Mamba anchors or chunked-prefill copy-on-write.
 A request that reaches that ceiling then self-preempts, which releases the
 durable window and makes a later deep revert recompute. This tool mirrors the
-vLLM arithmetic so a profile can be paired with a pool that keeps a safe margin.
+vLLM arithmetic and, given only the launch run script, reports:
 
-All launch parameters are read from the run script (``--profile``); only the
-target context (or pool, for the reverse) has to be supplied.
+  [池检查]      is the profile's pool large enough for its max-model-len?
+  [上下文检查]  is the profile's max-model-len within the pool's safe limit?
+
+Everything is read from the run script; no parameter has to be supplied.
+
+Usage:
+  kv_pool_sizing.py <run.sh>                     # the two checks
+  kv_pool_sizing.py <run.sh> --max-len 500k      # override the context
+  kv_pool_sizing.py <run.sh> --pool-bytes 9.6e9  # override the pool
+  kv_pool_sizing.py <run.sh> --feasible          # deploy once, measure OOM risk
+  kv_pool_sizing.py --self-test
 
 Sources mirrored (v0.27.1 fork):
   * block-size auto-selection: ``vllm/platforms/interface.py`` (~L904)
   * grouping heuristic:        ``vllm/v1/core/kv_cache_utils.py`` (~L1263)
   * pool requirement:          ``vllm/v1/core/kv_cache_utils.py`` (~L1959)
   * mamba align usage:         ``vllm/v1/kv_cache_interface.py`` (~L735)
-
-Examples:
-  kv_pool_sizing.py --profile run_..._512k_kv.sh --max-len 500k
-  kv_pool_sizing.py --profile run_..._512k_kv.sh
-  kv_pool_sizing.py --profile run_..._512k_kv.sh --pool-bytes 9.6e9
-  kv_pool_sizing.py --profile run_..._512k_kv.sh --max-len 500k --feasible \
-      --log fp8-kv-work/server_c5.log
-  kv_pool_sizing.py --self-test
 """
 
 from __future__ import annotations
@@ -31,7 +32,12 @@ import argparse
 import json
 import os
 import re
+import signal
+import socket
+import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass, field
 
 DTYPE_BYTES = {
@@ -47,7 +53,7 @@ DTYPE_BYTES = {
     "float32": 4,
 }
 
-# Fallback used when no profile/model config is given (Qwen3.8-27B).
+# Fallback used when no model config is given (Qwen3.8-27B).
 QWEN38_DEFAULTS = {
     "num_hidden_layers": 64,
     "full_attention_interval": 4,
@@ -66,27 +72,35 @@ QWEN38_DEFAULTS = {
 # state block per (mamba group x cadence anchor). Yields 16 blocks for the
 # default (3 groups, ANCHORS=3), matching the 435k/512k measurements.
 COW_BLOCKS = 7
-# Non-KV overhead on top of the weights: activations, CUDA graphs, NCCL and the
-# startup transient (GiB). Calibrated so the AWQ-512k profile's known points
-# (9.6e9 fits, 9.78e9 OOMs) come out right; it is an estimate (see --non-kv-gib).
+# Non-KV overhead on top of the weights (activations, graphs, NCCL, startup
+# transient), used only when measuring via --log instead of --feasible.
 NON_KV_BASELINE_GIB = 2.0
-# Usable GPU memory after the driver reserve (GiB), for a 22528 MiB card.
+# Usable GPU memory after the driver reserve, for a 22528 MiB card.
 GPU_USABLE_GIB = 21.5
+
+# --feasible deploy settings.
+FEASIBLE_LOG = "/tmp/kv_pool_sizing_feasible.log"
+HEALTH_URL = "http://localhost:8000/v1/models"
+POLL_SECONDS = 10
+READY_TIMEOUT_S = 1200
+MAX_ATTEMPTS = 3
+_OOM_RE = re.compile(r"CUDA out of memory|torch\.OutOfMemoryError")
+_TRANSIENT_RE = re.compile(
+    r"CUDA error: invalid argument|torch\.AcceleratorError"
+    r"|Engine core initialization failed|EngineDeadError"
+)
+_LOAD_RE = re.compile(r"Model loading took ([\d.]+) GiB")
 
 
 def cdiv(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def _fmt(n: int) -> str:
-    return f"{n:,}"
-
-
-def _gib(n: int) -> str:
+def _gib(n: float) -> str:
     return f"{n / (1024**3):.3f} GiB"
 
 
-def _mib(n: int) -> str:
+def _mib(n: float) -> str:
     return f"{n / (1024**2):.3f} MiB"
 
 
@@ -134,6 +148,14 @@ class Profile:
     env: dict[str, str] = field(default_factory=dict)
     flags: set[str] = field(default_factory=set)
 
+    @property
+    def max_len(self) -> int:
+        return int(self.args.get("max-model-len", 0) or 0)
+
+    @property
+    def pool_bytes(self) -> int:
+        return int(self.args.get("kv-cache-memory-bytes", 0) or 0)
+
 
 def parse_profile(path: str) -> Profile:
     """Read (never execute) a launch script's CLI args and exports."""
@@ -167,7 +189,6 @@ class ModelDims:
     linear_num_value_heads: int
     linear_key_head_dim: int
     linear_value_head_dim: int
-    mamba_state_dtype: str
     source: str
 
 
@@ -199,7 +220,7 @@ def load_model(path: str | None) -> ModelDims:
     if path and os.path.exists(path):
         cfg, source = _resolve_config(path)
     else:
-        cfg, source = dict(QWEN38_DEFAULTS), "built-in Qwen3.8-27B defaults"
+        cfg, source = dict(QWEN38_DEFAULTS), "内置 Qwen3.8-27B 默认"
     d = {**QWEN38_DEFAULTS, **cfg}
     attn, linear = _layer_counts(d)
     return ModelDims(
@@ -212,7 +233,6 @@ def load_model(path: str | None) -> ModelDims:
         linear_num_value_heads=d["linear_num_value_heads"],
         linear_key_head_dim=d["linear_key_head_dim"],
         linear_value_head_dim=d["linear_value_head_dim"],
-        mamba_state_dtype=d["mamba_ssm_dtype"],
         source=source,
     )
 
@@ -245,6 +265,12 @@ def auto_block_size(dims: ModelDims, tp: int, kv_dtype: str, num_spec: int) -> i
     return 16 * cdiv(m, 16 * a)
 
 
+def _group_size(dims: ModelDims) -> int:
+    mn = min(dims.attn_layers, dims.linear_layers)
+    mx = max(dims.attn_layers, dims.linear_layers)
+    return mx if mx < mn * 1.5 else mn
+
+
 @dataclass
 class Sizing:
     dims: ModelDims
@@ -265,30 +291,21 @@ class Sizing:
     def slot_bytes(self) -> int:
         return self.group_size * self.page_size
 
-    def forward(self, max_len: int) -> dict:
-        attn_blocks = cdiv(max_len, self.block_size)
-        base = attn_blocks + self.mamba_blocks
-        conc = (self.max_num_seqs - 1) * (attn_blocks + self.mamba_blocks)
-        return {
-            "max_len": max_len,
-            "attn_blocks": attn_blocks,
-            "min_pool_bytes": self.slot_bytes * base,
-            "safe_pool_bytes": self.slot_bytes
-            * (base + self.headroom + conc),
-        }
+    def min_pool(self, max_len: int) -> int:
+        return self.slot_bytes * (cdiv(max_len, self.block_size) + self.mamba_blocks)
 
-    def reverse(self, pool_bytes: int) -> dict:
+    def safe_pool(self, max_len: int) -> int:
+        conc = (self.max_num_seqs - 1) * (
+            cdiv(max_len, self.block_size) + self.mamba_blocks
+        )
+        return self.slot_bytes * (
+            cdiv(max_len, self.block_size) + self.mamba_blocks + self.headroom + conc
+        )
+
+    def max_safe_len(self, pool_bytes: int) -> int:
         slots = pool_bytes // self.slot_bytes
         cap_blocks = max(0, slots - self.mamba_blocks)
-        safe_blocks = max(0, cap_blocks - self.headroom)
-        return {
-            "pool_bytes": pool_bytes,
-            "capacity_tokens": cap_blocks * self.block_size,
-            "max_safe_len": safe_blocks * self.block_size,
-        }
-
-    def safe_pool_for(self, max_len: int) -> int:
-        return self.forward(max_len)["safe_pool_bytes"]
+        return max(0, cap_blocks - self.headroom) * self.block_size
 
 
 def build_sizing(prof: Profile | None, args: argparse.Namespace) -> Sizing:
@@ -296,11 +313,10 @@ def build_sizing(prof: Profile | None, args: argparse.Namespace) -> Sizing:
     e = prof.env if prof else {}
     flags = prof.flags if prof else set()
 
-    model_path = args.model_config or p.get("model")
-    dims = load_model(model_path)
-
+    dims = load_model(args.model_config or p.get("model"))
     tp = args.tp or int(p.get("tensor-parallel-size", 2))
     kv_dtype = args.kv_dtype or p.get("kv-cache-dtype", "fp8_e4m3")
+
     num_spec = args.num_spec
     if num_spec is None:
         num_spec = 0
@@ -310,6 +326,7 @@ def build_sizing(prof: Profile | None, args: argparse.Namespace) -> Sizing:
                 num_spec = int(json.loads(spec).get("num_speculative_tokens", 0))
             except (ValueError, json.JSONDecodeError):
                 num_spec = 0
+
     anchors = args.anchors
     if anchors is None:
         anchors = int(e.get("VLLM_MAMBA_CKPT_ANCHORS", 3) or 3)
@@ -319,32 +336,25 @@ def build_sizing(prof: Profile | None, args: argparse.Namespace) -> Sizing:
     page_size = block_size * attn_page_1_token(dims, tp, kv_dtype)
     gsize = _group_size(dims)
     mgroups = cdiv(dims.linear_layers, gsize)
+
     align = "enable-prefix-caching" in flags or args.prefix_caching
-    if align:
-        mamba_blocks = mgroups * (2 + num_spec)
-    else:
-        mamba_blocks = mgroups * (1 + num_spec)
+    mamba_blocks = mgroups * ((2 + num_spec) if align else (1 + num_spec))
 
     warnings: list[str] = []
     if not align:
-        warnings.append(
-            "prefix caching off -> mamba cache mode 'none'; anchors disabled"
-        )
+        warnings.append("prefix caching 关闭 -> mamba 模式 none，锚点不可用")
     ckpt = int(e.get("VLLM_MAMBA_CKPT_TOKENS", 0) or 0)
-    if align and ckpt == 0 and not args.durable:
-        warnings.append("VLLM_MAMBA_CKPT_TOKENS=0 -> durable anchors off")
+    durable = align and ckpt != 0
+    if align and not durable:
+        warnings.append("VLLM_MAMBA_CKPT_TOKENS=0 -> durable 锚点关闭")
     if anchors < 3:
         warnings.append(
-            f"ANCHORS={anchors} < 3: near-tail coverage ~{anchors} cadences; "
-            "deeper reverts recompute"
+            f"ANCHORS={anchors} < 3：近尾覆盖约 {anchors} 个 cadence，"
+            "更深的回退会重算"
         )
     if max_num_seqs > 1:
-        warnings.append(
-            f"max-num-seqs={max_num_seqs}: reserve {(max_num_seqs - 1)}x a full "
-            "sequence (counted below)"
-        )
+        warnings.append(f"max-num-seqs={max_num_seqs}：已计入并发余量")
 
-    durable = align and ckpt != 0
     if args.headroom_blocks:
         headroom = args.headroom_blocks
     elif durable:
@@ -369,129 +379,244 @@ def build_sizing(prof: Profile | None, args: argparse.Namespace) -> Sizing:
     )
 
 
-def _group_size(dims: ModelDims) -> int:
-    mn = min(dims.attn_layers, dims.linear_layers)
-    mx = max(dims.attn_layers, dims.linear_layers)
-    return mx if mx < mn * 1.5 else mn
-
-
 # --------------------------------------------------------------------------
-# Feasibility (optional)
+# Report
 # --------------------------------------------------------------------------
-_LOAD_RE = re.compile(r"Model loading took ([\d.]+) GiB")
+def _pool_verdict(pool: int, min_pool: int, safe_pool: int) -> str:
+    if pool >= safe_pool:
+        return "符合"
+    if pool >= min_pool:
+        return "偏小（可启动，但满池会自我抢占）"
+    return "不足（启动校验会报错）"
 
 
-def non_kv_gib(args: argparse.Namespace) -> tuple[float, str]:
-    if args.non_kv_gib:
-        return args.non_kv_gib, "given"
-    if args.log:
-        with open(args.log) as f:
-            for line in f:
-                m = _LOAD_RE.search(line)
-                if m:
-                    weights = float(m.group(1))
-                    return weights + NON_KV_BASELINE_GIB, (
-                        f"weights {weights} GiB + {NON_KV_BASELINE_GIB} baseline "
-                        "(estimate)"
-                    )
-        raise SystemExit(f"no 'Model loading took' line in {args.log}")
-    raise SystemExit("--feasible needs --log or --non-kv-gib")
-
-
-# --------------------------------------------------------------------------
-# Commands
-# --------------------------------------------------------------------------
-def _summary(s: Sizing, prof: Profile | None, pool: int | None) -> list[str]:
+def _header(s: Sizing, prof: Profile | None) -> list[str]:
+    src = s.dims.source
+    if src.endswith("config.json"):
+        src = os.path.basename(os.path.dirname(src))
     lines = []
     if prof:
-        lines.append(f"profile   : {prof.path}")
-    lines.append(f"model     : {s.dims.source}")
+        lines.append(f"profile : {prof.path}")
     lines.append(
-        f"resolved  : tp={s.tp} kv={s.kv_dtype} MTP={s.num_spec} "
-        f"anchors={s.anchors} max-num-seqs={s.max_num_seqs}"
+        f"model   : {src}  tp={s.tp} kv={s.kv_dtype} "
+        f"MTP={s.num_spec} anchors={s.anchors} block={s.block_size}"
     )
     lines.append(
-        f"block_size: {s.block_size}  page={_mib(s.page_size)}  "
-        f"group_size={s.group_size}  mamba_blocks={s.mamba_blocks}  "
-        f"headroom={s.headroom}"
+        f"          page={_mib(s.page_size)} group_size={s.group_size} "
+        f"mamba_blocks={s.mamba_blocks} headroom={s.headroom}"
     )
     for w in s.warnings:
-        lines.append(f"WARNING   : {w}")
+        lines.append(f"WARNING : {w}")
     return lines
 
 
-def _feasibility(s: Sizing, args: argparse.Namespace, safe_pool: int) -> list[str]:
-    if not args.feasible:
-        return []
-    nk, src = non_kv_gib(args)
-    total = args.gpu_gib
-    need = nk + safe_pool / (1024**3)
-    ok = need <= total
-    return [
-        f"feasible  : non-KV={nk:.2f} GiB ({src}) + "
-        f"pool={safe_pool / (1024**3):.2f} GiB"
-        f" = {need:.2f} <= {total:.2f} GiB -> {'OK' if ok else 'OOM RISK'}",
-    ]
-
-
-def cmd_forward(s: Sizing, prof: Profile | None, args: argparse.Namespace) -> int:
-    r = s.forward(args.max_len)
-    out = _summary(s, prof, None) + [
+def cmd_report(s: Sizing, prof: Profile, args: argparse.Namespace) -> int:
+    max_len = args.max_len or prof.max_len
+    pool = args.pool_bytes or prof.pool_bytes
+    out = _header(s, prof) + [
+        f"max-model-len         = {max_len:,}" if max_len
+        else "max-model-len         = (未定义)",
+        f"kv-cache-memory-bytes = {pool:,}" if pool
+        else "kv-cache-memory-bytes = (未定义)",
         "",
-        f"target    : {_fmt(r['max_len'])} tokens ({r['attn_blocks']} blocks)",
-        f"min pool  : {_fmt(r['min_pool_bytes'])}",
-        f"safe pool : {_fmt(r['safe_pool_bytes'])}",
-        f"recommend : --kv-cache-memory-bytes {r['safe_pool_bytes']}",
     ]
-    out += _feasibility(s, args, r["safe_pool_bytes"])
-    print("\n".join(out))
-    return 0
+    ok = True
 
-
-def cmd_check(s: Sizing, prof: Profile, args: argparse.Namespace) -> int:
-    p = prof.args
-    max_len = args.max_len or int(p.get("max-model-len", 0))
-    pool = args.pool_bytes or int(p.get("kv-cache-memory-bytes", 0) or 0)
-    rev = s.reverse(pool) if pool else None
-    fwd = s.forward(max_len) if max_len else None
-    out = _summary(s, prof, pool) + [""]
     if max_len:
-        out.append(f"max-model-len = {_fmt(max_len)}")
-    if pool:
-        out.append(f"kv-cache-memory-bytes = {_fmt(pool)}")
-    if not pool:
-        out.append("no kv-cache-memory-bytes in profile (auto profiling?)")
-    if rev and max_len:
-        ok = rev["max_safe_len"] >= max_len
-        out.append(f"safe max  : {_fmt(rev['max_safe_len'])} tokens")
-        if ok:
-            out.append("verdict   : SAFE")
+        safe = s.safe_pool(max_len)
+        minimum = s.min_pool(max_len)
+        state = _pool_verdict(pool, minimum, safe) if pool else "（未定义池）"
+        out.append(f"[池检查] 支持 {max_len:,} 需安全池 >= {safe:,}")
+        if pool:
+            out.append(f"         当前 {pool:,} -> {state}")
+            if pool < safe:
+                out.append(f"         -> 建议 --kv-cache-memory-bytes {safe}")
+                ok = False
         else:
-            need = fwd["safe_pool_bytes"] if fwd else 0
-            out.append(
-                f"verdict   : UNSAFE ({_fmt(max_len)} > {_fmt(rev['max_safe_len'])})"
-                f" -> lower --max-model-len to <= {_fmt(rev['max_safe_len'])},"
-                f" or raise pool to {_fmt(need)}"
+            out.append(f"         -> 建议 --kv-cache-memory-bytes {safe}")
+    else:
+        out.append("[池检查] 未定义 --max-model-len，跳过")
+
+    out.append("")
+    if pool:
+        safe_len = s.max_safe_len(pool)
+        out.append(f"[上下文检查] 当前池 {pool:,} 的安全上限 = {safe_len:,}")
+        if max_len:
+            if max_len <= safe_len:
+                out.append(f"         当前 {max_len:,} -> 符合")
+            else:
+                out.append(f"         当前 {max_len:,} -> 超出")
+                out.append(f"         -> 建议 --max-model-len <= {safe_len}")
+                ok = False
+    else:
+        out.append("[上下文检查] 未定义 kv-cache-memory-bytes，跳过")
+
+    print("\n".join(out))
+    return 0 if ok else 1
+
+
+def cmd_feasible(s: Sizing, prof: Profile, args: argparse.Namespace) -> int:
+    target_len = args.max_len or prof.max_len
+    if not target_len:
+        print("[可行性] 未定义 --max-model-len，无法判定")
+        return 2
+    target_pool = s.safe_pool(target_len)
+
+    if args.non_kv_gib:
+        non_kv, src = args.non_kv_gib, "给定 --non-kv-gib"
+    elif args.log:
+        non_kv, src = _non_kv_from_log(args.log)
+    else:
+        if not _port_free():
+            print("[可行性] 8000 端口已被占用（有引擎在跑），请先停止后再试")
+            return 2
+        measured = _deploy_and_measure(prof)
+        if measured is None:
+            print(
+                f"[可行性] {MAX_ATTEMPTS} 次部署均未成功（池可能过大或环境不稳定）；"
+                "可改用 --log / --non-kv-gib"
             )
-        out += _feasibility(s, args, fwd["safe_pool_bytes"] if fwd else 0)
-    print("\n".join(out))
-    if rev and max_len:
-        return 0 if rev["max_safe_len"] >= max_len else 1
-    return 0
+            return 1
+        non_kv, src = measured
+
+    need = non_kv + target_pool / (1024**3)
+    verdict = "OK" if need <= args.gpu_gib else "OOM RISK"
+    print("\n".join(_header(s, prof)))
+    print(f"\n[可行性] 非KV = {non_kv:.2f} GiB ({src})")
+    print(f"         安全池({target_len:,}) = {_gib(target_pool)}")
+    print(
+        f"         合计 {need:.2f} <= 可用 {args.gpu_gib:.2f} GiB -> {verdict}"
+    )
+    return 0 if verdict == "OK" else 1
 
 
-def cmd_reverse(s: Sizing, prof: Profile | None, args: argparse.Namespace) -> int:
-    rev = s.reverse(args.pool_bytes)
-    out = _summary(s, prof, args.pool_bytes) + [
-        "",
-        f"pool      : {_fmt(args.pool_bytes)}",
-        f"capacity  : ~{_fmt(rev['capacity_tokens'])} tokens",
-        f"safe max  : {_fmt(rev['max_safe_len'])} tokens",
-    ]
-    print("\n".join(out))
-    return 0
+# --------------------------------------------------------------------------
+# Feasibility helpers
+# --------------------------------------------------------------------------
+def _non_kv_from_log(log: str) -> tuple[float, str]:
+    with open(log) as f:
+        for line in f:
+            m = _LOAD_RE.search(line)
+            if m:
+                w = float(m.group(1))
+                return w + NON_KV_BASELINE_GIB, (
+                    f"权重 {w} GiB + {NON_KV_BASELINE_GIB} 基线（估算）"
+                )
+    raise SystemExit(f"日志中无 'Model loading took': {log}")
 
 
+def _port_free() -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", 8000)) != 0
+
+
+def _healthy() -> bool:
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _clean_shm() -> None:
+    for pat in ("/dev/shm/vllm_offload_", "/dev/shm/sem.mp-"):
+        for name in os.listdir("/dev/shm"):
+            if name.startswith(os.path.basename(pat)):
+                try:
+                    os.remove(os.path.join("/dev/shm", name))
+                except OSError:
+                    pass
+
+
+def _teardown(proc: subprocess.Popen | None) -> None:
+    if proc is not None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+    for pat in ("VLLM::", "vllm.entrypoints", "resource_tracker"):
+        subprocess.run(["pkill", "-9", "-f", pat], check=False)
+    time.sleep(3)
+    _clean_shm()
+
+
+def _gpu_used_gib() -> float:
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout
+    vals = [int(x) for x in out.split()]
+    return max(vals) / 1024 if vals else 0.0
+
+
+def _deploy_and_measure(prof: Profile) -> tuple[float, str] | None:
+    """Launch the profile, measure non-KV, tear it down. None if never healthy.
+
+    Any startup failure is retried: the warmup transiently OOMs or throws
+    ``CUDA error: invalid argument`` on this platform, so a single failure does
+    not mean the pool is infeasible.
+    """
+    cwd = os.path.dirname(os.path.abspath(prof.path)) or "."
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f"[可行性] 部署尝试 {attempt}/{MAX_ATTEMPTS} ...")
+        _clean_shm()
+        with open(FEASIBLE_LOG, "w") as logf:
+            proc = subprocess.Popen(
+                ["bash", os.path.abspath(prof.path)],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+        healthy = False
+        reason = ""
+        for _ in range(READY_TIMEOUT_S // POLL_SECONDS):
+            time.sleep(POLL_SECONDS)
+            if _healthy():
+                healthy = True
+                break
+            text = _read(FEASIBLE_LOG)
+            if _OOM_RE.search(text):
+                reason = "OOM"
+                break
+            if _TRANSIENT_RE.search(text):
+                reason = "瞬态错误"
+                break
+        if healthy:
+            used = _gpu_used_gib()
+            pool_gib = prof.pool_bytes / (1024**3)
+            non_kv = used - pool_gib
+            weights = _parse_weights(FEASIBLE_LOG)
+            _teardown(proc)
+            return non_kv, (
+                f"实测 used {used:.2f} GiB - 池 {pool_gib:.2f} GiB"
+                f"（权重 {weights} GiB）"
+            )
+        _teardown(proc)
+        print(f"[可行性] 尝试 {attempt} 未健康（{reason or '超时'}），重试")
+    return None
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _parse_weights(log: str) -> str:
+    m = _LOAD_RE.search(_read(log))
+    return m.group(1) if m else "?"
+
+
+# --------------------------------------------------------------------------
+# Self-test
+# --------------------------------------------------------------------------
 def cmd_self_test() -> int:
     fails: list[str] = []
 
@@ -512,21 +637,27 @@ def cmd_self_test() -> int:
         * attn_page_1_token(dims, 2, "fp8_e4m3"),
         group_size=_group_size(dims),
         mamba_groups=cdiv(dims.linear_layers, _group_size(dims)),
-        mamba_blocks=0,
+        mamba_blocks=cdiv(dims.linear_layers, _group_size(dims)) * (2 + 3),
         headroom=COW_BLOCKS + cdiv(dims.linear_layers, _group_size(dims)) * 3,
         anchors=3,
         max_num_seqs=1,
     )
-    s.mamba_blocks = s.mamba_groups * (2 + 3)
     check("block_size MTP3", s.block_size, 1600)
     check("group_size", s.group_size, 17)
     check("mamba_blocks MTP3", s.mamba_blocks, 15)
-    check("headroom (anchors=3)", s.headroom, 16)
-    f = s.forward(524288)
-    check("min pool @524288", f["min_pool_bytes"], 9553510400)
-    check("safe pool @524288", f["safe_pool_bytes"], 9999155200)
-    rev = s.reverse(9600000000)
-    check("max_safe @9.6e9", rev["max_safe_len"], 500800)
+    check("headroom(anchors=3)", s.headroom, 16)
+    check("min_pool @524288", s.min_pool(524288), 9553510400)
+    check("safe_pool @524288", s.safe_pool(524288), 9999155200)
+    check("max_safe_len @9.6e9", s.max_safe_len(9600000000), 500800)
+    lo, hi = 9553510400, 9999155200
+    short, tight, fits = (
+        "不足（启动校验会报错）",
+        "偏小（可启动，但满池会自我抢占）",
+        "符合",
+    )
+    check("verdict 不足", _pool_verdict(9_000_000_000, lo, hi), short)
+    check("verdict 偏小", _pool_verdict(9_700_000_000, lo, hi), tight)
+    check("verdict 符合", _pool_verdict(10_000_000_000, lo, hi), fits)
     s1 = Sizing(
         dims=dims,
         tp=2,
@@ -555,28 +686,27 @@ def cmd_self_test() -> int:
 # --------------------------------------------------------------------------
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Recommend a vLLM KV-cache pool from a launch profile.",
+        description="诊断 vLLM 启动脚本的 KV 池与上下文是否匹配。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--profile", help="launch run script (params read from it)")
-    p.add_argument("--max-len", help="target context, e.g. 500k (forward)")
-    p.add_argument("--pool-bytes", help="pool size, e.g. 9.6e9 (reverse)")
-    p.add_argument("--feasible", action="store_true", help="check GPU OOM risk")
-    p.add_argument("--log", help="engine startup log (for --feasible)")
-    p.add_argument("--non-kv-gib", type=float, help="exact non-KV GiB (--feasible)")
-    p.add_argument("--gpu-gib", type=float, default=GPU_USABLE_GIB,
-                   help="usable GPU GiB")
-    adv = p.add_argument_group("advanced (override profile / other models)")
-    adv.add_argument("--model-config", help="model dir or config.json")
-    adv.add_argument("--tp", type=int, help="tensor parallel size")
-    adv.add_argument("--num-spec", type=int, help="MTP spec tokens")
+    p.add_argument("run_script", nargs="?", help="启动脚本（如 run_....sh）")
+    p.add_argument("--profile", help="启动脚本（同位置参数）")
+    p.add_argument("--max-len", help="覆盖上下文，如 500k")
+    p.add_argument("--pool-bytes", help="覆盖池，如 9.6e9")
+    p.add_argument("--feasible", action="store_true", help="实际部署一次测 OOM")
+    p.add_argument("--log", help="用已有启动日志估算非KV（不部署）")
+    p.add_argument("--non-kv-gib", type=float, help="直接给非KV GiB（不部署）")
+    p.add_argument("--gpu-gib", type=float, default=GPU_USABLE_GIB)
+    adv = p.add_argument_group("高级（换模型/覆盖）")
+    adv.add_argument("--model-config")
+    adv.add_argument("--tp", type=int)
+    adv.add_argument("--num-spec", type=int)
     adv.add_argument("--kv-dtype", choices=sorted(DTYPE_BYTES))
-    adv.add_argument("--anchors", type=int, help="VLLM_MAMBA_CKPT_ANCHORS")
+    adv.add_argument("--anchors", type=int)
     adv.add_argument("--max-num-seqs", type=int)
-    adv.add_argument("--block-size", type=int, help="override auto block size")
-    adv.add_argument("--headroom-blocks", type=int, help="override headroom")
+    adv.add_argument("--block-size", type=int)
+    adv.add_argument("--headroom-blocks", type=int)
     adv.add_argument("--prefix-caching", action="store_true")
-    adv.add_argument("--durable", action="store_true")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -586,21 +716,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return cmd_self_test()
 
-    prof = parse_profile(args.profile) if args.profile else None
+    path = args.profile or args.run_script
+    if not path:
+        make_parser().print_help()
+        return 2
+    if not os.path.isfile(path):
+        raise SystemExit(f"启动脚本不存在: {path}")
+
+    prof = parse_profile(path)
     if args.max_len:
         args.max_len = parse_size(args.max_len)
     if args.pool_bytes:
         args.pool_bytes = parse_size(args.pool_bytes)
 
     s = build_sizing(prof, args)
-    if args.max_len:
-        return cmd_forward(s, prof, args)
-    if args.pool_bytes:
-        return cmd_reverse(s, prof, args)
-    if prof:
-        return cmd_check(s, prof, args)
-    make_parser().print_help()
-    return 2
+    if args.feasible:
+        return cmd_feasible(s, prof, args)
+    return cmd_report(s, prof, args)
 
 
 if __name__ == "__main__":
