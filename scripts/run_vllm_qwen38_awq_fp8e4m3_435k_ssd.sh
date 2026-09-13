@@ -30,7 +30,7 @@ fi
 : "${MAX_MODEL_LEN:=435200}"                 # 272 blocks * 1600 = 435.2k
 : "${KV_CACHE_MEMORY_BYTES:=9000000000}"     # calibrate to "GPU KV cache size"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-: "${CPU_BYTES_TO_USE:=4000000000}"          # host staging = chunk bounce buffer
+: "${CPU_BYTES_TO_USE:=2400000000}"          # host staging = chunk bounce buffer; <=2e9 breaks cudaHostRegister
 : "${SPEC_NUM_TOKENS:=3}"
 : "${VLLM_PIN_MIN_TOKENS:=16000}"
 : "${VLLM_MAMBA_CKPT_TOKENS:=32000}"

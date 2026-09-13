@@ -1,7 +1,8 @@
 # vLLM KV 优化 05：KV 信息面板
 
-> 实时观测保活、锚点、RAM/SSD offload 的指标与面板。数据来自 vLLM 的 Prometheus
-> `/metrics`、引擎进程的 `/proc`、启动日志，以及 `nvidia-smi` / `du`。
+> 实时观测保活、锚点、RAM/SSD offload 的指标与面板。数据来自 vLLM 的两个只读 HTTP
+> 端点：Prometheus `/metrics`（STATUS）与 `GET /host_tier_info`（CONFIG / SESSIONS，
+> 由引擎侧直接提供）；另用 `nvidia-smi` / `du` 取本机资源。
 >
 > 相关文档：
 > - 保活：[`vllm_01_保活.md`](vllm_01_保活.md)
@@ -13,10 +14,12 @@
 
 ## 1. 实时监控脚本 `scripts/monitor_host_tier.py`
 
-默认每 5 秒清屏重绘，分类显示配置与状态（仅用 Python 标准库）。
+默认每 5 秒清屏重绘，分类显示配置与状态（仅用 Python 标准库）。实例用 `--port` 选择：
+面板据此拼出 `http://localhost:<port>` 并同时查 `/metrics` 与 `/host_tier_info`。
 
 ```bash
-python scripts/monitor_host_tier.py            # 5s 刷新
+python scripts/monitor_host_tier.py            # :8000, 5s 刷新
+python scripts/monitor_host_tier.py --port 8001
 python scripts/monitor_host_tier.py -d 10      # 10s 刷新
 python scripts/monitor_host_tier.py --once     # 打印一次
 python scripts/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本化）
@@ -27,21 +30,22 @@ python scripts/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-d/--interval` | `5` | 刷新秒数 |
-| `--url` | `http://localhost:8000` | vLLM 服务地址 |
+| `--port` | `8000` | 要观测的 vLLM 实例端口 |
+| `--url` | `http://localhost:PORT` | 直接指定服务地址（覆盖 `--port`） |
 | `--once` | — | 打印一次退出 |
 | `--count N` | `0`（永久） | 打印 N 次退出 |
-| `--server-log` | 自动（最新 `logs/server*.log`） | 解析配置用 |
-| `--ssd-root` | 配置/env | `du` 统计的 SSD 目录 |
+| `--ssd-root` | 取自 `/host_tier_info` | `du` 统计的 SSD 目录 |
+| `--no-sessions` | — | 隐藏逐条 `SESSIONS` 块 |
 | `--json` | — | 每 tick 输出一行 JSON（不清屏） |
 | `--no-clear` | — | 不清屏 |
 
 ### 1.1 数据来源
 
-- **实时值**：`/metrics`（保活、锚点、GPU KV、RAM/SSD 池与计数器）。
-- **配置**：引擎进程 `/proc/<pid>/{environ,cmdline}` + 启动日志
-  （`GPU KV cache size`、`HostTierSSD: staging_slots=.. chunk_slots=.. evict_small=..
-  block_size=..`、`HostTierSSDStore: root=.. quota=..`）。
-- **资源**：`nvidia-smi` 两卡显存、`du -sb` 的 SSD 目录实际占用。
+- **实时值（STATUS）**：`/metrics`（保活、锚点、GPU KV、RAM/SSD 池与计数器）。
+- **配置 + 逐条 chain（CONFIG / SESSIONS）**：`GET /host_tier_info`（见 §1.4）——
+  由引擎侧（`Scheduler.host_tier_info()`）直接给出，**不再扫 `/proc`、不解析启动日志、
+  不读快照文件**。
+- **资源**：`nvidia-smi` 两卡显存、`du -sb` 的 SSD 目录实际占用（这两项在客户端本地做）。
 
 ### 1.2 输出样式（示意）
 
@@ -50,25 +54,33 @@ python scripts/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本
 
  CONFIG
    endpoint     http://localhost:8000
+   instance     pid 12345   model …/Qwen3.8-27B-AWQ-INT4-yarn512k
    keep-alive   pin_min_tokens   = 16000
    anchors      ckpt_tokens      = 32000        anchors = 3
    eviction     small_tokens     = 32000        (small<32000 first, else oldest)
    GPU KV pool  kv_cache_bytes   = 8.4 GiB       max_model_len = 435200
                 block_size       = 1600 tok     max_num_seqs = 1
                 capacity         = 489,789 tok   (306 blocks)
-   staging      cpu_bytes_to_use = 3.7 GiB       slots = 71   chunk_slots = 35
+   staging      cpu_bytes_to_use = 2.2 GiB       slots = 43   chunk_slots = 21
    SSD          root             = /home/.../ssd_kv
                 quota = 64.0 GiB   max_mibps = 800   only = 1   clean_start = 1
 
  STATUS
    Keep-alive   entries 1   blocks 38   tokens 60.8k   anchors 3 blk / 1 sess
    GPU KV       [█░░░░░░░░░]  11.8%   57,801 / 489,789 tok   (36 / 306 blocks)
-   RAM pool     [░░░░░░░░░░]   0.0%   0 / 71 slots      sessions 0
+   RAM pool     [░░░░░░░░░░]   0.0%   0 / 43 slots      sessions 0
                 spills 0 (+0)   restores 0 (+0)   evictions 0 (+0)   drops 0 (+0)
    SSD pool     [░░░░░░░░░░]   0.0%   0 B / 64.0 GiB   sessions 0
                 stores 0 (+0)   restores 0 (+0)   evictions 0 (+0)   drops 0 (+0)
                 write 0 B (+0 B)   read 0 B (+0 B)
    Resources    GPU0 21747 / 22528 MiB   GPU1 21244 / 22528 MiB   ssd_dir 0 B
+
+ SESSIONS
+   (GPU 1, RAM 2, SSD 1)
+   GPU [1]  id=chatcmpl-abc123…      60.8k tok    38 blk   59.4 MiB  anchors 3  last_used 19:27:03 (12s)
+   RAM [1]  id=chatcmpl-def456…     120.0k tok    75 blk  117.2 MiB  anchors 3  last_used 19:26:54 (21s)
+   RAM [2]  id=chatcmpl-ghi789…      32.0k tok    20 blk   31.3 MiB  anchors 1  last_used 19:26:10 (65s)
+   SSD [1]  id=chatcmpl-jkl012…      60.8k tok    38 blk   59.4 MiB  anchors 3  last_used 19:25:40 (95s)
 
  note: vLLM has no agent session; "session" = one request KV chain
        (matched to a later request by prefix hash).
@@ -78,6 +90,52 @@ python scripts/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本
 >
 > 实测：单条 52k 保活会话 → `entries 1 / blocks 38 / tokens 60.8k / anchors 3 blk / 1 sess`
 > （3 个 Mamba 组各 1 锚点），与 `/metrics` 一致。
+
+### 1.3 逐条 chain（`SESSIONS` 块）
+
+`SESSIONS` 逐条列出三个 tier 的请求链：GPU keep-alive（pin 在显存）、RAM 停放、SSD 停放。
+每行 `id / tokens / blocks / 占用字节 / anchors / last_used(HH:MM:SS) (idle)`。
+
+数据来自 `GET /host_tier_info`（见 §1.4）。`last_used` 由引擎转成**绝对时间**，所以即使
+引擎空闲、请求停顿，面板仍能算出正确的 idle。`--no-sessions` 隐藏该块；端点不可达时
+显示 `(unavailable: ...)`，不影响其余面板。
+
+### 1.4 服务侧端点 `GET /host_tier_info`
+
+始终注册（与 `/metrics`、`/health` 同级，**无需 dev-mode**），只读、只暴露运维字段
+（不 dump 环境变量、无密钥）。返回：
+
+```json
+{
+  "ts": 1757840000.0,
+  "config": {
+    "pid": 12345, "model": ".../Qwen3.8-27B-AWQ-INT4-yarn512k",
+    "max_model_len": 500800, "max_num_seqs": 1, "kv_cache_bytes": 9600000000,
+    "block_size": 1600, "gpu_total_tokens": 525816,
+    "staging_slots": 43, "chunk_slots": 21, "cpu_bytes": 2400000000,
+    "pin_min_tokens": 16000, "ckpt_tokens": 32000, "ckpt_anchors": 3,
+    "evict_small_tokens": 32000, "ram_slot_bytes": 55705600, "page_bytes": 55705600,
+    "ssd": {"enabled": true, "root": ".../ssd_kv", "quota_bytes": 6600000000,
+            "max_mbps": 800, "only": true, "clean_start": true, "row_bytes": 55705600}
+  },
+  "sessions": {
+    "gpu": [{"id": "…", "tokens": 60800, "blocks": 38, "bytes": 2116812800,
+             "anchors": 3, "last_used": 1757839990.0}],
+    "ram": [{"id": "…", "tokens": 120000, "blocks": 75, "slots": 75,
+             "bytes": 4177920000, "anchors": 3, "last_used": 1757839950.0}],
+    "ssd": [{"id": "…", "tokens": 60800, "blocks": 38, "bytes": 2116812800,
+             "anchors": 3, "last_used": 1757839800.0}]
+  }
+}
+```
+
+- 实现链：`Scheduler.host_tier_info()`（`vllm/v1/core/sched/scheduler.py`）→
+  `EngineCore.host_tier_info()` → `AsyncLLM.host_tier_info()` →
+  `call_utility_async("host_tier_info")`；路由在
+  `vllm/entrypoints/serve/host_tier/api_router.py`，由
+  `register_vllm_serve_api_routers` 注册。
+- 引擎不可达 / 抛错 → HTTP 503（面板显示 `(unavailable: ...)`）。
+- 单实例单端口；多实例用 `--port` 区分，每实例各自返回自己的数据（互不串台）。
 
 ---
 

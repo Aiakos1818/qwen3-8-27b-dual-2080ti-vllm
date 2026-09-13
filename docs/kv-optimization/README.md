@@ -26,7 +26,7 @@
 | [vllm_02_锚点](vllm_02_锚点.md) | revert/截断重发（从历史中间分叉）整段重算的根因；按 cadence（32k）落 Mamba 持久快照，最迟-K 窗口、同等保护、容量/卡死口径、512k 规划。 |
 | [vllm_03_offload_ram](vllm_03_offload_ram.md) | 会话级 park/spill 到 RAM：语义、架构、连接器只作拷贝通道、容量对照、实测；**跨层两档驱逐策略的权威描述（§9）**。 |
 | [vllm_04_offload_ssd](vllm_04_offload_ssd.md) | 两层 GPU↔SSD + 分块流式（无会话大小上限）：架构、配置、实现不变式、435k 真 NVMe 验收、bug 修复、限制与复现。 |
-| [vllm_05_kv信息面板](vllm_05_kv信息面板.md) | Prometheus 指标全集、`scripts/monitor_host_tier.py` 实时面板、`RAMTRACE` 轨迹、env 配置总表。 |
+| [vllm_05_kv信息面板](vllm_05_kv信息面板.md) | Prometheus 指标全集、服务侧 `GET /host_tier_info`（逐条 chain 的 `SESSIONS`）、`scripts/monitor_host_tier.py` 实时面板、`RAMTRACE` 轨迹、env 配置总表。 |
 
 ## 知识参考项
 

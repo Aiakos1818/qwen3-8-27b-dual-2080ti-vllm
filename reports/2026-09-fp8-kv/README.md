@@ -129,6 +129,10 @@ restore sha 与 baseline 一致 → **SSD 分块 park/resume 字节正确**。�
 > `cudaErrorInvalidValue`，进而毒化 CUDA context 使 warmup 失败。把 staging 调大
 > （`4e9`，71 槽）即可稳定启动；`VLLM_SSD_CHUNK_SLOTS=8` 仍强制分块传输。
 >
+> **更新（2026-09-14）**：真实 SSD（非 tmpfs）下同样复现；实测阈值在 35~43 槽之间——
+> `2e9`（35 槽）失败、**`2.4e9`（43 槽）稳定**。当前 profile 取 `cpu_bytes_to_use=2.4e9`
+> （chunk 21），两实例共存时 `/dev/shm` 占用 2×2.4e9 ≈ 4.5 GiB。
+>
 > S2 的 `restores+0`（soft）与 §6.3 同因：为保住 restore 后 Mamba 锚点存活，矩阵把 GPU
 > 池提到 128k token，S+T 不再挤出 SSD；SSD park/resume 由 S3/S3b/S4 覆盖。S3b 紧跟 S3
 > 运行、共享前缀缓存，作为回归 smoke check；干净的机制验证见 §3.4 的 RAM `test2`。

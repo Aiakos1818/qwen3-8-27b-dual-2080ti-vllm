@@ -2,14 +2,21 @@
 # -*- coding: utf-8 -*-
 """Live host-tier monitor: keep-alive / anchors / offload pools.
 
-Reads live values from the vLLM ``/metrics`` endpoint and the engine's
-``/proc`` environment/cmdline plus the server startup log, then redraws a
-categorized screen every ``-d`` seconds (default 5).
+Live values come from two read-only HTTP endpoints on the vLLM server:
+
+- ``GET /metrics``        -- Prometheus counters/gauges (STATUS block)
+- ``GET /host_tier_info`` -- host-tier config + per-chain inventory (CONFIG,
+  SESSIONS blocks), served by the engine itself.
+
+The instance is selected with ``--port`` (default 8000); ``--url`` overrides
+the derived ``http://localhost:<port>``. Nothing is read from ``/proc``,
+startup logs or snapshot files.
 
 Usage:
     python scripts/monitor_host_tier.py -d 10
-    python scripts/monitor_host_tier.py --once
+    python scripts/monitor_host_tier.py --port 8001 --once
     python scripts/monitor_host_tier.py --json --count 5
+    python scripts/monitor_host_tier.py --no-sessions
 
 Terminology: vLLM has no agent-session entity. A "session" in the metrics is
 one request's KV chain (matched to a later request by prefix hash).
@@ -17,7 +24,6 @@ one request's KV chain (matched to a later request by prefix hash).
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -25,8 +31,6 @@ import subprocess
 import sys
 import time
 import urllib.request
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --------------------------------------------------------------------------
 # formatting helpers
@@ -73,150 +77,24 @@ def pct(used: float | None, total: float | None) -> str:
     return f"{100.0 * used / total:5.1f}%"
 
 
-# --------------------------------------------------------------------------
-# engine discovery / config
-# --------------------------------------------------------------------------
+def _ago(epoch: float | None, now: float) -> str:
+    if not epoch:
+        return "?"
+    secs = max(0.0, now - float(epoch))
+    if secs < 60:
+        return f"{int(secs)}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    return f"{int(secs // 3600)}h"
 
 
-def _read_file(path: str, binary: bool = False):
-    try:
-        if binary:
-            with open(path, "rb") as f:
-                return f.read()
-        with open(path, "r", errors="ignore") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-def find_engine_pids() -> tuple[int | None, int | None]:
-    """Return (api_server_pid, engine_core_pid) discovered via /proc."""
-    api = core = None
-    for ent in os.listdir("/proc"):
-        if not ent.isdigit():
-            continue
-        raw = _read_file(f"/proc/{ent}/cmdline", binary=True)
-        if not raw:
-            continue
-        text = raw.replace(b"\x00", b" ").decode("utf-8", "ignore")
-        if "vllm.entrypoints" in text:
-            api = int(ent)
-        elif "VLLM::EngineCore" in text:
-            core = int(ent)
-    return api, core
-
-
-def read_environ(pid: int | None) -> dict[str, str]:
-    if pid is None:
-        return dict(os.environ)
-    raw = _read_file(f"/proc/{pid}/environ", binary=True)
-    if raw is None:
-        return dict(os.environ)
-    env: dict[str, str] = {}
-    for kv in raw.split(b"\x00"):
-        if b"=" in kv:
-            k, v = kv.split(b"=", 1)
-            env[k.decode("utf-8", "ignore")] = v.decode("utf-8", "ignore")
-    return env
-
-
-def read_cmdline_args(pid: int | None) -> list[str]:
-    if pid is None:
-        return []
-    raw = _read_file(f"/proc/{pid}/cmdline", binary=True)
-    if not raw:
-        return []
-    return [a.decode("utf-8", "ignore") for a in raw.split(b"\x00") if a]
-
-
-def _arg_value(args: list[str], name: str) -> str | None:
-    for i, a in enumerate(args):
-        if a == name and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith(name + "="):
-            return a.split("=", 1)[1]
-    return None
-
-
-def _read_tail(path: str, max_bytes: int = 2_000_000) -> str:
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
-            return f.read().decode("utf-8", "ignore")
-    except OSError:
-        return ""
-
-
-def _last_match(pattern: str, text: str) -> re.Match | None:
-    if not text:
-        return None
-    found = None
-    for found in re.finditer(pattern, text):
-        pass
-    return found
-
-
-def auto_server_log() -> str | None:
-    cands = glob.glob(os.path.join(BASE_DIR, "logs", "server*.log"))
-    if not cands:
-        return None
-    return max(cands, key=os.path.getmtime)
-
-
-def read_config(api_pid: int | None, server_log: str | None) -> dict:
-    env = read_environ(api_pid)
-    args = read_cmdline_args(api_pid)
-    log = _read_tail(server_log) if server_log else ""
-
-    def _last_int(pat: str) -> int | None:
-        m = _last_match(pat, log)
-        return int(m.group(1)) if m else None
-
-    cfg: dict = {}
-    cfg["pin_min_tokens"] = env.get("VLLM_PIN_MIN_TOKENS")
-    cfg["ckpt_tokens"] = env.get("VLLM_MAMBA_CKPT_TOKENS")
-    cfg["ckpt_anchors"] = env.get("VLLM_MAMBA_CKPT_ANCHORS")
-    cfg["evict_small"] = _last_int(r"evict_small=(\d+)") or env.get(
-        "VLLM_HOSTTIER_EVICT_SMALL_TOKENS"
-    )
-    cfg["block_size"] = _last_int(r"block_size=(\d+)")
-    cfg["staging_slots"] = _last_int(r"staging_slots=(\d+)")
-    cfg["chunk_slots"] = _last_int(r"chunk_slots=(\d+)")
-    m_gpu = _last_match(r"GPU KV cache size:\s*([0-9,]+)\s*tokens", log)
-    cfg["gpu_total_tokens"] = (
-        int(m_gpu.group(1).replace(",", "")) if m_gpu else None
-    )
-
-    m = _last_match(r"HostTierSSDStore:\s*root=(\S+)\s+quota=([\d.]+)GiB", log)
-    cfg["ssd_root_log"] = m.group(1) if m else None
-    cfg["ssd_quota_log"] = float(m.group(2)) * (1 << 30) if m else None
-
-    cfg["ssd_root"] = env.get("VLLM_SSD_ROOT") or cfg["ssd_root_log"]
-    cfg["ssd_quota"] = env.get("VLLM_SSD_QUOTA_BYTES") or cfg["ssd_quota_log"]
-    cfg["ssd_max_mbps"] = env.get("VLLM_SSD_MAX_MBPS")
-    cfg["ssd_only"] = env.get("VLLM_SSD_ONLY")
-    cfg["ssd_clean"] = env.get("VLLM_SSD_CLEAN_START")
-    cfg["ssd_chunk_env"] = env.get("VLLM_SSD_CHUNK_SLOTS")
-
-    cfg["max_model_len"] = _arg_value(args, "--max-model-len")
-    cfg["max_num_seqs"] = _arg_value(args, "--max-num-seqs")
-    cfg["kv_cache_bytes"] = _arg_value(args, "--kv-cache-memory-bytes")
-    xfer = _arg_value(args, "--kv-transfer-config")
-    cfg["cpu_bytes"] = None
-    if xfer:
-        try:
-            cfg["cpu_bytes"] = json.loads(xfer).get(
-                "kv_connector_extra_config", {}
-            ).get("cpu_bytes_to_use")
-        except (ValueError, AttributeError):
-            pass
-    return cfg
+def _sid_short(sid: object, width: int = 22) -> str:
+    text = str(sid)
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
 # --------------------------------------------------------------------------
-# live metrics
+# HTTP endpoints
 # --------------------------------------------------------------------------
 
 _METRIC_RE = re.compile(
@@ -250,6 +128,15 @@ WANTED = [
 ]
 
 
+def _get_json(url: str, timeout: float = 10.0) -> dict | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def fetch_metrics(url: str) -> dict[str, float] | None:
     try:
         with urllib.request.urlopen(f"{url}/metrics", timeout=10) as resp:
@@ -267,6 +154,10 @@ def fetch_metrics(url: str) -> dict[str, float] | None:
             continue
         out[name] = out.get(name, 0.0) + val
     return out
+
+
+def fetch_info(url: str) -> dict | None:
+    return _get_json(f"{url}/host_tier_info", timeout=15.0)
 
 
 def gpu_memory() -> list[tuple[int, int, int]]:
@@ -317,17 +208,23 @@ def dir_bytes(path: str | None) -> int | None:
 # --------------------------------------------------------------------------
 
 
-def render_config(cfg: dict, url: str) -> list[str]:
+def render_config(cfg: dict | None, url: str) -> list[str]:
     def v(key, default="?"):
-        val = cfg.get(key)
+        val = (cfg or {}).get(key)
         return default if val in (None, "") else str(val)
+
+    lines = ["", " CONFIG", f"   {'endpoint':<12} {url}"]
+    if cfg is None:
+        lines.append("   (unavailable: /host_tier_info not reachable)")
+        return lines
 
     gpu_total = cfg.get("gpu_total_tokens")
     block = cfg.get("block_size")
     gpu_blocks = f"{gpu_total // block:,}" if gpu_total and block else "?"
+    model = str(cfg.get("model") or "?")
+    model_short = model if len(model) <= 40 else "…" + model[-39:]
 
-    lines = ["", " CONFIG"]
-    lines.append(f"   {'endpoint':<12} {url}")
+    lines.append(f"   {'instance':<12} pid {v('pid')}   model {model_short}")
     lines.append(
         f"   {'keep-alive':<12} pin_min_tokens   = {v('pin_min_tokens')}"
     )
@@ -336,8 +233,8 @@ def render_config(cfg: dict, url: str) -> list[str]:
         f"        anchors = {v('ckpt_anchors')}"
     )
     lines.append(
-        f"   {'eviction':<12} small_tokens     = {v('evict_small')}"
-        f"        (small<{v('evict_small')} first, else oldest)"
+        f"   {'eviction':<12} small_tokens     = {v('evict_small_tokens')}"
+        f"        (small<{v('evict_small_tokens')} first, else oldest)"
     )
     kv_bytes = cfg.get("kv_cache_bytes")
     kv_bytes_txt = fmt_bytes(float(kv_bytes)) if kv_bytes else "?"
@@ -354,27 +251,29 @@ def render_config(cfg: dict, url: str) -> list[str]:
         f"   ({gpu_blocks} blocks)"
     )
     lines.append(
-        f"   {'staging':<12} cpu_bytes_to_use = "
-        f"{fmt_bytes(float(cfg['cpu_bytes'])) if cfg.get('cpu_bytes') else '?'}"
+        f"   {'staging':<12} cpu_bytes_to_use = {fmt_bytes(cfg.get('cpu_bytes'))}"
         f"       slots = {v('staging_slots')}   chunk_slots = {v('chunk_slots')}"
     )
-    lines.append(f"   {'SSD':<12} root             = {v('ssd_root')}")
+    ssd = cfg.get("ssd") or {}
+    lines.append(f"   {'SSD':<12} root             = {ssd.get('root') or '?'}")
     lines.append(
-        f"   {'':<12} quota = {fmt_bytes(cfg.get('ssd_quota'))}"
-        f"   max_mibps = {v('ssd_max_mbps')}   only = {v('ssd_only')}"
-        f"   clean_start = {v('ssd_clean')}"
+        f"   {'':<12} quota = {fmt_bytes(ssd.get('quota_bytes'))}"
+        f"   max_mibps = {ssd.get('max_mbps')}   only = {ssd.get('only')}"
+        f"   clean_start = {ssd.get('clean_start')}"
     )
     return lines
 
 
 def render_status(
     m: dict[str, float],
-    cfg: dict,
+    cfg: dict | None,
     prev: dict[str, float],
     gpus: list[tuple[int, int, int]],
     ssd_dir: int | None,
     interval: float,
 ) -> list[str]:
+    cfg = cfg or {}
+
     def g(key, default=0.0):
         return m.get(key, default)
 
@@ -421,7 +320,11 @@ def render_status(
     )
 
     su = float(g("vllm:host_tier_ssd_bytes_used") or 0.0)
-    st = float(g("vllm:host_tier_ssd_quota_bytes") or cfg.get("ssd_quota") or 0.0)
+    st = float(
+        g("vllm:host_tier_ssd_quota_bytes")
+        or (cfg.get("ssd") or {}).get("quota_bytes")
+        or 0.0
+    )
     lines.append(
         f"   {'SSD pool':<12} [{bar(su / st if st else None)}] {pct(su, st)}"
         f"   {fmt_bytes(su)} / {fmt_bytes(st)}    "
@@ -454,14 +357,46 @@ def render_status(
     return lines
 
 
+def render_sessions(info: dict | None, now: float) -> list[str]:
+    lines = ["", " SESSIONS"]
+    if info is None:
+        lines.append("   (unavailable: /host_tier_info not reachable)")
+        return lines
+    data = info.get("sessions") or {}
+    groups = [
+        ("GPU", data.get("gpu") or []),
+        ("RAM", data.get("ram") or []),
+        ("SSD", data.get("ssd") or []),
+    ]
+    summary = ", ".join(f"{name} {len(items)}" for name, items in groups)
+    lines.append(f"   ({summary})")
+    for name, items in groups:
+        for i, sess in enumerate(items, 1):
+            ts = sess.get("last_used")
+            try:
+                when = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+            except (TypeError, ValueError):
+                when = "?"
+            lines.append(
+                f"   {name} [{i}]  id={_sid_short(sess.get('id')):<22}"
+                f"  {fmt_tok(sess.get('tokens')):>8} tok"
+                f"  {fmt_int(sess.get('blocks')):>5} blk"
+                f"  {fmt_bytes(sess.get('bytes')):>10}"
+                f"  anchors {int(sess.get('anchors', 0) or 0)}"
+                f"  last_used {when} ({_ago(ts, now)})"
+            )
+    return lines
+
+
 def render(
     m: dict[str, float] | None,
-    cfg: dict,
+    info: dict | None,
     prev: dict[str, float],
     url: str,
     gpus: list[tuple[int, int, int]],
     ssd_dir: int | None,
     interval: float,
+    show_sessions: bool = True,
 ) -> str:
     width = 60
     now = time.strftime("%H:%M:%S")
@@ -472,11 +407,15 @@ def render(
         "═" * side + title + now + " " + "═" * max(0, width - fixed - side)
     )
     body = [header, ""]
-    body += render_config(cfg, url)
+    body += render_config((info or {}).get("config"), url)
     if m is None:
         body += ["", " STATUS", "   server down / metrics unavailable"]
     else:
-        body += render_status(m, cfg, prev, gpus, ssd_dir, interval)
+        body += render_status(
+            m, (info or {}).get("config"), prev, gpus, ssd_dir, interval
+        )
+    if show_sessions:
+        body += render_sessions(info, time.time())
     body += [
         "",
         ' note: vLLM has no agent session; "session" = one request KV chain',
@@ -495,26 +434,26 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-d", "--interval", type=float, default=5.0,
                     help="refresh seconds (default 5)")
-    ap.add_argument("--url", default="http://localhost:8000",
-                    help="vLLM server base url")
+    ap.add_argument("--port", type=int, default=8000,
+                    help="vLLM server port to monitor (default 8000)")
+    ap.add_argument("--url", default=None,
+                    help="vLLM server base url (default http://localhost:PORT)")
     ap.add_argument("--once", action="store_true", help="print once and exit")
     ap.add_argument("--count", type=int, default=0,
                     help="print N times then exit (0 = forever)")
-    ap.add_argument("--server-log", default=None,
-                    help="server log to parse config from (default auto)")
     ap.add_argument("--ssd-root", default=None,
-                    help="SSD dir for du (default: config/env)")
+                    help="SSD dir for du (default: from /host_tier_info)")
     ap.add_argument("--json", action="store_true",
                     help="emit one JSON object per tick (no clear)")
     ap.add_argument("--no-clear", action="store_true",
                     help="do not clear the screen between ticks")
+    ap.add_argument("--no-sessions", action="store_true",
+                    help="hide the per-chain SESSIONS block")
     args = ap.parse_args()
 
+    url = args.url or f"http://localhost:{args.port}"
     count = 1 if args.once else args.count
-    server_log = args.server_log or auto_server_log()
 
-    cfg: dict = {}
-    cfg_pid: int | None = None
     prev: dict[str, float] = {}
     last_dir: int | None = None
     start = time.time()
@@ -522,18 +461,14 @@ def main() -> int:
 
     try:
         while True:
-            api_pid, core_pid = find_engine_pids()
-            pid = api_pid or core_pid
-            if pid != cfg_pid:
-                cfg = read_config(pid, server_log)
-                cfg_pid = pid
-                prev = {}
-
-            m = fetch_metrics(args.url)
+            m = fetch_metrics(url)
             if m is not None and not prev:
                 prev = dict(m)
+            info = fetch_info(url)
+            cfg = (info or {}).get("config") or {}
+
             gpus = gpu_memory()
-            ssd_root = args.ssd_root or cfg.get("ssd_root")
+            ssd_root = args.ssd_root or (cfg.get("ssd") or {}).get("root")
             if isinstance(ssd_root, bytes):
                 ssd_root = ssd_root.decode("utf-8", "ignore")
             cur_dir = dir_bytes(ssd_root)
@@ -547,13 +482,14 @@ def main() -> int:
                 rec["_elapsed"] = round(time.time() - start, 2)
                 rec["_gpu_mem"] = gpus
                 rec["_ssd_dir_bytes"] = last_dir
+                rec["_host_tier_info"] = info
                 print(json.dumps(rec, ensure_ascii=False), flush=True)
             else:
                 if not args.no_clear:
                     sys.stdout.write("\033[H\033[2J")
                 sys.stdout.write(
-                    render(m, cfg, prev, args.url, gpus, last_dir,
-                           args.interval)
+                    render(m, info, prev, url, gpus, last_dir,
+                           args.interval, not args.no_sessions)
                 )
                 sys.stdout.flush()
 

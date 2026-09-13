@@ -70,7 +70,8 @@ _drain_spill_completions: register_restored_blocks
 要点：
 - store 未完成前 GPU 块不下发（`_spill_hold` 保持 pinned），避免被提前覆写。
 - CPU 槽粒度 = GPU 块（`blocks_per_chunk=1`），单会话占 `len(链)` 个槽。
-- 被淘汰会话的“可还原信息”只保留**不可变元数据**（各组 hash、长度）+ CPU 槽，不引用会被复用的块对象。
+- 被淘汰会话的“可还原信息”只保留**不可变元数据**（各组 hash、长度、锚点数）+ CPU 槽，不引用会被复用的块对象。
+  （锚点数同时供面板逐条显示，见 [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md) §1.3。）
 
 ## 4. 配置
 

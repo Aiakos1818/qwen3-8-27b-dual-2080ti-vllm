@@ -49,6 +49,8 @@ SSD 会话仓（配额 + LRU + 进程内索引）
 - 磁盘上每个会话一个目录：`<root>/<engine_id>_<hash>/sessions/<sid>/<idx>.bin`，
   每槽一个文件；`sid` 做了文件系统安全化（sha1 后缀）。
 - 进程内索引按 **tail hash / 前缀 hash** 匹配（与 RAM 路径同规则，取最长链）。
+  每条会话记录保留 tokens/槽数/字节/**锚点数**（供面板逐条显示，见
+  [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md) §1.3）。
 
 ### 2.2 Spill（GPU 压力淘汰保活会话）
 
@@ -102,13 +104,18 @@ SSD 会话仓（配额 + LRU + 进程内索引）
 | `VLLM_HOSTTIER_EVICT_SMALL_TOKENS` | `64000` | 驱逐分档阈值（见 03 §9；0 = 单档最旧优先） |
 | `VLLM_DISABLE_HOSTTIER` | `0` | 全局 kill-switch（含 SSD） |
 
-`cpu_bytes_to_use` = staging 池总大小（双 rank）。**分块流式下只需放得下
-2 个 chunk**（默认 chunk = staging//2），不再要求 ≥ 最大会话：
+`cpu_bytes_to_use` = staging 池总大小（双 rank）。**分块流式下不必放得下整个会话**，
+只决定每次搬多少、要搬几趟：默认 `chunk = staging//2`（双缓冲，让多会话 / restore+spill
+各占一个在飞 chunk）；staging 越小 → chunk 越小 → I/O 往返越多。硬性下限仅 `chunk ≥ 1`。
 
 | 部署 | staging | chunk | 可 offload 会话 |
 |---|---|---|---|
-| 100k 池（已验证） | 4.2e9（77 slot） | 38 slot ≈ 1.9 GiB | 无上限（≤ max-model-len） |
-| 435k 池（已验收） | 4.0e9（71 slot） | 35 slot ≈ 1.8 GiB | 无上限（435k 会话 = 9 chunk） |
+| 100k / 256k / 435k / pool9.6e9（当前 profile） | 2.4e9（43 slot） | 21 slot ≈ 1.1 GiB | 无上限（435k 会话 ≈ 14 chunk） |
+
+> **staging 下限（本机 kernel 7.0 / 驱动 580）**：过小（≤2e9，≤35 slot）会让 TP1 的
+> `cudaHostRegister` 返回 `cudaErrorInvalidValue`，进而毒化 CUDA context 使 warmup 失败
+> （`qwen_triton_warmup` 里一个 1 元素 `torch.full` 报 `CUDA error: invalid argument`）。
+> 实测 **2.4e9（43 slot）稳定**；4e9（71 slot）亦稳定。历史实测见 §7/§8。
 
 启动示例：
 
@@ -116,7 +123,7 @@ SSD 会话仓（配额 + LRU + 进程内索引）
 export VLLM_SSD_ROOT=/path/to/ssd_kv
 export VLLM_SSD_QUOTA_BYTES=68719476736   # 64 GiB
 export VLLM_SSD_ONLY=1
-# --kv-transfer-config ... "cpu_bytes_to_use":4000000000
+# --kv-transfer-config ... "cpu_bytes_to_use":2400000000
 ```
 
 ---
@@ -132,7 +139,7 @@ export VLLM_SSD_ONLY=1
 | `vllm/distributed/.../offloading_connector.py` | `cpu_engine_id()` / `create_scheduler_kv_region()` |
 | `vllm/v1/metrics/{stats,loggers}.py` | SSD 指标（见 [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md)） |
 | `vllm/envs.py` | `VLLM_SSD_*` 声明 |
-| `tests/v1/core/test_host_tier_ssd.py` | 10 个单测（索引/配额 LRU/槽位生命周期/失败清理/在飞保护/分块/两档驱逐） |
+| `tests/v1/core/test_host_tier_ssd.py` | 12 个单测（索引/配额 LRU/槽位生命周期/失败清理/在飞保护/分块/两档驱逐/锚点快照） |
 | `scripts/ssd_matrix.py` | 单次启动功能矩阵 |
 | `scripts/ssd_100k_check.py` / `ssd_435k_check.py` | 真 NVMe park/resume |
 | `scripts/ssd_crash_check.py` | 写中 SIGKILL 原子性 + 启动清理 |
@@ -192,21 +199,24 @@ export VLLM_SSD_ONLY=1
 | NVMe（Colorful CN600 476 GiB） | **0.93 GiB/s** | **1.68 GiB/s** | 系统盘，171 GiB 空闲 |
 | tmpfs（`/dev/shm`） | 2.51 GiB/s | 5.68 GiB/s | 用于功能矩阵，无磨损 |
 
-### 6.2 单元测试（140 passed，2026-09 更新）
+### 6.2 单元测试（149 passed，2026-09 更新）
 
-- `tests/v1/core/test_host_tier_ssd.py`：11 例（chunked roundtrip / abort 释放配额 /
-  load range 边界 / 两档 LRU 驱逐 / `touch` 刷新 recency）。
-- `tests/v1/core/test_host_tier_spill.py`：13 例（release 部分释放+abort 不重复 unpin /
-  hold+release restored blocks / 两档 LRU 驱逐 / `find` 刷新 recency）。
+- `tests/v1/core/test_host_tier_ssd.py`：12 例（chunked roundtrip / abort 释放配额 /
+  load range 边界 / 两档 LRU 驱逐 / `touch` 刷新 recency / 锚点数与 `snapshot()`）。
+- `tests/v1/core/test_host_tier_spill.py`：16 例（release 部分释放+abort 不重复 unpin /
+  hold+release restored blocks / 两档 LRU 驱逐 / `find` 刷新 recency / 锚点传播 /
+  `matches_pinned_chain` 刷新 / `host_tier_info`）。
 - `tests/v1/core/test_prefix_caching.py`：89 例回归。
-- `tests/v1/core/test_mamba_align_chunk_split.py`：26 例（含 `_remove_blocks_in_range`
+- `tests/v1/core/test_mamba_align_chunk_split.py`：28 例（含 `_remove_blocks_in_range`
   保留 pre-cadence 锚点、恢复会话重新认领缓存锚点、抢占后不重认领、cadence 自动对齐
   到 block_size 的回归测试）。
+- `tests/entrypoints/serve/host_tier/test_host_tier_api.py`：4 例（`/host_tier_info`
+  的 200 / 无引擎 / 不支持 / 引擎异常 503）。
 
 ### 6.3 功能矩阵（tmpfs 假 SSD，强制分块）**18/18（1 soft）**
 
 `VLLM_SSD_ROOT=/dev/shm/ssd_test`、quota 3e9、**staging 4e9（71 slot）、chunk 8**
-（强制 50k 会话走 4-5 个 chunk；1e9 会触发 `cudaHostRegister` 毒化，见下注）：
+（强制 50k 会话走 4-5 个 chunk；≤2e9 会触发 `cudaHostRegister` 毒化，见 §4.3）：
 
 | 场景 | 结果 |
 |---|---|
@@ -325,7 +335,7 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 # 功能矩阵（tmpfs，强制分块：在 100k 启动配置上加）
 #   VLLM_SSD_ROOT=/dev/shm/ssd_test VLLM_SSD_QUOTA_BYTES=3000000000 \
 #   VLLM_SSD_CHUNK_SLOTS=8 VLLM_SSD_ONLY=1 RAMTRACE=1
-#   --kv-transfer-config ... "cpu_bytes_to_use":4000000000
+#   --kv-transfer-config ... "cpu_bytes_to_use":2400000000
 #   --kv-cache-memory-bytes 2770000000 --max-num-seqs 4
 python scripts/ssd_matrix.py
 

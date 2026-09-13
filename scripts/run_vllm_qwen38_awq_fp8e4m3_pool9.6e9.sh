@@ -68,5 +68,5 @@ exec /home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/venv/bin/python -m vllm.entry
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}' \
   --cpu-offload-gb 0 \
-  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":4000000000}}' \
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":2400000000}}' \
   --disable-uvicorn-access-log

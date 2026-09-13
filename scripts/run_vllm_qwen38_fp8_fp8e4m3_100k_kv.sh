@@ -36,7 +36,7 @@ fi
 : "${MAX_MODEL_LEN:=102400}"                 # 100*1024 = 102.4k
 : "${KV_CACHE_MEMORY_BYTES:=2300000000}"     # calibrate to "GPU KV cache size"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-: "${CPU_BYTES_TO_USE:=4000000000}"          # host staging (RAM parking / bounce)
+: "${CPU_BYTES_TO_USE:=2400000000}"          # host staging (RAM parking / bounce); <=2e9 breaks cudaHostRegister
 : "${SPEC_NUM_TOKENS:=3}"                    # MTP speculative tokens
 : "${MAX_NUM_SEQS:=1}"                       # single long-context request by default
 : "${MAX_NUM_BATCHED_TOKENS:=4096}"          # prefill chunk size

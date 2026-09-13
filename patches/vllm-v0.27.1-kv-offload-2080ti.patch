@@ -1,9 +1,79 @@
+diff --git a/tests/entrypoints/serve/host_tier/__init__.py b/tests/entrypoints/serve/host_tier/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/tests/entrypoints/serve/host_tier/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/tests/entrypoints/serve/host_tier/test_host_tier_api.py b/tests/entrypoints/serve/host_tier/test_host_tier_api.py
+new file mode 100644
+index 000000000..b9ad6d9ac
+--- /dev/null
++++ b/tests/entrypoints/serve/host_tier/test_host_tier_api.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for the always-on host-tier diagnostics endpoint."""
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from vllm.entrypoints.serve.host_tier.api_router import attach_router
++
++pytestmark = pytest.mark.cpu_test
++
++
++class _FakeEngine:
++    def __init__(self, info=None, error=None) -> None:
++        self._info = info
++        self._error = error
++
++    async def host_tier_info(self):
++        if self._error is not None:
++            raise self._error
++        return self._info
++
++
++def _client(engine) -> TestClient:
++    app = FastAPI()
++    app.state.engine_client = engine
++    attach_router(app)
++    return TestClient(app)
++
++
++def test_host_tier_info_ok() -> None:
++    info = {
++        "config": {"pid": 1, "block_size": 1600},
++        "sessions": {"gpu": [], "ram": [], "ssd": []},
++    }
++    resp = _client(_FakeEngine(info)).get("/host_tier_info")
++    assert resp.status_code == 200
++    assert resp.json() == info
++
++
++def test_host_tier_info_no_engine() -> None:
++    app = FastAPI()
++    app.state.engine_client = None
++    attach_router(app)
++    assert TestClient(app).get("/host_tier_info").status_code == 503
++
++
++def test_host_tier_info_unsupported() -> None:
++    engine = _FakeEngine(error=NotImplementedError())
++    assert _client(engine).get("/host_tier_info").status_code == 503
++
++
++def test_host_tier_info_engine_failure() -> None:
++    engine = _FakeEngine(error=RuntimeError("boom"))
++    assert _client(engine).get("/host_tier_info").status_code == 503
 diff --git a/tests/v1/core/test_host_tier_spill.py b/tests/v1/core/test_host_tier_spill.py
 new file mode 100644
-index 000000000..c3a8522a7
+index 000000000..551a8bc45
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_spill.py
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,537 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the session-level host-tier (RAM) spill/restore helpers.
@@ -13,10 +83,13 @@ index 000000000..c3a8522a7
 +contract without spinning up an engine.
 +"""
 +
++from types import SimpleNamespace
++
 +import pytest
 +import torch
 +
 +from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.sched import scheduler as scheduler_module
 +from vllm.v1.core.sched.scheduler import Scheduler
 +from vllm.v1.kv_cache_interface import (
 +    FullAttentionSpec,
@@ -232,6 +305,7 @@ index 000000000..c3a8522a7
 +        "tail": b"tailhash",
 +        "tokens": 8,
 +        "num_blocks": 2,
++        "anchors": 3,
 +        "blocks": [],
 +        "grp_blocks": [[block]],
 +    }
@@ -242,7 +316,71 @@ index 000000000..c3a8522a7
 +    assert session["slots"] == slots
 +    assert session["grp_hashes"] == [[b"tailhash"]]
 +    assert session["tokens"] == 8
++    assert session["anchors"] == 3
 +    assert "r" not in manager._spill_hold
++
++
++def test_matches_pinned_chain_refreshes_recency() -> None:
++    """A resumed keep-alive chain becomes most-recently-used (true LRU)."""
++    manager = make_manager()
++    manager._auto_pin_entries.append(
++        {
++            "req_id": "s",
++            "tail": b"t2",
++            "tokens": 20,
++            "blocks": [],
++            "grp_blocks": [],
++            "anchors": 1,
++            "parked_at": 1.0,
++            "last_used": 1.0,
++        }
++    )
++    assert manager.matches_pinned_chain([b"t0", b"t1", b"t2"])
++    assert manager._auto_pin_entries[0]["last_used"] > 1.0
++
++    # A miss (or an empty prompt) leaves recency untouched.
++    manager._auto_pin_entries[0]["last_used"] = 5.0
++    assert not manager.matches_pinned_chain([b"x0"])
++    assert not manager.matches_pinned_chain([])
++    assert manager._auto_pin_entries[0]["last_used"] == 5.0
++
++
++def test_host_tier_snapshots_report_anchors() -> None:
++    manager = make_manager()
++    manager._auto_pin_entries.append(
++        {
++            "req_id": "g",
++            "tail": b"t",
++            "tokens": 40,
++            "blocks": [object(), object()],
++            "grp_blocks": [],
++            "anchors": 2,
++            "parked_at": 1.0,
++            "last_used": 3.0,
++        }
++    )
++    manager._ram_sessions["r"] = {
++        "req_id": "r",
++        "tokens": 20,
++        "num_blocks": 5,
++        "slots": [0, 1],
++        "anchors": 1,
++        "parked_at": 2.0,
++        "last_used": 4.0,
++    }
++    assert manager.pinned_chain_snapshot() == [
++        {"id": "g", "tokens": 40, "blocks": 2, "anchors": 2, "last_used": 3.0}
++    ]
++    assert manager.ram_session_snapshot() == [
++        {
++            "id": "r",
++            "tokens": 20,
++            "blocks": 5,
++            "slots": 2,
++            "anchors": 1,
++            "last_used": 4.0,
++        }
++    ]
 +
 +
 +def test_pinned_hit_blocks_are_not_evictable() -> None:
@@ -399,12 +537,86 @@ index 000000000..c3a8522a7
 +    assert manager.block_pool.get_num_free_blocks() == free_before
 +    manager.release_restored_hold(blocks)
 +    assert manager.block_pool.get_num_free_blocks() == free_before + 2
++
++
++class _InfoScheduler:
++    """Minimal host for ``Scheduler.host_tier_info``."""
++
++    host_tier_info = Scheduler.host_tier_info
++    _ram_slot_bytes = Scheduler._ram_slot_bytes
++
++    def __init__(self, manager: KVCacheManager, connector=None, store=None) -> None:
++        self.kv_cache_manager = manager
++        self._ssd_store = store
++        self.connector = connector
++        self._ssd_chunk_slots = 7
++        self.block_size = 4
++        self.kv_cache_config = object()
++        self.vllm_config = SimpleNamespace(
++            model_config=SimpleNamespace(model="m", max_model_len=1000),
++            scheduler_config=SimpleNamespace(max_num_seqs=1),
++            cache_config=SimpleNamespace(kv_cache_memory_bytes=123),
++            kv_transfer_config=None,
++        )
++
++
++class _SlotConnector:
++    def cpu_slot_bytes(self) -> int:
++        return 100
++
++
++def test_host_tier_info(monkeypatch) -> None:
++    manager = make_manager()
++    manager.set_ram_capacity(4)
++    manager._auto_pin_entries.append(
++        {
++            "req_id": "g",
++            "tail": b"t",
++            "tokens": 40,
++            "blocks": [object(), object()],
++            "grp_blocks": [],
++            "anchors": 2,
++            "parked_at": 1.0,
++            "last_used": 1.0,
++        }
++    )
++    manager._ram_sessions["r"] = {
++        "req_id": "r",
++        "tokens": 20,
++        "num_blocks": 5,
++        "slots": [0, 1],
++        "anchors": 1,
++        "parked_at": 2.0,
++        "last_used": 2.0,
++    }
++    monkeypatch.setattr(
++        scheduler_module, "get_kv_cache_capacity", lambda *_: (999, 1.0)
++    )
++    scheduler = _InfoScheduler(manager, connector=_SlotConnector())
++
++    info = scheduler.host_tier_info()
++
++    assert info["config"]["gpu_total_tokens"] == 999
++    assert info["config"]["staging_slots"] == 4
++    assert info["config"]["chunk_slots"] == 7
++    assert info["config"]["block_size"] == 4
++    assert info["config"]["ram_slot_bytes"] == 100
++    assert info["config"]["ssd"]["enabled"] is False
++
++    sessions = info["sessions"]
++    assert [s["id"] for s in sessions["gpu"]] == ["g"]
++    assert sessions["gpu"][0]["anchors"] == 2
++    assert sessions["gpu"][0]["bytes"] == 2 * 100
++    assert sessions["ram"][0]["bytes"] == 2 * 100
++    assert sessions["ssd"] == []
++    # last_used is exported as an absolute epoch, not a monotonic tick.
++    assert sessions["gpu"][0]["last_used"] > 1_000_000_000.0
 diff --git a/tests/v1/core/test_host_tier_ssd.py b/tests/v1/core/test_host_tier_ssd.py
 new file mode 100644
-index 000000000..e1273e98f
+index 000000000..5e335be05
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_ssd.py
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,388 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the two-tier GPU/SSD host tier (``HostTierSSDStore``).
@@ -771,6 +983,26 @@ index 000000000..e1273e98f
 +    assert store.submit_load_range("s", 1, [2, 3], keep_files=True) is None
 +    assert store.submit_load_range("s", -1, [2], keep_files=True) is None
 +    store.discard("s")
++    store.shutdown()
++    close_view(buf, view, flat)
++
++
++def test_begin_store_records_anchors_and_snapshot(tmp_path) -> None:
++    """The parked session keeps its anchor count for the monitor snapshot."""
++    buf, view, flat = make_view(8)
++    store = make_store(tmp_path, view)
++    assert store.begin_store("sidA", 3, [[b"\x01" * 16]], tail(0xAA), 96, 2)
++    assert store.append_store("sidA", 0, [0, 1, 2], commit=True) is not None
++    wait_n(store, 1)
++
++    [sess] = store.snapshot()
++    assert sess["sid"] == "sidA"
++    assert sess["tokens"] == 96
++    assert sess["blocks"] == 3
++    assert sess["bytes"] == 3 * ROW
++    assert sess["anchors"] == 2
++    assert "last_used" in sess
++
 +    store.shutdown()
 +    close_view(buf, view, flat)
 diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
@@ -1245,7 +1477,7 @@ index 211903242..2267657a3 100644
          for job_id, entry in metadata.store_jobs.items():
              if not self._is_store_writer:
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
-index a32d5d9cc..8cabdc72c 100644
+index a32d5d9cc..75736a57e 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
 @@ -67,6 +67,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -1256,13 +1488,17 @@ index a32d5d9cc..8cabdc72c 100644
  
          self.connector_scheduler: OffloadingConnectorScheduler | None = None
          self.connector_worker: OffloadingConnectorWorker | None = None
-@@ -79,6 +80,19 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+@@ -79,6 +80,23 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                  spec, vllm_config, kv_cache_config
              )
  
 +    def cpu_capacity(self) -> int:
 +        """Number of host-tier CPU slots available (per worker)."""
 +        return self._spec.num_blocks
++
++    def cpu_slot_bytes(self) -> int:
++        """Bytes per host-tier CPU slot (per worker)."""
++        return int(getattr(self._spec, "kv_bytes_per_chunk", 0))
 +
 +    def cpu_engine_id(self) -> str:
 +        """Engine id naming this instance's shared host KV region."""
@@ -1276,7 +1512,7 @@ index a32d5d9cc..8cabdc72c 100644
      def shutdown(self) -> None:
          if self.connector_worker is not None:
              self.connector_worker.shutdown()
-@@ -168,6 +182,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+@@ -168,6 +186,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
          assert self.connector_scheduler is not None
          return self.connector_scheduler.has_pending_push_work()
  
@@ -1295,6 +1531,100 @@ index a32d5d9cc..8cabdc72c 100644
      def update_connector_output(self, connector_output: KVConnectorOutput):
          assert self.connector_scheduler is not None
          self.connector_scheduler.update_connector_output(connector_output)
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 5a9b9f96d..65dff8048 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -249,6 +249,10 @@ class EngineClient(ABC):
+         """Get supported tasks"""
+         raise NotImplementedError
+ 
++    async def host_tier_info(self) -> dict:
++        """Get host-tier config and parked-chain inventory."""
++        raise NotImplementedError
++
+     async def init_weight_transfer_engine(
+         self, init_request: WeightTransferInitRequest
+     ) -> None:
+diff --git a/vllm/entrypoints/serve/__init__.py b/vllm/entrypoints/serve/__init__.py
+index 57491d45f..5619ad169 100644
+--- a/vllm/entrypoints/serve/__init__.py
++++ b/vllm/entrypoints/serve/__init__.py
+@@ -13,6 +13,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
+ 
+     register_instrumentator_api_routers(app)
+ 
++    from vllm.entrypoints.serve.host_tier.api_router import (
++        attach_router as attach_host_tier_router,
++    )
++
++    attach_host_tier_router(app)
++
+     from vllm.entrypoints.serve.lora.api_router import (
+         attach_router as attach_lora_router,
+     )
+diff --git a/vllm/entrypoints/serve/host_tier/__init__.py b/vllm/entrypoints/serve/host_tier/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm/entrypoints/serve/host_tier/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/entrypoints/serve/host_tier/api_router.py b/vllm/entrypoints/serve/host_tier/api_router.py
+new file mode 100644
+index 000000000..6260d8387
+--- /dev/null
++++ b/vllm/entrypoints/serve/host_tier/api_router.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Read-only host-tier diagnostics: ``GET /host_tier_info``.
++
++Always registered (like ``/metrics``). Returns the host-tier config plus the
++parked-chain inventory (GPU keep-alive / RAM / SSD) as JSON, so external
++monitors do not have to scrape ``/proc``, startup logs or a snapshot file.
++Only operational fields are exposed (no environment dump, no secrets).
++"""
++
++from http import HTTPStatus
++
++from fastapi import APIRouter, FastAPI, HTTPException, Request
++from fastapi.responses import JSONResponse
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++router = APIRouter()
++
++
++@router.get("/host_tier_info")
++async def host_tier_info(raw_request: Request):
++    client = getattr(raw_request.app.state, "engine_client", None)
++    if client is None:
++        raise HTTPException(
++            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
++            detail="no engine client (render-only server)",
++        )
++    try:
++        info = await client.host_tier_info()
++    except NotImplementedError as err:
++        raise HTTPException(
++            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
++            detail="engine client does not support host_tier_info",
++        ) from err
++    except Exception as err:
++        logger.exception("host_tier_info failed")
++        raise HTTPException(
++            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
++            detail=f"host_tier_info failed: {err}",
++        ) from err
++    return JSONResponse(content=info)
++
++
++def attach_router(app: FastAPI):
++    app.include_router(router)
 diff --git a/vllm/envs.py b/vllm/envs.py
 index eb369a4f1..3f3a67506 100755
 --- a/vllm/envs.py
@@ -1466,10 +1796,10 @@ index a64b7e321..4cb11ad9f 100644
      def reset_prefix_cache(self) -> bool:
 diff --git a/vllm/v1/core/host_tier_ssd.py b/vllm/v1/core/host_tier_ssd.py
 new file mode 100644
-index 000000000..c325c86c9
+index 000000000..69584b335
 --- /dev/null
 +++ b/vllm/v1/core/host_tier_ssd.py
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,602 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Session-level SSD parking for the host-tier offload (two-tier GPU/SSD).
@@ -1649,6 +1979,21 @@ index 000000000..c325c86c9
 +        with self._lock:
 +            return self._bytes_used
 +
++    def snapshot(self) -> list[dict[str, Any]]:
++        """Committed parked sessions (for diagnostics/monitoring)."""
++        with self._lock:
++            return [
++                {
++                    "sid": s["sid"],
++                    "tokens": s["tokens"],
++                    "blocks": s["n_slots"],
++                    "bytes": s["bytes"],
++                    "anchors": s.get("anchors", 0),
++                    "last_used": s["last_used"],
++                }
++                for s in self._sessions.values()
++            ]
++
 +    def session_dir(self, sid: str) -> str:
 +        return os.path.join(self._sessions_dir, _safe_name(sid))
 +
@@ -1775,6 +2120,7 @@ index 000000000..c325c86c9
 +        grp_hashes: list[list[bytes]],
 +        tail: bytes | None,
 +        tokens: int,
++        anchors: int = 0,
 +    ) -> bool:
 +        """Reserve quota for a session that will be written in chunks.
 +
@@ -1817,6 +2163,7 @@ index 000000000..c325c86c9
 +            "tokens": tokens,
 +            "n_slots": total_slots,
 +            "bytes": total_bytes,
++            "anchors": int(anchors),
 +            "dir": directory,
 +            "last_used": time.monotonic(),
 +        }
@@ -2102,7 +2449,7 @@ index 70cd26750..e2ac02b34 100644
  
      def allocate_new_computed_blocks(
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index fcb67726a..53db6d88e 100644
+index fcb67726a..928a87383 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,19 +2,26 @@
@@ -2243,7 +2590,7 @@ index fcb67726a..53db6d88e 100644
              return None
  
          if (
-@@ -577,6 +658,568 @@ class KVCacheManager:
+@@ -577,6 +658,607 @@ class KVCacheManager:
              self.block_pool.free_blocks(pins)
          self.coordinator.free(request.request_id)
  
@@ -2455,6 +2802,33 @@ index fcb67726a..53db6d88e 100644
 +    def num_ram_sessions(self) -> int:
 +        return len(self._ram_sessions)
 +
++    def pinned_chain_snapshot(self) -> list[dict[str, Any]]:
++        """Per-chain view of keep-alive pinned chains (for monitoring)."""
++        return [
++            {
++                "id": e["req_id"],
++                "tokens": e["tokens"],
++                "blocks": len(e["blocks"]),
++                "anchors": e.get("anchors", 0),
++                "last_used": e.get("last_used", e["parked_at"]),
++            }
++            for e in self._auto_pin_entries
++        ]
++
++    def ram_session_snapshot(self) -> list[dict[str, Any]]:
++        """Per-chain view of RAM-parked sessions (for monitoring)."""
++        return [
++            {
++                "id": s["req_id"],
++                "tokens": s["tokens"],
++                "blocks": s["num_blocks"],
++                "slots": len(s["slots"]),
++                "anchors": s.get("anchors", 0),
++                "last_used": s.get("last_used", s["parked_at"]),
++            }
++            for s in self._ram_sessions.values()
++        ]
++
 +    # ------------------------------------------------------------------ #
 +    # Host-tier session spill (RAM parking).                             #
 +    # ------------------------------------------------------------------ #
@@ -2472,13 +2846,22 @@ index fcb67726a..53db6d88e 100644
 +                pass
 +
 +    def matches_pinned_chain(self, block_hashes: list[bytes]) -> bool:
-+        """True if a keep-alive pinned chain's tail is in this request's hashes."""
++        """True if a keep-alive pinned chain's tail is in this request's hashes.
++
++        A match means the chain is being resumed, so refresh its recency
++        (``last_used``) to keep the host-tier eviction order a true LRU.
++        """
 +        if not block_hashes:
 +            return False
 +        bh = set(block_hashes)
-+        return any(
-+            e["tail"] is not None and e["tail"] in bh for e in self._auto_pin_entries
-+        )
++        now = None
++        for entry in self._auto_pin_entries:
++            if entry["tail"] is not None and entry["tail"] in bh:
++                if now is None:
++                    now = time.monotonic()
++                entry["last_used"] = now
++                return True
++        return False
 +
 +    def ram_slots_free(self) -> int:
 +        return sum(length for _, length in self._ram_free)
@@ -2571,6 +2954,7 @@ index fcb67726a..53db6d88e 100644
 +            "tail": entry["tail"],
 +            "grp_hashes": grp_hashes,
 +            "tokens": entry["tokens"],
++            "anchors": entry.get("anchors", 0),
 +        }
 +
 +    def release_spill_blocks(
@@ -2604,6 +2988,7 @@ index fcb67726a..53db6d88e 100644
 +            "tail": entry["tail"],
 +            "grp_hashes": grp_hashes,
 +            "tokens": entry["tokens"],
++            "anchors": entry.get("anchors", 0),
 +        }
 +
 +    def hold_restored_blocks(
@@ -2666,6 +3051,7 @@ index fcb67726a..53db6d88e 100644
 +            "grp_hashes": grp_hashes,
 +            "tokens": entry["tokens"],
 +            "num_blocks": entry["num_blocks"],
++            "anchors": entry.get("anchors", 0),
 +            "slots": slots or [],
 +            "parked_at": time.monotonic(),
 +            "last_used": time.monotonic(),
@@ -2854,10 +3240,17 @@ index 9aea06109..885f7238a 100644
      # when the block is full and cached.
      _block_hash: BlockHashWithGroupId | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b4521a2e1..cfcdb58bf 100644
+index b4521a2e1..43ca9246e 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -7,6 +7,7 @@ from collections.abc import Iterable
+@@ -1,12 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
  from dataclasses import replace
  from typing import Any
  
@@ -2865,17 +3258,21 @@ index b4521a2e1..cfcdb58bf 100644
  from vllm.compilation.cuda_graph import CUDAGraphStat
  from vllm.config import KVEventsConfig, VllmConfig
  from vllm.distributed.ec_transfer.ec_connector.base import (
-@@ -37,7 +38,8 @@ from vllm.v1.core.encoder_cache_manager import (
+@@ -37,7 +39,12 @@ from vllm.v1.core.encoder_cache_manager import (
  )
  from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
  from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 -from vllm.v1.core.kv_cache_utils import KVCacheBlock
-+from vllm.v1.core.kv_cache_utils import KVCacheBlock, align_ckpt_tokens
++from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlock,
++    align_ckpt_tokens,
++    get_kv_cache_capacity,
++)
 +from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, GPULoadStoreSpec
  from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
  from vllm.v1.core.sched.output import (
      CachedRequestData,
-@@ -53,7 +55,7 @@ from vllm.v1.core.sched.request_queue import (
+@@ -53,7 +60,7 @@ from vllm.v1.core.sched.request_queue import (
  )
  from vllm.v1.core.sched.utils import check_stop, remove_all
  from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
@@ -2884,7 +3281,7 @@ index b4521a2e1..cfcdb58bf 100644
  from vllm.v1.metrics.perf import ModelMetrics, PerfStats
  from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
  from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-@@ -132,6 +134,33 @@ class Scheduler(SchedulerInterface):
+@@ -132,6 +139,33 @@ class Scheduler(SchedulerInterface):
          # Whether a preempted request's in-flight output must be dropped; see
          # KVConnectorBase_V1.requires_kv_delivery.
          self.requires_kv_delivery = False
@@ -2918,7 +3315,7 @@ index b4521a2e1..cfcdb58bf 100644
          kv_transfer_config = self.vllm_config.kv_transfer_config
          if kv_transfer_config is not None:
              assert not self.is_encoder_decoder, (
-@@ -292,6 +321,63 @@ class Scheduler(SchedulerInterface):
+@@ -292,6 +326,63 @@ class Scheduler(SchedulerInterface):
          # kv_cache_manager is constructed so block_pool is available.
          if self.connector is not None:
              self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
@@ -2982,7 +3379,7 @@ index b4521a2e1..cfcdb58bf 100644
  
          self.use_pp = self.parallel_config.pipeline_parallel_size > 1
          self.use_v2_model_runner = vllm_config.use_v2_model_runner
-@@ -414,6 +500,37 @@ class Scheduler(SchedulerInterface):
+@@ -414,6 +505,37 @@ class Scheduler(SchedulerInterface):
              if self.mamba_partial_cache_hit
              else 0
          )
@@ -3020,7 +3417,7 @@ index b4521a2e1..cfcdb58bf 100644
          stops = (
              # Same invariant: a chunk starting mid-block stops at the boundary
              # rather than running past it.
-@@ -425,6 +542,10 @@ class Scheduler(SchedulerInterface):
+@@ -425,6 +547,10 @@ class Scheduler(SchedulerInterface):
              tail_boundary
              if last_cache_position < tail_boundary < request.num_prompt_tokens
              else 0,
@@ -3031,7 +3428,7 @@ index b4521a2e1..cfcdb58bf 100644
              # Marconi shared-prefix junction, block-floored (a sub-block
              # junction's state is not separately cacheable): cache its state
              # so sibling requests sharing the prefix can reuse it.
-@@ -741,10 +862,31 @@ class Scheduler(SchedulerInterface):
+@@ -741,10 +867,31 @@ class Scheduler(SchedulerInterface):
                  connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                  did_prefix_cache_lookup = False
  
@@ -3063,7 +3460,7 @@ index b4521a2e1..cfcdb58bf 100644
                      # Get locally-cached tokens.
                      if self.connector is not None:
                          # A KV connector transfers the missing suffix, which needs a
-@@ -765,6 +907,13 @@ class Scheduler(SchedulerInterface):
+@@ -765,6 +912,13 @@ class Scheduler(SchedulerInterface):
                              request.shared_prefix_boundary,
                          ) = self.kv_cache_manager.get_computed_blocks(request)
  
@@ -3077,7 +3474,7 @@ index b4521a2e1..cfcdb58bf 100644
                      # Get externally-cached tokens if using a KVConnector.
                      if self.connector is not None:
                          # Present a block-aligned local hit to the connector so
-@@ -810,7 +959,11 @@ class Scheduler(SchedulerInterface):
+@@ -810,7 +964,11 @@ class Scheduler(SchedulerInterface):
                          else:
                              num_external_computed_tokens = ext_tokens
  
@@ -3090,7 +3487,7 @@ index b4521a2e1..cfcdb58bf 100644
                              # No external tokens back the deeper local hit, so its
                              # resume boundary would have no valid Mamba state.
                              # Reconcile to the boundary every group agrees on.
-@@ -970,6 +1123,36 @@ class Scheduler(SchedulerInterface):
+@@ -970,6 +1128,36 @@ class Scheduler(SchedulerInterface):
                      # avoid deadlock and predictable preemptions.
                      reserved_blocks = self._inflight_prefill_reserved_blocks()
  
@@ -3127,7 +3524,7 @@ index b4521a2e1..cfcdb58bf 100644
                  new_blocks = self.kv_cache_manager.allocate_slots(
                      request,
                      num_new_tokens,
-@@ -1916,6 +2099,11 @@ class Scheduler(SchedulerInterface):
+@@ -1916,6 +2104,11 @@ class Scheduler(SchedulerInterface):
  
              if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                  request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -3139,7 +3536,7 @@ index b4521a2e1..cfcdb58bf 100644
  
              # Get prompt logprobs for this request.
              prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-@@ -2328,9 +2516,41 @@ class Scheduler(SchedulerInterface):
+@@ -2328,9 +2521,41 @@ class Scheduler(SchedulerInterface):
  
      def _free_blocks(self, request: Request):
          assert request.is_finished()
@@ -3181,7 +3578,7 @@ index b4521a2e1..cfcdb58bf 100644
      @property
      def pause_state(self) -> PauseState:
          return self._pause_state
-@@ -2516,7 +2736,7 @@ class Scheduler(SchedulerInterface):
+@@ -2516,7 +2741,7 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.data if kv_connector_stats else None
          )
@@ -3190,7 +3587,7 @@ index b4521a2e1..cfcdb58bf 100644
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
              num_skipped_waiting_reqs=len(self.skipped_waiting),
-@@ -2528,7 +2748,47 @@ class Scheduler(SchedulerInterface):
+@@ -2528,7 +2753,130 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -3223,7 +3620,7 @@ index b4521a2e1..cfcdb58bf 100644
 +            host_tier_ssd_drops=self._host_tier_ssd_drops,
 +            host_tier_ssd_write_bytes=self._host_tier_ssd_write_bytes,
 +            host_tier_ssd_read_bytes=self._host_tier_ssd_read_bytes,
-         )
++        )
 +        self._host_tier_spills = 0
 +        self._host_tier_restores = 0
 +        self._host_tier_evictions = 0
@@ -3235,10 +3632,93 @@ index b4521a2e1..cfcdb58bf 100644
 +        self._host_tier_ssd_write_bytes = 0
 +        self._host_tier_ssd_read_bytes = 0
 +        return stats
++
++    def host_tier_info(self) -> dict[str, Any]:
++        """Host-tier config + parked chains, served by ``/host_tier_info``.
++
++        ``last_used`` is converted from monotonic to epoch so an idle engine
++        (no stats ticks) still yields correct idle times on the monitor.
++        """
++        kvm = self.kv_cache_manager
++        gpu_total_tokens, _ = get_kv_cache_capacity(
++            self.vllm_config, self.kv_cache_config
++        )
++        slot_bytes = self._ram_slot_bytes()
++        page_bytes = (
++            self._ssd_store.row_bytes if self._ssd_store is not None else slot_bytes
+         )
++        now_mono = time.monotonic()
++        now_wall = time.time()
++
++        def _epoch(mono: float) -> float:
++            return now_wall - (now_mono - mono)
++
++        gpu = kvm.pinned_chain_snapshot()
++        ram = kvm.ram_session_snapshot()
++        ssd = self._ssd_store.snapshot() if self._ssd_store is not None else []
++        for sess in gpu:
++            sess["bytes"] = sess["blocks"] * page_bytes
++        for sess in ram:
++            sess["bytes"] = sess["slots"] * slot_bytes
++        for group in (gpu, ram, ssd):
++            for sess in group:
++                sess["last_used"] = _epoch(sess["last_used"])
++
++        kv_transfer = self.vllm_config.kv_transfer_config
++        cpu_bytes = None
++        if kv_transfer is not None:
++            cpu_bytes = kv_transfer.kv_connector_extra_config.get(
++                "cpu_bytes_to_use"
++            )
++        store = self._ssd_store
++        config = {
++            "pid": os.getpid(),
++            "model": self.vllm_config.model_config.model,
++            "max_model_len": self.vllm_config.model_config.max_model_len,
++            "max_num_seqs": self.vllm_config.scheduler_config.max_num_seqs,
++            "kv_cache_bytes": self.vllm_config.cache_config.kv_cache_memory_bytes,
++            "block_size": self.block_size,
++            "gpu_total_tokens": gpu_total_tokens,
++            "staging_slots": kvm.ram_capacity(),
++            "chunk_slots": self._ssd_chunk_slots,
++            "cpu_bytes": cpu_bytes,
++            "pin_min_tokens": envs.VLLM_PIN_MIN_TOKENS,
++            "ckpt_tokens": envs.VLLM_MAMBA_CKPT_TOKENS,
++            "ckpt_anchors": envs.VLLM_MAMBA_CKPT_ANCHORS,
++            "evict_small_tokens": envs.VLLM_HOSTTIER_EVICT_SMALL_TOKENS,
++            "ram_slot_bytes": slot_bytes,
++            "page_bytes": page_bytes,
++            "ssd": {
++                "enabled": store is not None,
++                "root": envs.VLLM_SSD_ROOT,
++                "quota_bytes": (
++                    store.quota_bytes if store is not None else None
++                ),
++                "max_mbps": envs.VLLM_SSD_MAX_MBPS,
++                "only": envs.VLLM_SSD_ONLY,
++                "clean_start": envs.VLLM_SSD_CLEAN_START,
++                "row_bytes": store.row_bytes if store is not None else 0,
++            },
++        }
++        return {
++            "ts": now_wall,
++            "config": config,
++            "sessions": {"gpu": gpu, "ram": ram, "ssd": ssd},
++        }
++
++    def _ram_slot_bytes(self) -> int:
++        """Bytes per host-tier CPU slot (0 when unavailable)."""
++        get = getattr(self.connector, "cpu_slot_bytes", None)
++        if get is None:
++            return 0
++        try:
++            return int(get())
++        except Exception:
++            return 0
  
      def make_spec_decoding_stats(
          self,
-@@ -2553,6 +2813,12 @@ class Scheduler(SchedulerInterface):
+@@ -2553,6 +2901,12 @@ class Scheduler(SchedulerInterface):
          logger.debug_once("[shutdown] Scheduler: start")
          if self.kv_event_publisher:
              self.kv_event_publisher.shutdown()
@@ -3251,7 +3731,7 @@ index b4521a2e1..cfcdb58bf 100644
          if self.connector is not None:
              self.connector.shutdown()
  
-@@ -2611,16 +2877,40 @@ class Scheduler(SchedulerInterface):
+@@ -2611,16 +2965,40 @@ class Scheduler(SchedulerInterface):
  
          return self.connector.request_finished_all_groups(request, block_ids)
  
@@ -3297,7 +3777,7 @@ index b4521a2e1..cfcdb58bf 100644
              num_tokens_main_model=full_num_tokens,
              apply_admission_cap=True,
          )
-@@ -2632,6 +2922,735 @@ class Scheduler(SchedulerInterface):
+@@ -2632,6 +3010,740 @@ class Scheduler(SchedulerInterface):
              self._request_remaining_blocks(req) for req in self._inflight_prefills
          )
  
@@ -3426,7 +3906,12 @@ index b4521a2e1..cfcdb58bf 100644
 +            self._host_tier_evictions += evicted
 +            self._host_tier_ssd_evictions += evicted
 +        if not self._ssd_store.begin_store(
-+            req_id, len(flat), grp_hashes, entry["tail"], entry["tokens"]
++            req_id,
++            len(flat),
++            grp_hashes,
++            entry["tail"],
++            entry["tokens"],
++            entry.get("anchors", 0),
 +        ):
 +            kvm.abort_spill(req_id)
 +            self._host_tier_drops += 1
@@ -4033,7 +4518,7 @@ index b4521a2e1..cfcdb58bf 100644
      def _update_waiting_for_remote_kv(self, request: Request) -> None:
          """
          KV Connector: update request state after async recv is finished.
-@@ -2724,6 +3743,7 @@ class Scheduler(SchedulerInterface):
+@@ -2724,6 +3836,7 @@ class Scheduler(SchedulerInterface):
  
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)
@@ -4378,6 +4863,35 @@ index 75cf97f4f..87f8aef94 100644
              partial_hash = self._cache_partial_tail_block(request, num_tokens)
              if partial_hash is not None:
                  self.cached_blocks_this_step.add(partial_hash)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 4ce9d64b4..983f69537 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -280,6 +280,9 @@ class AsyncLLM(EngineClient):
+ 
+         return self._supported_tasks
+ 
++    async def host_tier_info(self) -> dict:
++        return await self.engine_core.call_utility_async("host_tier_info")
++
+     async def add_request(
+         self,
+         request_id: str,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 11c78c7e7..ed4e607eb 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -363,6 +363,10 @@ class EngineCore:
+         self._log_pooler_config(supported_tasks)
+         return supported_tasks
+ 
++    def host_tier_info(self) -> dict[str, Any]:
++        """Host-tier config + parked chains (see ``GET /host_tier_info``)."""
++        return self.scheduler.host_tier_info()
++
+     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
+         if self._pooler_config_logged:
+             return
 diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
 index 40b57ac86..2886c8960 100644
 --- a/vllm/v1/kv_offload/cpu/gpu_worker.py
