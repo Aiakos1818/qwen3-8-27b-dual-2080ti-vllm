@@ -1,12 +1,20 @@
-#!/usr/bin/env bash
-# 512k + KV anchors (AWQ-INT4, fp8_e4m3 KV, MTP=3, pool 9.6e9).
-# Same MTP as the 435k production profile (block_size=1600, cadence 32000).
-# The pool must leave >= K free slots at full length (anchor deadlock criterion,
-# docs/kv-optimization/vllm_02_锚点.md 4.2). Cadence auto-aligns to the block
-# size (floor), so the raw 32000 is valid at 1600 and would floor to 31680 at
-# MTP1's 1584. 9.7e9 OOMs at request time.
-# SSD offload on: the pool is ~96% full, so a revert needs S to spill/restore
-# rather than be evicted.
+#!/bin/bash
+set -e
+
+# 配置 = INT4 W4A16 (AWQ-INT4) + YARN rope + 256K 上下文 + fp8_e4m3 KV
+#      + 保活(pin) + Mamba/GDN 锚点 + 两层 GPU/SSD 会话 offload(分块流式)
+#   - 权重: Qwen3.8-27B-AWQ-INT4-yarn512k (~10.5GiB/卡)
+#   - --max-model-len 262144 (=256*1024), 池 5.6e9。
+#     实测: 支持 262144 需安全池 >= 5,431,296,000; 取 5.6e9(省显存, 安全上限
+#     ~272,000, 比 262,144 略高留余量)。池容量/安全上限用
+#     scripts/kv_pool_sizing.py 诊断(见 docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5)。
+#   - 锚点: VLLM_MAMBA_CKPT_TOKENS=32000/K=3(覆盖近尾 96k, 每 cadence 1 个锚点)。
+#   - 保活: 结束且 >= VLLM_PIN_MIN_TOKENS(16000) 的会话整链 pin; 准入压力时
+#     最小保活会话先落盘(分块, GPU 块逐块释放), 回来时 restore。
+#   - SSD: quota 64 GiB=68719476736 B, 限速 800 MiB/s 保护系统盘, 启动清残留。
+#   - 启动 flakiness: TP worker warmup 偶发 CUDA invalid argument/OOM; 重试即可,
+#     重试前清理 /dev/shm/vllm_offload_*.mmap 残留。
+
 export OMP_NUM_THREADS=8
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
@@ -14,17 +22,19 @@ export VLLM_USE_DEEP_GEMM=0
 export VLLM_QWOPUS_MTP_BF16_DRAFT=1
 export VLLM_SM75_SPEC_SYNC_MODE=safe
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+# Keep-alive (auto pin finished long sessions).
 export VLLM_PIN_MIN_TOKENS=16000
-# Auto-aligned to the block size (MTP3 -> 1600 -> stays 32000).
+# Durable Mamba/GDN checkpoint anchors (deep/truncated revert reuse).
 export VLLM_MAMBA_CKPT_TOKENS=32000
 export VLLM_MAMBA_CKPT_ANCHORS=3
-# Offload: with the pool ~96% full a revert would otherwise evict the resident
-# session instead of reusing it; the SSD tier lets S spill and be restored.
+# Two-tier GPU/SSD session offload (chunked, no session-size limit).
 export VLLM_SSD_ROOT=${VLLM_SSD_ROOT:-/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}
 export VLLM_SSD_QUOTA_BYTES=${VLLM_SSD_QUOTA_BYTES:-68719476736}
 export VLLM_SSD_MAX_MBPS=${VLLM_SSD_MAX_MBPS:-800}
 export VLLM_SSD_CLEAN_START=${VLLM_SSD_CLEAN_START:-1}
 export VLLM_SSD_ONLY=1
+# Eviction tiers: sessions < 32k are parked first, >= 32k by oldest-first
+# (aligned with keep-alive 16k / anchors 32k).
 export VLLM_HOSTTIER_EVICT_SMALL_TOKENS=32000
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:/home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/venv/bin:$PATH
@@ -37,12 +47,12 @@ exec /home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/venv/bin/python -m vllm.entry
   --served-model-name qwen38-27b \
   --dtype half --tensor-parallel-size 2 --device-ids 0,1 \
   --kv-cache-dtype fp8_e4m3 \
-  --max-model-len 524288 \
+  --max-model-len 262144 \
   --gpu-memory-utilization 0.92 \
-  --kv-cache-memory-bytes 9600000000 \
+  --kv-cache-memory-bytes ${KV_CACHE_MEMORY_BYTES:-5600000000} \
   --enable-prefix-caching --max-num-seqs 1 \
   --enable-prompt-tokens-details \
-  --max-num-batched-tokens 1024 --enable-chunked-prefill \
+  --max-num-batched-tokens 4096 --enable-chunked-prefill \
   --no-async-scheduling \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":20,"video":1}' \

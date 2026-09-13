@@ -345,10 +345,10 @@ max_safe_len   = (slots − mamba_blocks − H) × block_size
 默认做两项一致性检查并给建议：
 ```bash
 # 默认：检查 profile 的池/上下文是否匹配（两项检查）
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh
 # 可选：覆盖上下文 / 池
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 500k
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --pool-bytes 9.6e9
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 500k
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool-bytes 9.6e9
 ```
 输出：
 - `[池检查]`：当前池 vs `safe_pool(max-model-len)` → 不足 / 偏小（可启动但满池会自我抢占）/ 符合；不符给推荐池。
@@ -359,9 +359,9 @@ python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --pool-b
 健康探测每 10s，瞬态失败重试 ≤3 次，`CUDA out of memory` 不重试），健康后读 `nvidia-smi` 的
 used − 池字节得**真实非KV**，随即退出部署并清理，再判定 `非KV + 安全池 ≤ 21.5 GiB`。
 ```bash
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh --max-len 512k --feasible
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 512k --feasible
 # 不部署的替代：--log <已有启动日志>（估算）或 --non-kv-gib <实测值>
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_512k_kv.sh \
+python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh \
     --max-len 512k --feasible --log fp8-kv-work/server_c5.log
 ```
 `--log` 用 `Model loading took X GiB` + 基线(2.0 GiB) 估非KV；`--non-kv-gib` 直接给实测值
@@ -452,19 +452,19 @@ Based on the available memory, the estimated maximum model length is 233600.
 
 ## 7. 推荐配置表
 
-### 7.1 FP8 模型, fp8_e4m3 KV Cache
+### 7.1 当前 profile 一览
 
-| 目标上下文 | max_model_len | kv-cache-memory-bytes | batched-tokens | 脚本 | 状态 |
-|---|---|---|---|---|---|
-| 180,000 | 180000 | 4e9 B (3.73 GiB) | 4096 | `run_vllm_qwen38_zyYuc.sh` | 稳定 |
-| 245,760 (=240×1024) | 245760 | 4.8e9 B (4.47 GiB) | 4096 | `run_vllm_qwen38_zyYuc_v3.sh` | 已验证可运行 |
-| 262,144 (=256×1024) | 262144 | 5.0e9 B (4.66 GiB) | 2048 | `run_vllm_qwen38_zyYuc_v4.sh` | 已验证可运行 |
+| 模型 | 上下文 | 池 (kv-cache-memory-bytes) | 脚本 |
+|---|---|---|---|
+| FP8 | 180,000 | 4e9 B (3.73 GiB) | `run_vllm_qwen38_zyYuc.sh` |
+| AWQ-INT4 | 102,400 | 2.3e9 B | `run_vllm_qwen38_awq_fp8e4m3_100k.sh` |
+| AWQ-INT4 | 262,144 | 5.6e9 B | `run_vllm_qwen38_awq_fp8e4m3_256k.sh` |
+| AWQ-INT4 | 435,200 | 9.0e9 B | `run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` |
+| AWQ-INT4 | 500,800 | 9.6e9 B | `run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` |
 
-**kv-cache-memory-bytes 计算方法** (3.5 节精确公式, 无 MM IPC 扣减):
-```
-kv-cache-memory-bytes ≥ 27,852,800 × (ceil(max_model_len/1600) + 15)
-```
-262,144: 27,852,800 × (164 + 15) = 4,985,651,200 → 取 5,000,000,000 (余量 13.7 MiB)
+**池容量计算方法** (3.5 节精确公式, 无 MM IPC 扣减):
+- 启动校验最低值: `27,852,800 × (ceil(max_len/1600) + 15)`
+- 深回退安全值: 再加 `H` 块 (见 §4.5)；直接诊断用 `scripts/kv_pool_sizing.py <run.sh>`。
 
 > 注: `--gpu-memory-utilization` 设了 `kv-cache-memory-bytes` 后被跳过
 > (日志: "skipped memory profiling. This does not respect the gpu_memory_utilization config")，
@@ -472,28 +472,31 @@ kv-cache-memory-bytes ≥ 27,852,800 × (ceil(max_model_len/1600) + 15)
 
 ### 7.2 安全建议
 
-- **核心约束** (4.4 节): `非KV占用 + KV ≤ 21999 MiB`，v3 非KV 基线 17387 MiB (@ batched-tokens 4096)
+- **核心约束** (4.4 节): `非KV占用 + KV ≤ 21999 MiB`
 - 加大上下文 → KV 增大 → 必须同步削减非KV，否则启动 OOM:
-  1. 降 `--max-num-batched-tokens` (4096→2048→1024): 释放临时激活池 (预估 ≥150 MiB/档, 待实测)
+  1. 降 `--max-num-batched-tokens` (4096→2048→1024): 释放临时激活池
   2. 降 MTP `num_speculative_tokens` (3→1): 释放 MTP draft (BF16) + 推测 temp
 - 代价: 降 batched-tokens 使长 prompt 的 prefill 分块变慢 (TTFT 上升)，decode 不受影响
-- 262,144 已是 `max_position_embeddings` 上限，无法再加
+- 本机 AWQ 可启动的最大池 = 9.6e9 (8.94 GiB/卡)；9.7e9 首次请求即 OOM
+  → 最大安全上下文 500,800 (见 §4.5)
 
 ### 7.3 已验证的稳定配置
 
 | 配置 | 参数 | 状态 |
 |---|---|---|
-| FP8 + 180,000 | `run_vllm_qwen38_zyYuc.sh` (4e9 B = 3.73 GiB KV) | 稳定 |
-| FP8 + 245,760 | `run_vllm_qwen38_zyYuc_v3.sh` (4.8e9 B = 4.47 GiB KV) | 已验证可运行 |
-| FP8 + 262,144 | `run_vllm_qwen38_zyYuc_v4.sh` (5.0e9 B = 4.66 GiB KV, batched 2048) | 已验证可运行 |
+| FP8 + 180,000 | `run_vllm_qwen38_zyYuc.sh` (4e9 B) | 稳定 |
+| AWQ-INT4 + 100k | `run_vllm_qwen38_awq_fp8e4m3_100k.sh` (2.3e9 B) | 稳定 (小池实验台) |
+| AWQ-INT4 + 256k | `run_vllm_qwen38_awq_fp8e4m3_256k.sh` (5.6e9 B) | 已验证 |
+| AWQ-INT4 + 435k | `run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` (9.0e9 B) | 已验证 |
+| AWQ-INT4 + 500.8k | `run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` (9.6e9 B) | 已验证 |
 
-### 7.4 v4 启动 OOM 回退阶梯
+### 7.4 启动 OOM 回退阶梯
 
-若 v4 启动时 `torch.OutOfMemoryError` (KV 分配阶段)，依次尝试:
+若启动时 `torch.OutOfMemoryError` (KV 分配阶段)，依次尝试:
 1. `--max-num-batched-tokens 1024`
-2. `--kv-cache-memory-bytes 4985651200` (精确需求下限)
+2. `--kv-cache-memory-bytes` 降到该上下文的最低需求 (见 §4.5)
 3. `num_speculative_tokens: 3 → 1`
-4. 回退 v3 (245760)
+4. 降 `--max-model-len`
 
 ## 附录 A: 关键源码位置
 
