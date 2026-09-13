@@ -253,7 +253,7 @@ python scripts/ssd_crash_check.py
 
 `p03_restore_revert.py` 支持 `control|test|test2` 三种模式（`test2` 为两轮停车/恢复）。
 
-单元测试（139 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领、真 LRU 三个回归测试）：
+单元测试（140 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领、真 LRU 三个回归测试）：
 
 ```bash
 cd zyYuc-sandbox/src/vllm-0271

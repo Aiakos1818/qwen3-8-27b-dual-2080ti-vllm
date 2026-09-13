@@ -774,7 +774,7 @@ index 000000000..e1273e98f
 +    store.shutdown()
 +    close_view(buf, view, flat)
 diff --git a/tests/v1/core/test_mamba_align_chunk_split.py b/tests/v1/core/test_mamba_align_chunk_split.py
-index 31671caf7..e03488599 100644
+index 31671caf7..936caa6a5 100644
 --- a/tests/v1/core/test_mamba_align_chunk_split.py
 +++ b/tests/v1/core/test_mamba_align_chunk_split.py
 @@ -78,6 +78,8 @@ def _split(
@@ -801,7 +801,7 @@ index 31671caf7..e03488599 100644
  
  
  def _run_chunked_prefill(
-@@ -209,6 +217,235 @@ def test_poisoning_is_block_size_independent(
+@@ -209,6 +217,266 @@ def test_poisoning_is_block_size_independent(
      assert _prefill(prompt_len, budgets=budgets) > 0
  
  
@@ -838,6 +838,37 @@ index 31671caf7..e03488599 100644
 +    # The retained entries are detached from the table like any freed block.
 +    blocks = mamba.req_to_blocks[request.request_id]
 +    assert blocks[0].is_null and blocks[1].is_null
++
++
++def test_durable_window_retires_lowest_token_anchor(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A one-shot head-free must retire the oldest anchors, not the newest.
++
++    The head-prefix free walks blocks high->low, so retiring by insertion order
++    kept the oldest boundaries (1600..9600) and dropped the near-tail ones a
++    revert needs; a restored 515k session reproduced exactly that.
++    """
++    from vllm import envs
++    from vllm.v1.core.kv_cache_utils import KVCacheBlock
++
++    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
++    manager = _make_hybrid_kv_cache_manager()
++    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
++    # Policy test: the window list is what matters, not the pool bookkeeping.
++    monkeypatch.setattr(mamba.block_pool, "pin_block", lambda blk: None)
++    monkeypatch.setattr(mamba.block_pool, "unpin_block", lambda blk: None)
++    monkeypatch.setattr(mamba.block_pool, "free_blocks", lambda blocks: None)
++
++    # Retain boundaries in the order a one-shot head-free visits them.
++    for end in range(10 * MAMBA_BLOCK_SIZE, 0, -MAMBA_BLOCK_SIZE):
++        blk = KVCacheBlock(block_id=end)
++        blk._block_hash_num_tokens = end
++        mamba._retain_durable_anchor("r", blk)
++
++    kept = sorted(b.block_hash_num_tokens for b in mamba._durable_win["r"])
++    # Cap 6 (ANCHORS=3, doubled): the six highest boundaries survive.
++    assert kept == [8000, 9600, 11200, 12800, 14400, 16000]
 +
 +
 +def test_align_ckpt_tokens_floors_to_block_size() -> None:
@@ -3989,7 +4020,7 @@ index b4521a2e1..9cb532d79 100644
          # KV Connector:: update recv and send status from last step.
          for req_id in kv_connector_output.finished_recving or ():
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 75cf97f4f..bef08db63 100644
+index 75cf97f4f..cb2bc2f04 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -6,6 +6,8 @@ from collections import defaultdict
@@ -4077,7 +4108,7 @@ index 75cf97f4f..bef08db63 100644
  
      @classmethod
      def find_longest_cache_hit(
-@@ -1440,9 +1488,161 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1440,9 +1488,189 @@ class MambaManager(SingleTypeKVCacheManager):
              ):
                  blocks = self.req_to_blocks[request_id]
                  if blocks[last_state_block_idx] != self._null_block:
@@ -4161,16 +4192,34 @@ index 75cf97f4f..bef08db63 100644
 +        self, request_id: str, blk: KVCacheBlock
 +    ) -> None:
 +        """Pin ``blk`` and hand it to this request's durable window (newest
-+        last), retiring the oldest anchor past the cap. No-op if the block is
-+        already in the window (avoids a duplicate unpin at finish)."""
++        last), retiring the anchor with the lowest token position past the cap.
++        No-op if the block is already in the window (avoids a duplicate unpin
++        at finish)."""
 +        win = self._durable_win.setdefault(request_id, [])
 +        if any(b is blk for b in win):
 +            return
 +        self.block_pool.pin_block(blk)
 +        win.append(blk)
++        if envs.RAMTRACE:
++            try:
++                with open(envs.RAMTRACE_LOG, "a") as _f:
++                    _f.write(
++                        f"retain anchor req={request_id} "
++                        f"tok={blk.block_hash_num_tokens} win={len(win)}\n"
++                    )
++            except Exception:
++                pass
 +        if len(win) > self._ckpt_anchors:
-+            oldest = win.pop(0)
-+            self._release_durable_anchor(oldest)
++            # Retire by token position, not insertion order: a one-shot
++            # head-prefix free walks blocks high->low, so dropping the first
++            # inserted would keep the oldest boundaries and discard the
++            # near-tail ones a revert needs (e.g. a restored 515k session kept
++            # 30400..96000 instead of ~448k..512k).
++            idx = min(
++                range(len(win)),
++                key=lambda i: win[i].block_hash_num_tokens or 0,
++            )
++            self._release_durable_anchor(win.pop(idx))
 +
 +    def take_durable_window(self, request_id: str) -> list[KVCacheBlock]:
 +        """Hand over this request's surviving durable anchors to the caller
@@ -4184,7 +4233,17 @@ index 75cf97f4f..bef08db63 100644
 +        """
 +        if self.mamba_cache_mode != "align" or not self._ckpt_tokens:
 +            return []
-+        return self._durable_win.pop(request_id, [])
++        win = self._durable_win.pop(request_id, [])
++        if envs.RAMTRACE and win:
++            try:
++                with open(envs.RAMTRACE_LOG, "a") as _f:
++                    _f.write(
++                        f"durable window req={request_id} "
++                        f"anchors={[b.block_hash_num_tokens for b in win]}\n"
++                    )
++            except Exception:
++                pass
++        return win
 +
 +    def _adopt_cached_durable_anchors(
 +        self, request: Request, num_tokens: int
@@ -4240,7 +4299,7 @@ index 75cf97f4f..bef08db63 100644
      def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
          """
          cascade attention is not supported by mamba
-@@ -1468,6 +1668,18 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1468,6 +1696,18 @@ class MambaManager(SingleTypeKVCacheManager):
              # To put it in the next step, we return num_gpu_blocks + 1 so
              # that kv_cache_manager will think there is no enough blocks to allocate now
              # and don't schedule it in the current step.
@@ -4259,7 +4318,7 @@ index 75cf97f4f..bef08db63 100644
              return self.block_pool.num_gpu_blocks + 1
          if self.mamba_cache_mode != "align":
              # Allocate extra `num_speculative_blocks` blocks for
-@@ -1653,8 +1865,16 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1653,8 +1893,16 @@ class MambaManager(SingleTypeKVCacheManager):
      def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
          if self.mamba_cache_mode == "align":
              self._allocated_block_reqs.discard(request_id)
@@ -4276,7 +4335,7 @@ index 75cf97f4f..bef08db63 100644
              # A hand-off whose request died in this same scheduling pass must
              # not reach the connector: its unpin hook (free) has already run.
              self._pending_partial_tail_offloads = [
-@@ -1682,6 +1902,19 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -1682,6 +1930,19 @@ class MambaManager(SingleTypeKVCacheManager):
          super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
          num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
          if self.mamba_cache_mode == "align":

@@ -29,7 +29,7 @@ GPU↔RAM/SSD 分层 offload）在 **FP8 权重**（block-wise dynamic e4m3）�
 | RAM offload 矩阵 | `spills=8 restores=4 evictions=2 drops=2`（与 AWQ 一致） |
 | SSD 真盘 park/resume | `R cached=81600 / 10.7s`，sha 一致，写 9.34 GiB / 读 2.85 GiB |
 | SSD 强制分块矩阵 | **18/18 PASS**；`S3 restore + 深回退 keep2=30400 keep3=46400`、`S3b 二次停车 keep2=30400` |
-| 单元测试 | 139 passed（含新增回归测试与真 LRU 测试） |
+| 单元测试 | 140 passed（含新增回归测试与真 LRU 测试） |
 
 结论：**KV 优化与权重量化无关**，切换只需改 `--quantization`、重标定 KV 池、把 `ninja` 放进 PATH。
 

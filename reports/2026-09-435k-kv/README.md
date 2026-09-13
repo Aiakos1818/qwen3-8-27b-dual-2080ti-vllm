@@ -52,8 +52,10 @@ SSD 上复跑。
 - 对比 MTP1（`awq_512k_anchor_check.txt`，S=515k、池 536,624、仅剩 ~21.6k slot）：V 的准入
   把常驻链 spill 到 SSD，而 SSD `find` 只认"更长/同链"、不认更短纯前缀 → 重算。即池贴近上限
   时才会触发该限制。
-- 结论：MTP3 下 512k 全流程 PASS。极上限（S≥515k、free < ~7 slot）仍需 headroom，或后续让
-  SSD 支持"更短前缀"恢复（Phase C）。
+- 结论：MTP3 下 512k 全流程 PASS。极上限（S≥515k、free < ~7 slot）长 prefill 会**自我抢占**，
+  释放 durable 窗口、近尾锚点丢失 → 深回退重算；需留 free ≥ ~10 slot。另修复：durable 窗口
+  改为按 token 位置淘汰（保留近尾 K 个，而非最早插入的），否则恢复会话只留最早几个边界
+  （`30400..96000`）而非近尾（`448k..512k`）。
 
 ## 4. 结果文件
 

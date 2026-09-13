@@ -291,8 +291,9 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
   ——512k 现池按 ~1.0x 配，无 slot 余量，需先小步实测（临时加大 bytes 或降 MTP spec 腾位），
   确认满长 prefill + 目标 K 不卡后再定默认值。
 - 待办：①（已完成 §6.1）极细 cadence 中途覆盖；②（已完成 2026-09-13）512k 满长 + 锚点实测：
-  MTP3 下 S 499k 不 OOM、SSD 分块恢复 99.4%（sha 一致）、深回退命中 480000；仅当池贴近
-  上限（MTP1/S=515k、free ~21.6k）时恢复链被 spill 到 SSD，而 SSD 只认"更长/同链" → miss，
+  MTP3 下 S 499k 不 OOM、SSD 分块恢复 99.4%（sha 一致）、深回退命中 480000；池贴近上限
+  （free < ~7 slot，如 S 515k）时长 prefill **自我抢占**会释放 durable 窗口、近尾锚点丢失
+  → 深回退重算（需留 free ≥ ~10 slot）。durable 窗口已改为按 token 位置淘汰（保留近尾 K 个），
   见 [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)；③ 若需细粒度，
   将“free slot 数”从近似换成引擎真值探针。
 
