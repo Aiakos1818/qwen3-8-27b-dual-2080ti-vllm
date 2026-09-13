@@ -311,6 +311,54 @@ Used: 21809 MiB, Free: 190 MiB  (比 v3 的 34 MiB 更宽裕)
 v4 实测: 17041 + 4768 = 21809, 余量 190 MiB ✓
 ```
 
+### 4.5 durable 深回退的安全池余量 (重要)
+
+§3.5 的公式是**启动校验的最低值**: 它把 attention 组恰好配到 `max_model_len`，
+attention 组余量为 0。durable 锚点(每请求)与 chunked-prefill 的 CoW 需要额外块，
+一旦请求到达池上限就会**自我抢占** (`alloc gate ... need=3 free=0`)，抢占会释放
+durable 窗口 → 深回退重算。因此要**安全**运行，池必须比最低值多留 `H` 块:
+
+```
+min_pool_bytes(max_len)  = group_size × page_size × ( ceil(max_len/block_size) + mamba_blocks )
+safe_pool_bytes(max_len) = group_size × page_size × ( ceil(max_len/block_size) + mamba_blocks + H )
+```
+
+- 本部署 (MTP3): `group_size=17`、`page_size=1,638,400`、`slot=27,852,800`、
+  `block_size=1600`、`mamba_blocks=3×(2+num_spec)=15`。即
+  `safe_pool_bytes ≈ 27,852,800 × (ceil(max_len/1600) + 15 + H)`。
+- **H 标定 = 16 块** (25,600 token): 实测 499k 留 16 块 PASS、515k 留 6 块 FAIL
+  (见 `reports/2026-09-435k-kv/`)。更保守可取 20。
+- 等价规则: 启动日志 `GPU KV cache size: N tokens` 必须满足
+  `N ≥ max_len + H × block_size`。
+
+**反向 (由池推最大安全上下文)**:
+```
+slots          = floor(pool_bytes / slot_bytes)
+max_safe_len   = (slots − mamba_blocks − H) × block_size
+```
+
+**工具**: `scripts/kv_pool_sizing.py`（纯标准库，可 `--model-config` 读 config.json；
+支持前向/反向/`--verify-log`/`--self-test`）:
+```bash
+python scripts/kv_pool_sizing.py --max-len 512000 --num-spec 3   # 推荐池
+python scripts/kv_pool_sizing.py --pool-bytes 9600000000 --check-len 515046
+python scripts/kv_pool_sizing.py --verify-log fp8-kv-work/server_c5.log --pool-bytes 9600000000
+```
+
+**标定示例** (MTP3, H=16):
+
+| max_len | 最低池 | 安全池 | 现有 profile | 结论 |
+|---|---|---|---|---|
+| 512,000 | 9.33e9 | **9.78e9** | 9.6e9 | ✗ 本机 9.78e9 启动 OOM；9.6e9 只能安全到 500,800 |
+| 500,000 | 9.13e9 | **9.58e9** | 9.6e9 | ✓ 刚好 |
+| 435,200 | 7.99e9 | **8.44e9** | 9.0e9 | ✓ 有余量 |
+| 262,144 | 4.99e9 | **5.43e9** | 5.0e9 | ✗ 需提到 5.43e9 |
+| 102,400 | 2.20e9 | **2.65e9** | 2.3e9 | ✗ 需提到 2.65e9 |
+
+> 注: `block_size` 由 MTP `num_spec` 决定、与 `max_len` 无关 (MTP3→1600, MTP1→1584)，
+> 从启动日志 `Setting attention block size to N tokens` 读取。换模型/TP/量化时用
+> `--model-config` 重算 `page_size`/`group_size`/`mamba_blocks`。
+
 ## 5. 各上下文长度内存预算表
 
 约束 (4.4 节): `非KV占用 + KV ≤ 21999 MiB`，v3 非KV 基线 = 17387 MiB (@ batched-tokens 4096)，余量 34 MiB。

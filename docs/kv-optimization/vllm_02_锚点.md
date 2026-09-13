@@ -287,15 +287,19 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
   block_size 的整数倍（`MambaManager` 与 `scheduler` 用同一值），用户无需知道 block_size。
   block_size 由引擎自动选（MTP3→1600、MTP1→1584）；启动日志打印
   `requested/effective/block_size`。故 32000 在 MTP3 下不变、MTP1 下自动变 31680。
-- 锚点成本几乎可忽略：K=16 ≈ 16 slot ≈ ~25 MiB/卡容量；真正约束是**运行中 free slot ≥ K**
-  ——512k 现池按 ~1.0x 配，无 slot 余量，需先小步实测（临时加大 bytes 或降 MTP spec 腾位），
-  确认满长 prefill + 目标 K 不卡后再定默认值。
+- 锚点成本几乎可忽略：K=16 ≈ 16 slot ≈ ~25 MiB/卡容量；真正约束是**运行中池余量** ——
+  512k 现池按 ~1.0x 配（`--kv-cache-memory-bytes 9.6e9`），无 slot 余量，满长 prefill 会
+  自我抢占。**余量口径**：池需比"恰好容纳 max_len"多留 **16 块（25,600 token）**；用
+  `scripts/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。9.6e9 安全上限
+  ≈ 500,800 token，故 512k 满长需 9.78e9（本机启动 OOM，不可行）→ 建议 `--max-model-len
+  ≤ 500,000` 或接受满长深回退重算。
 - 待办：①（已完成 §6.1）极细 cadence 中途覆盖；②（已完成 2026-09-13）512k 满长 + 锚点实测：
   MTP3 下 S 499k 不 OOM、SSD 分块恢复 99.4%（sha 一致）、深回退命中 480000；池贴近上限
-  （free < ~7 slot，如 S 515k）时长 prefill **自我抢占**会释放 durable 窗口、近尾锚点丢失
-  → 深回退重算（需留 free ≥ ~10 slot）。durable 窗口已改为按 token 位置淘汰（保留近尾 K 个），
-  见 [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)；③ 若需细粒度，
-  将“free slot 数”从近似换成引擎真值探针。
+  （余量 < ~6 块，如 S 515k）时长 prefill **自我抢占**（`alloc gate ... need=3 free=0`）
+  会释放 durable 窗口、近尾锚点丢失 → 深回退重算（需留余量 ≥ 16 块）。durable 窗口已改为
+  按 token 位置淘汰（保留近尾 K 个），见
+  [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)；③ 若需细粒度，
+  将"free slot 数"从近似换成引擎真值探针。
 
 ---
 

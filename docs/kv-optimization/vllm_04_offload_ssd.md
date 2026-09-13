@@ -303,11 +303,12 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
   block_size。例：MTP3 → block 1600，32000 不变；MTP1 → block 1584，32000 → 31680。
   启动日志打印 `requested/effective/block_size`。
 - **满池下深回退**：能否命中取决于恢复后常驻链是否仍在 GPU。512k MTP3（池 525,816、
-  S 499,018、剩 ~26.8k slot）R 恢复后仍常驻 → V 命中 480000。池贴近上限时（free < ~7 slot，
-  如 S 515k）长 prefill 会**自我抢占**，`pop_blocks_for_free` 释放 durable 窗口，近尾锚点丢失
-  → 深回退重算；尝试"抢占时保留锚点"会在重新调度时死锁（锚点占位使准入失败），故需**留足
-  余量**（free ≥ ~10 slot）。另：durable 窗口现按 token 位置淘汰（保留近尾 K 个，而非最早
-  插入的），见
+  S 499,018、剩 ~26.8k slot）R 恢复后仍常驻 → V 命中 480000。池贴近上限时（余量 < ~6 块，
+  如 S 515k）长 prefill 会**自我抢占**（`alloc gate ... need=3 free=0`），
+  `pop_blocks_for_free` 释放 durable 窗口，近尾锚点丢失 → 深回退重算；尝试"抢占时保留锚点"
+  会在重新调度时死锁（锚点占位使准入失败），故需**留足余量**（余量 ≥ 16 块 = 25,600 token）。
+  余量口径用 `scripts/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。另：
+  durable 窗口现按 token 位置淘汰（保留近尾 K 个，而非最早插入的），见
   [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)。
 - 启动 flakiness（TP warmup CUDA invalid argument）与实现无关；重试前清理
   `/dev/shm/vllm_offload_*.mmap` 残留（失败的 worker 会留下 ~858 MiB 文件，多次失败会拖垮后续启动）。

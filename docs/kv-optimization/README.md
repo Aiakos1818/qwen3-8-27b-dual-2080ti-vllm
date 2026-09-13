@@ -32,7 +32,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [GPU 显存计算](GPU_MEMORY_CALCULATION.md) | Qwen3.8-27B 双 2080Ti 的显存/KV 池精确计算：层结构、page_size、混合分组、KV 需求公式与验证、参数关系、预算表、OOM 案例、推荐配置。KV 池容量与 `--kv-cache-memory-bytes` 标定参考。 |
+| [GPU 显存计算](GPU_MEMORY_CALCULATION.md) | Qwen3.8-27B 双 2080Ti 的显存/KV 池精确计算：层结构、page_size、混合分组、KV 需求公式与验证、参数关系、预算表、OOM 案例、推荐配置。**§4.5 给出 durable 深回退的安全池余量公式**；池容量与 `--kv-cache-memory-bytes` 标定参考，配套工具 `scripts/kv_pool_sizing.py`。 |
 
 ## 相关入口
 
@@ -40,6 +40,7 @@
 - FP8 权重 profile：`scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh`（见下）
 - 观测面板：`scripts/monitor_host_tier.py`
 - 验证脚本：`scripts/ssd_matrix.py`、`scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、`scripts/correctness_check.py`
+- 池容量计算：`scripts/kv_pool_sizing.py`（由 `--max-model-len` 算推荐 `--kv-cache-memory-bytes`，或反向；见 GPU 显存计算 §4.5）
 - 环境变量样例：`config/vllm-435k-ssd.env.example`、`config/vllm-fp8-100k.env.example`
 - 打补丁步骤：`docs/PATCHING.md`
 
