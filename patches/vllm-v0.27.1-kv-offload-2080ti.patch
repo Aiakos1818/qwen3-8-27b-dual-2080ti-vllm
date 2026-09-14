@@ -985,7 +985,7 @@ index 000000000..9345faff7
 +    assert sessions["gpu"][0]["last_used"] > 1_000_000_000.0
 diff --git a/tests/v1/core/test_host_tier_ssd.py b/tests/v1/core/test_host_tier_ssd.py
 new file mode 100644
-index 000000000..0611ce8a0
+index 000000000..85dc2898e
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_ssd.py
 @@ -0,0 +1,391 @@
@@ -1370,7 +1370,7 @@ index 000000000..0611ce8a0
 +    wait_n(store, 1)
 +
 +    [sess] = store.snapshot()
-+    assert sess["sid"] == "sidA"
++    assert sess["id"] == "sidA"
 +    assert sess["tokens"] == 96
 +    assert sess["blocks"] == 3
 +    assert sess["bytes"] == 3 * ROW
@@ -2265,7 +2265,7 @@ index a64b7e321..4cb11ad9f 100644
      def reset_prefix_cache(self) -> bool:
 diff --git a/vllm/v1/core/host_tier_ssd.py b/vllm/v1/core/host_tier_ssd.py
 new file mode 100644
-index 000000000..7155ba68c
+index 000000000..c6285ace3
 --- /dev/null
 +++ b/vllm/v1/core/host_tier_ssd.py
 @@ -0,0 +1,612 @@
@@ -2453,7 +2453,7 @@ index 000000000..7155ba68c
 +        with self._lock:
 +            return [
 +                {
-+                    "sid": s["sid"],
++                    "id": s.get("req_id", s["sid"]),
 +                    "tokens": s["tokens"],
 +                    "blocks": s["n_slots"],
 +                    "bytes": s["bytes"],
