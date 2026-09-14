@@ -72,3 +72,31 @@ V2 命中 352,000（9.9s），`SSD-435K-REVERT-DONE`。RAMTRACE 窗口 = `[31840
 - `awq_435k_cblock_check.txt`：435k 复跑原始输出（每 cadence 1 个锚点，2026-09-14）。
 - `awq_512k_anchor_check.txt`：512k **MTP1** 复跑原始输出（深回退未命中）。
 - `awq_512k_mtp3_check.txt`：512k **MTP3** 复跑原始输出（全 PASS）。
+- `awq_435k_upstream_sync_check.txt`：移植上游 3 个 mamba/GDN 修复后的 435k 尺度复验（见 §5）。
+
+## 5. 上游同步后的复验（2026-09-14，`upstream-sync`）
+
+在移植上游 #51812 / #56196 / #49436 之后，用 `scripts/checks/ssd_435k_revert_check.py`
+在 **9.6e9 profile**（`--max-model-len 500800`、池 9.6e9、容量 525,229 token、真 NVMe
+`ssd_kv`、staging 2.4e9 = 43 槽 / chunk 21、MTP3、锚点 3）上复跑；原始输出
+`awq_435k_upstream_sync_check.txt`。
+
+| 请求 | prompt | cached | wall | 说明 |
+|---|---|---|---|---|
+| S 常驻 | 384,704 | 35,200 | 790.0s | — |
+| **V0 深回退 keep=22（常驻）** | 352,652 | **350,400** | 8.8s | 锚点命中 |
+| T 小请求（挤出 S） | 160,312 | 0 | 204.7s | — |
+| **R 恢复（SSD 分块）** | 384,714 | **382,400** | 47.9s | sha `db8b8e836881534b`，与移植前基线逐字节一致 |
+| **V2 深回退（restore 后）** | 352,652 | **350,400** | 8.7s | 恢复后重新认领锚点 |
+
+`METRICS stores=3 restores=2`、写 30.5 GiB、读 24.8 GiB、盘上 6.07 GB；`SSD-435K-REVERT-DONE`。
+服务日志除启动期 `fa_utils` 的 FA2 提示（SM75 不支持 FA2，既有）外无 ERROR。同期
+`GET /host_tier_info` 显示 gpu 2 条链（398k/366k，各 9 anchors）、ssd 1 条（174k），与
+S/T 布局一致。
+
+> 注：本次验收跑在 **9.6e9 profile**（当时生产在跑的实例）上。同一时段 `435k_ssd` profile
+> 在本机起不来：TP1 的 `cudaHostRegister` 返回 `cudaErrorInvalidValue`，毒化 CUDA context 后
+> `qwen_triton_warmup` 的 `torch.full` 报 `CUDA error: invalid argument`，引擎挂死。用
+> **移植前的代码**复现同样失败（4/4），故与本次移植无关；9.6e9 profile 同环境 0 次 pin 失败。
+> 两个 profile 的差异项：`--max-num-batched-tokens 4096`（435k）vs `1024`（9.6e9）、池
+> 9.0e9 vs 9.6e9。原因待查。

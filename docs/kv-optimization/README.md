@@ -28,6 +28,28 @@
 | [vllm_04_offload_ssd](vllm_04_offload_ssd.md) | 两层 GPU↔SSD + 分块流式（无会话大小上限）：架构、配置、实现不变式、435k 真 NVMe 验收、bug 修复、限制与复现。 |
 | [vllm_05_kv信息面板](vllm_05_kv信息面板.md) | Prometheus 指标全集、服务侧 `GET /host_tier_info`（逐条 chain 的 `SESSIONS`）、`scripts/tools/monitor_host_tier.py` 实时面板、`RAMTRACE` 轨迹、env 配置总表。 |
 
+## 上游同步
+
+KV 补丁在自身改动之外，还携带 3 个从上游 v0.28/v0.29 手工移植到 v0.27.1 基线的
+mamba/GDN 修复（源码 fork 的 `upstream-sync` commit，补丁内一并分发）：
+
+| PR | 上游版本 | 内容 |
+|---|---|---|
+| #51812 | v0.28 | Qwen GDN 投机解码：`a`/`b` gate 按 `spec_token_indx` gather，mixed batch 不再串用其它 token 的 gate。 |
+| #56196 | 未合并（PR） | mamba 短 prefill chunk（< conv width−1 token）的 conv state 落到自己的块，不再覆写共享前缀块；本模型 `linear_conv_kernel_dim=4` 且跑 prefix caching + chunked prefill，命中该 bug。 |
+| #49436 | v0.28 | state-copy Triton kernel 3D-grid tiling：新增 `_memcpy_u64_tiled`，temporal state 的 u64 body 按 `_TEMPORAL_TILES=16` 分给多个 CTA（小 batch 填满 SM）；8B 对齐断言降级为 warning。 |
+
+**评估后未移植**：#52789（mamba internal prefill checkpoints，TTFT 9–25%）。它只对
+Kimi-K3 KDA 生效——`num_prefill_checkpoint_blocks` 仅由 `vllm/models/kimi_k3/nvidia/kda.py`
+在 flashkda 后端下设置，调度器/管理器那部分基础设施对 GDN 模型完全惰性；本 fork 的对应
+能力是锚点（`vllm_02_锚点`）。#51674/#52539（fused GDN MTP decode CUDA kernel）也排除：
+kernel 用 `cp.async`（sm80+）且 Python 侧有 `has_device_capability(80)` 门槛，2080Ti
+（sm75）跑不了。
+
+验证：单元测试 149 CPU 通过；kernel 套件（memcpy 120 / precopy 75 / causal_conv1d 156）
+通过（本机 8 个 float64 参考实现 `varlen` 失败为既有问题，基线同样失败）；#56196 的回归
+测试在未打补丁的内核上失败、打补丁后通过。E2E 见 `reports/2026-09-435k-kv/`。
+
 ## 知识参考项
 
 | 文档 | 内容 |

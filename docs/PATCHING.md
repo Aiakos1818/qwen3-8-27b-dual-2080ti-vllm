@@ -40,6 +40,11 @@ python -m pip install -e .
 GPU↔RAM/SSD 分层 offload 与分块流式、指标面板），必须**在基础补丁之后**应用。
 设计与实测见 `docs/kv-optimization/`。
 
+该补丁同时携带 3 个从上游 v0.28/v0.29 手工移植的 mamba/GDN 修复（#51812 投机解码
+gate 对齐、#56196 短 prefill chunk 的 conv state 落块、#49436 state-copy Triton 3D
+tiling）。上游 #52789 只对 Kimi-K3 KDA 生效、#51674/#52539 需要 sm80+，均未移植；
+详见 `docs/kv-optimization/README.md` 的「上游同步」一节。
+
 本次验证环境：Python 3.12.3 + PyTorch 2.13.0+cu130。
 
 ### FlashQLA-SM70-SM75
