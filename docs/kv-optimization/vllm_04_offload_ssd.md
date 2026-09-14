@@ -104,6 +104,11 @@ SSD 会话仓（配额 + LRU + 进程内索引）
 | `VLLM_HOSTTIER_EVICT_SMALL_TOKENS` | `64000` | 驱逐分档阈值（见 03 §9；0 = 单档最旧优先） |
 | `VLLM_DISABLE_HOSTTIER` | `0` | 全局 kill-switch（含 SSD） |
 
+> **`engine_id`**（`--kv-transfer-config` 的字段，profile 里由 `KV_ENGINE_ID` 注入）：决定
+> SSD 会话目录名（`<root>/<engine_id 的 _safe_name>/sessions`）与 `/dev/shm` staging 文件名
+> （`vllm_offload_<engine_id>.mmap`）。**每个 profile 必须固定且唯一**——随机 UUID 会让上次的
+> 会话目录变成孤儿、staging 残留逐次累积（详见 README §5 与本文 §8）。
+
 `cpu_bytes_to_use` = staging 池总大小（双 rank）。**分块流式下不必放得下整个会话**，
 只决定每次搬多少、要搬几趟：默认 `chunk = staging//2`（双缓冲，让多会话 / restore+spill
 各占一个在飞 chunk）；staging 越小 → chunk 越小 → I/O 往返越多。硬性下限仅 `chunk ≥ 1`。
@@ -270,7 +275,8 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 ### 6.5 中断原子性
 
 `scripts/checks/ssd_crash_check.py`：写中 SIGKILL → 18 个完整 `.bin` + 1 个临时文件（无索引引用）；
-重启 `CLEAN_START=1` 后目录清空。`SSD-CRASH-OK`。
+重启 `CLEAN_START=1` 后本 `engine_id` 的 sessions 目录清空（要求 profile 固定
+`KV_ENGINE_ID`，见 README §5）。`SSD-CRASH-OK`。
 
 ---
 
@@ -304,7 +310,10 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 - **并发抖动**：多个大会话 + 小配额会频繁 LRU（每次 park/resume 数 GB I/O）。建议配额 ≥ 并发
   大会话数，或只对空闲会话落盘。
 - **消费级 NVMe 寿命**：用 `VLLM_SSD_MAX_MBPS` 限速 + 配额兜底；本方案按需 LRU。
-- **无跨重启恢复**：索引在进程内；`CLEAN_START=1` 启动清残留，避免脏文件。
+- **无跨重启恢复**：索引在进程内，启动不扫描磁盘；`CLEAN_START=1` 只清**本 `engine_id`**
+  的 sessions 目录。所以 profile 固定 `KV_ENGINE_ID`（见 README §5）：若沿用每次启动随机的
+  UUID，上次的会话目录会成为孤儿（永不回收、永不清理），且 `/dev/shm` 的 staging 残留会逐次
+  累积——满 7.8 GiB 后 `cudaHostRegister` 失败并毒化 CUDA context，表现为启动挂死。
 - **O_DIRECT**：tmpfs 在本内核可用（probe=True），不可用时自动回退 buffered。
 - 系统盘与 OS/模型权重共用：独立目录 + 限速，避免影响其他负载。
 - **锚点 cadence**：C=32000/K=3 覆盖近尾 96k；更深的截断重发无锚点可用（见 02）。

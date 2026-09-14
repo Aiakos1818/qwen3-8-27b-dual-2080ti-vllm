@@ -36,6 +36,11 @@ fi
 : "${VLLM_MAMBA_CKPT_TOKENS:=32000}"         # anchor cadence
 : "${VLLM_MAMBA_CKPT_ANCHORS:=3}"            # anchors kept per chain
 : "${VLLM_HOSTTIER_EVICT_SMALL_TOKENS:=32000}"  # sessions < this park first
+# Stable engine id (default is a random UUID per launch): names the host-tier
+# SSD session dir and the /dev/shm staging file. A fixed id lets
+# VLLM_SSD_CLEAN_START=1 clear the previous run's sessions. Keep it unique
+# per profile; two instances must not share one.
+: "${KV_ENGINE_ID:=qwen38-27b-100k}"
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -83,11 +88,16 @@ ARGS=(
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$SPEC_NUM_TOKENS}"
   --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[4],"max_cudagraph_capture_size":4}'
   --cpu-offload-gb 0
-  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE}}"
+  --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE}}"
   --disable-uvicorn-access-log
 )
 if [ -n "${CHAT_TEMPLATE:-}" ]; then
   ARGS+=(--chat-template "$CHAT_TEMPLATE")
 fi
+
+# With a stable engine id the /dev/shm staging file outlives a crashed run and
+# would be re-opened (never unlinked) by the next launch. Remove it so every
+# launch creates a fresh one of the expected size.
+rm -f "/dev/shm/vllm_offload_${KV_ENGINE_ID}.mmap"
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

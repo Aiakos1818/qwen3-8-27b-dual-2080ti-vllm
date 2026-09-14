@@ -111,6 +111,48 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 bash scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
+### 5. 启动排障（本机实测）
+
+三项都与模型/KV 优化无关，但会直接导致"起不来"或"时好时坏"：
+
+**1. `/dev/shm` 必须留够空间（最重要）**
+
+host tier 的 staging 区是 `/dev/shm/vllm_offload_<engine_id>.mmap`，单实例约 2.23 GiB
+（`CPU_BYTES_TO_USE=2.4e9`），加上 vLLM 自身的 POSIX shm 约 0.7 GiB，**单实例需 ≈3 GiB**。
+进程被 kill/崩溃时该文件不会被删（只有正常退出才 `unlink`）；若 `engine_id` 是每次启动
+随机的 UUID，残留文件永远不会被回收 → `/dev/shm`（本机 7.8 GiB）累积几次即满 →
+驱动 `cuMemHostRegister_v2` 无法为 staging 落页，报
+`Failed to allocate physical memory` 并返回 `CUDA_ERROR_INVALID_VALUE` →
+**毒化 CUDA context** → warmup 里 `torch.full` 报 `CUDA error: invalid argument` → 引擎挂死。
+表现就是"有时能起、清一下或重启就能起"。
+
+对策（本仓库 profile 已内置）：**固定 `KV_ENGINE_ID`**（每个 profile 一个，互不重复），
+并在启动前 `rm -f /dev/shm/vllm_offload_<id>.mmap`。残留不再累积；同时 SSD 会话目录
+（`<VLLM_SSD_ROOT>/<engine_id 的 _safe_name>/sessions`）保持稳定，`VLLM_SSD_CLEAN_START=1`
+才能真正清掉**上一次运行**的会话（否则旧目录成为孤儿，永远不回收）。
+排查：`df -h /dev/shm`、`ls -la /dev/shm/*.mmap`。
+
+**2. 从 SSH 会话启动时，先开 linger**
+
+否则会话一结束，systemd 会停掉 `user@<uid>` 并移除整个 user slice，**该用户所有进程
+被杀**（engine 首当其冲，日志表现为 worker `died unexpectedly (exit code: None)` 且
+无 Python 栈）：
+
+~~~bash
+sudo loginctl enable-linger $USER      # 一次性
+loginctl show-user $USER -p Linger     # 期望 Linger=yes
+~~~
+
+或者从常驻会话 / 系统服务启动（见下文 systemd 一节）。
+
+**3. `cudaHostRegister` 偶发失败 → 重试**
+
+`/dev/shm` 空间充足时该调用仍偶发返回 `cudaErrorInvalidValue`，且**失败即毒化 CUDA
+context**（实测：失败后下一次 CUDA 调用必报 `invalid argument`）。带
+`CUDA_LOG_FILE=stderr` 启动可看到驱动给的原因（例如上面的
+`Failed to allocate physical memory`）。先按第 1 条确认空间；空间正常仍偶发时，
+重启引擎重试即可。
+
 ## 跑通后的性能验收
 
 > **数据来源**：本节及下一节（含 `reports/`）的实测数据来自原项目（zyYuc）在其机器

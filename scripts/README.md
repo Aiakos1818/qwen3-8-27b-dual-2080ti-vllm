@@ -9,6 +9,13 @@
 > `python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh`。
 > 通过软链（如 `deploy/scripts -> repo/scripts`）调用同样可用。
 
+> **每个 profile 都有自己的固定 `KV_ENGINE_ID`**（互不重复），并在启动前
+> `rm -f /dev/shm/vllm_offload_<id>.mmap`。这是为了：① 不让上次崩溃残留的 staging 文件
+> 累积把 `/dev/shm`（单实例约需 3 GiB）塞满——满了会让 `cudaHostRegister` 失败并毒化
+> CUDA context、启动挂死；② 让 SSD 会话目录稳定，`VLLM_SSD_CLEAN_START=1` 才能真正清掉
+> 上一次运行的会话。**不要同时跑两个相同 `KV_ENGINE_ID` 的实例**（会互相删 staging 文件）。
+> 详见 [README §5 启动排障](../README.md)。
+
 ## 启动 profile（根目录）
 
 | 文件 | 用途 |
