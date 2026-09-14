@@ -2,7 +2,8 @@
 # Verified launch profile for Qwen3.8-27B on 2x RTX 2080 Ti 22GB + NVLink.
 set -Eeuo pipefail
 
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 if [ -f "$REPO_ROOT/.env" ]; then
   source "$REPO_ROOT/.env"
 fi

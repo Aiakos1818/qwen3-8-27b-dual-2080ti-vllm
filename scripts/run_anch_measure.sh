@@ -9,7 +9,8 @@ set -u
 TAG=$1
 CKPT=$2
 ANCH=$3
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
