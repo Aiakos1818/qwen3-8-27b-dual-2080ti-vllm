@@ -9,7 +9,7 @@ turn k-1, replace the following user message (edited), drop the rest.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from revert_lib import (SYSTEM, assistant_msg, filler_fast, revert_request,
                         send, user_msg)  # noqa: E402
 

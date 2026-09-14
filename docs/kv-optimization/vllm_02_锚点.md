@@ -191,7 +191,7 @@ pin/K 保护，结束由 `take_durable_window` 交给保活 entry（34→40）�
 锚点已是该请求自己的空闲块，再 pin 会把它们从空闲队列抽走，导致其下一次分配
 在池边界上饿死（`need=3 avail=1` 活锁；tmpfs 矩阵 S3 实测）。
 
-实测（FP8 100k、MTP3、RAM 与真 NVMe SSD）：`p03_restore_revert.py test2`
+实测（FP8 100k、MTP3、RAM 与真 NVMe SSD）：`scripts/checks/p03_restore_revert.py test2`
 （A→B→A→revert→B→A→revert）两轮 `keep=2` 均 `cached=30400`（修复前第二轮 `0`）；
 trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点），
 修复前 `[1,1,1,30]`。
@@ -299,7 +299,7 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 - 锚点成本几乎可忽略：K=16 ≈ 16 slot ≈ ~25 MiB/卡容量；真正约束是**运行中池余量** ——
   512k 现池按 ~1.0x 配（`--kv-cache-memory-bytes 9.6e9`），无 slot 余量，满长 prefill 会
   自我抢占。**余量口径**：池需比"恰好容纳 max_len"多留 **16 块（25,600 token）**；用
-  `scripts/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。9.6e9 安全上限
+  `scripts/tools/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。9.6e9 安全上限
   ≈ 500,800 token，故 512k 满长需 9.78e9（本机启动 OOM，不可行）→ 建议 `--max-model-len
   ≤ 500,000` 或接受满长深回退重算。
 - 待办：①（已完成 §6.1）极细 cadence 中途覆盖；②（已完成 2026-09-13）512k 满长 + 锚点实测：
@@ -356,12 +356,12 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 
 ## 8. 复现（锚点相关脚本/产物）
 
-- 矩阵驱动：`scripts/revert_lib.py`、`scripts/revert_matrix.py`、`scripts/revert_pinprobe.py`
-- A1 检查点 / cadence 矩阵：`scripts/revert_ckpt.py`、`scripts/revert_cmatrix.py`
-- 单 cadence 起停编排：`scripts/run_cmatrix_one.sh`（起引擎 → 跑矩阵 → 停引擎，追加 TSV）
-- 锚点显存采样：`scripts/run_anch_measure.sh`（起引擎 → 跑 resident → 逐秒采 nvidia-smi）
-- resident 探针：`scripts/resident_once.py`、`scripts/resident_big.py`
-- MTP/NaN 调试：`scripts/mtp_probe.py`
+- 矩阵驱动：`scripts/revert_lib.py`、`scripts/probes/revert_matrix.py`、`scripts/probes/revert_pinprobe.py`
+- A1 检查点 / cadence 矩阵：`scripts/probes/revert_ckpt.py`、`scripts/probes/revert_cmatrix.py`
+- 单 cadence 起停编排：`scripts/checks/run_cmatrix_one.sh`（起引擎 → 跑矩阵 → 停引擎，追加 TSV）
+- 锚点显存采样：`scripts/checks/run_anch_measure.sh`（起引擎 → 跑 resident → 逐秒采 nvidia-smi）
+- resident 探针：`scripts/probes/resident_once.py`、`scripts/probes/resident_big.py`
+- MTP/NaN 调试：`scripts/checks/mtp_probe.py`
 - 结果：`$LOG_DIR/cmatrix_results.tsv`、`$LOG_DIR/anch_*.txt`（显存 A/B）
 - 日志：`$LOG_DIR/revert_ckpt*.log`、`$LOG_DIR/cmatrix_*.log`、`$LOG_DIR/revert_clean.log`
 - 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`$LOG_DIR/server_100k.log`

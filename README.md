@@ -19,7 +19,7 @@
 - **会话保活（keep-alive pin）**：结束的长会话整链 pin 出可驱逐池；准入放不下时按“缓存最小的先出”释放，回来仍全命中。
 - **Mamba/GDN 锚点**：按 cadence（默认 32k）落持久状态快照，中间分叉从最近锚点续跑，最迟-K 窗口防卡死。
 - **GPU↔RAM/SSD 分层 offload**：会话整链 park/restore，**分块流式**使会话大小不再受 CPU staging 限制。
-- **观测面板**：Prometheus 指标 + `scripts/monitor_host_tier.py` 实时面板。
+- **观测面板**：Prometheus 指标 + `scripts/tools/monitor_host_tier.py` 实时面板。
 
 补丁 `patches/vllm-v0.27.1-kv-offload-2080ti.patch` 必须在基础补丁 `patches/vllm-v0.27.1-sm75-qwen3.8.patch` **之后**应用。完整设计与实测见
 [`docs/kv-optimization/`](docs/kv-optimization/README.md)，启动 profile 见下方「KV 优化」一节。
@@ -72,7 +72,7 @@ reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原�
 ### 1. 验证硬件
 
 ~~~bash
-bash scripts/verify_hardware.sh
+bash scripts/setup/verify_hardware.sh
 ~~~
 
 关键拓扑应包含：
@@ -199,7 +199,7 @@ python benchmarks/run_context_ttft.py \
 | **会话保活（keep-alive pin）** | 结束且 ≥16k token 的会话整链 pin 出可驱逐池；准入放不下时按“缓存最小的先出”释放，回来仍全命中。 | [vllm_01_保活](docs/kv-optimization/vllm_01_保活.md) |
 | **Mamba/GDN 锚点** | 按 cadence（默认 32k）落持久状态快照；中间分叉从最近锚点续跑，最迟-K 窗口防卡死。 | [vllm_02_锚点](docs/kv-optimization/vllm_02_锚点.md) |
 | **GPU↔RAM/SSD 分层 offload** | 会话整链 park 到 RAM 或 SSD，回来 restore；**分块流式**使会话大小不再受 CPU staging 限制。 | [vllm_03 RAM](docs/kv-optimization/vllm_03_offload_ram.md) · [vllm_04 SSD](docs/kv-optimization/vllm_04_offload_ssd.md) |
-| **观测面板** | Prometheus 指标 + `scripts/monitor_host_tier.py` 实时面板（保活 / 锚点 / RAM+SSD 池 / I/O）。 | [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md) |
+| **观测面板** | Prometheus 指标 + `scripts/tools/monitor_host_tier.py` 实时面板（保活 / 锚点 / RAM+SSD 池 / I/O）。 | [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md) |
 
 启动 profile：
 
@@ -220,10 +220,10 @@ bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
 - 深回退从锚点续跑：72k 截断 cached=64,000（整段重算需 43s）。
 - 写中 SIGKILL 原子性、分块流式功能矩阵 17/17（1 soft）通过。
 
-复现/验证脚本：`scripts/monitor_host_tier.py`、`scripts/ssd_matrix.py`、
-`scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、
-`scripts/correctness_check.py`。开发期定向探测脚本（`probe_*` / `revert_*` / `resident_*` /
-`test_kv_100k.py` / `offload_matrix.py` / `capture_proxy.py` 等）同样收录于 `scripts/`，
+复现/验证脚本：`scripts/tools/monitor_host_tier.py`、`scripts/checks/ssd_matrix.py`、
+`scripts/checks/ssd_100k_check.py`、`scripts/checks/ssd_435k_check.py`、`scripts/checks/ssd_crash_check.py`、
+`scripts/checks/correctness_check.py`。开发期定向探测脚本（`probe_*` / `revert_*` / `resident_*` /
+`scripts/checks/test_kv_100k.py` / `scripts/checks/offload_matrix.py` / `scripts/capture/capture_proxy.py` 等）同样收录于 `scripts/`，
 路径与模型经 `MODEL_PATH` / `VLLM_BASE_URL` / `VLLM_PYTHON` 参数化。
 指标与 env 总表见 [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md)。
 

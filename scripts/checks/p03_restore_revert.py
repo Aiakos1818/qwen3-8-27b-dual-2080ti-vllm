@@ -13,7 +13,7 @@ forces A out of GPU into RAM.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from revert_lib import SYSTEM, assistant_msg, filler_fast, send, user_msg  # noqa: E402
 
 

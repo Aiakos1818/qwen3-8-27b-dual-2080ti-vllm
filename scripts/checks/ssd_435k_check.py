@@ -1,18 +1,11 @@
 #!/usr/bin/env python
-"""435k-scale post-anchor-fix check: resident + post-restore deep revert.
+"""435k-scale chunked SSD park/resume check on the real NVMe.
 
-S (--turns x --a-tok, default 24x16000 ~= 384k) runs resident. V0 reverts S to
-the --keep-th cadence (~352k) while resident (tests the eagle-drop / head-free
-anchor fixes). T (default 10x16000 ~= 160k, much smaller than the 407k in
-ssd_435k_check.py) forces S to spill to the real NVMe SSD. R resumes S (chunked
-SSD restore). V2 reverts S to the same cadence after the restore (tests the
-resumed-session anchor re-claim).
+S (~--turns*a-tok tokens) runs resident; T (larger) forces S to spill to SSD;
+R resumes S with a tail. Validates that a session far larger than the CPU
+staging pool is streamed in chunks both ways.
 
-Expected: V0 and V2 cached ~= keep*a_tok (e.g. 350400/352000), not 0; R cached
-> 0.9 * S prompt. This is the 435k regression check for the three anchor fixes.
-
-Usage: ssd_435k_revert_check.py [--turns 24] [--a-tok 16000] [--keep 22]
-                                [--t-turns 10]
+Usage: ssd_435k_check.py [--turns 26] [--a-tok 15000] [--t-turns 27]
 """
 import argparse
 import hashlib
@@ -23,7 +16,7 @@ import sys
 import time
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from openai import OpenAI  # noqa: E402
 from revert_lib import BASE, MODEL, SYSTEM, assistant_msg, filler_fast, user_msg  # noqa: E402
 
@@ -31,15 +24,13 @@ _client = OpenAI(base_url=BASE, api_key="EMPTY", timeout=3600)
 SSD_ROOT = os.environ.get("VLLM_SSD_ROOT", "/tmp/vllm_ssd")
 
 
-def build(uid: int, n_turns: int, a_tok: int, keep: int | None = None,
-          edited: bool = False, tail: str | None = None):
+def build(uid: int, n_turns: int, a_tok: int, tail: str | None = None):
     qs = [f"用户第{i}轮问题：请继续深入讲解该主题。" for i in range(n_turns + 1)]
-    n = n_turns if keep is None else keep
     m = [{"role": "system", "content": SYSTEM}]
-    for i in range(n):
+    for i in range(n_turns):
         m.append(user_msg(qs[i]))
-        m.append(assistant_msg(filler_fast(uid * 100 + i, a_tok)))
-    m.append(user_msg(qs[n] + ("（改写重发）" if edited else "")))
+        m.append(assistant_msg(filler_fast(uid + i, a_tok)))
+    m.append(user_msg(qs[n_turns]))
     if tail:
         m.append(user_msg(tail))
     return m
@@ -101,25 +92,20 @@ def nvidia_used() -> list[int]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--turns", type=int, default=24)
-    ap.add_argument("--a-tok", type=int, default=16000)
-    ap.add_argument("--keep", type=int, default=22)
-    ap.add_argument("--t-turns", type=int, default=10)
+    ap.add_argument("--turns", type=int, default=26)
+    ap.add_argument("--a-tok", type=int, default=15000)
+    ap.add_argument("--t-turns", type=int, default=27)
     args = ap.parse_args()
 
-    S = build(1, args.turns, args.a_tok)
-    V = build(1, args.turns, args.a_tok, keep=args.keep, edited=True)
-    T = build(2, args.t_turns, args.a_tok)
-    R = build(1, args.turns, args.a_tok, tail="请只回答：OK")
-    target = args.keep * args.a_tok
+    S = build(500, args.turns, args.a_tok)
+    T = build(600, args.t_turns, args.a_tok)
+    R = build(500, args.turns, args.a_tok, tail="请只回答：OK")
 
     m0 = metrics()
     print("nvidia@start", nvidia_used(), flush=True)
     s = run("S resident", S, 1)
-    v0 = run(f"V0 revert keep={args.keep} (resident)", V, 1)
-    t = run("T smaller (forces S spill)", T, 1)
+    t = run("T bigger (forces S spill)", T, 1)
     r = run("R resumed (SSD restore)", R, 32)
-    v2 = run(f"V2 revert keep={args.keep} (after restore)", V, 1)
     m1 = metrics()
     print("nvidia@end", nvidia_used(), flush=True)
 
@@ -135,17 +121,11 @@ def main() -> int:
         "sessions": m1.get("vllm:host_tier_ssd_sessions", 0),
     }, flush=True)
     print("DISK_BYTES", du(SSD_ROOT), flush=True)
-
-    ok_r = bool(r["cached"]) and r["cached"] > s["prompt"] * 0.9
-    ok_v0 = bool(v0["cached"]) and v0["cached"] > target * 0.95
-    ok_v2 = bool(v2["cached"]) and v2["cached"] > target * 0.95
+    ok = bool(r["cached"]) and r["cached"] > s["prompt"] * 0.9
     print(f"R cached={r['cached']} vs S prompt={s['prompt']} "
-          f"(>=90% prefix restored: {ok_r})", flush=True)
-    print(f"ANCHOR target~{target} V0={v0['cached']} V2={v2['cached']} "
-          f"(V0 hit: {ok_v0}, V2 hit: {ok_v2})", flush=True)
-    print("SSD-435K-REVERT-" + ("DONE" if (ok_r and ok_v0 and ok_v2) else "WEAK"),
-          flush=True)
-    return 0 if (ok_r and ok_v0 and ok_v2) else 1
+          f"(>=90% prefix restored: {ok})", flush=True)
+    print("SSD-435K-" + ("DONE" if ok else "WEAK"), flush=True)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

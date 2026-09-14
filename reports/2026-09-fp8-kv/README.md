@@ -48,17 +48,17 @@
 | offload（S→T 挤出→restore） | 48152 | 46400 | 55 | `db8b8e836881534b` | `\n\nOK` |
 
 两条路径 sha 完全一致，且与 AWQ 模型相同（`db8b8e836881534b`）→ RAM restore 字节正确、`NAN=0`。
-（注：`correctness_check.py` 新增 `KV_CHECK_MAX_TOKENS` 环境变量，默认 32；FP8 在该 prompt 下需
+（注：`scripts/checks/correctness_check.py` 新增 `KV_CHECK_MAX_TOKENS` 环境变量，默认 32；FP8 在该 prompt 下需
 64 才能产出非空 content，本测试用 64。）
 
 ### 3.2 RAM spill/restore 指标
 
-P3 代码（真 LRU 淘汰）在干净引擎上复测 `correctness_check.py offload`：`R-restored cached=46400`、
+P3 代码（真 LRU 淘汰）在干净引擎上复测 `scripts/checks/correctness_check.py offload`：`R-restored cached=46400`、
 sha 一致；`host_tier_spills=1, restores=1, evictions=0, drops=1`；`keep_alive_entries=1,
 tokens=62400, anchors=6, anchor_sessions=1`。（修复 1–2 时代的旧值 `spills=2, restores=1,
 drops=0`，随负载/时序略有差异，正确性不变。）
 
-### 3.3 RAM offload 矩阵（`offload_matrix.py`）
+### 3.3 RAM offload 矩阵（`scripts/checks/offload_matrix.py`）
 
 | 请求 | prompt | cached（修复 1–2 后 / 修复 3 后） |
 |---|---|---|
@@ -90,7 +90,7 @@ P3 真 LRU 代码复跑矩阵（`fp8_100k_offload_matrix_p3.txt`）同样 **2/4*
 
 ## 4. Phase 3 — SSD 分块 offload
 
-### 4.1 真 NVMe 100K（`ssd_100k_check.py`）
+### 4.1 真 NVMe 100K（`scripts/checks/ssd_100k_check.py`）
 
 引擎：`VLLM_SSD_ROOT=<NVMe>/ssd_kv`、quota 8 GiB、`MAX_MBPS=800`、`SSD_ONLY=1`、
 `staging_slots=71 / chunk_slots=35`、`O_DIRECT=True`。
@@ -106,11 +106,11 @@ P3 真 LRU 代码复跑矩阵（`fp8_100k_offload_matrix_p3.txt`）同样 **2/4*
 restore sha 与 baseline 一致 → **SSD 分块 park/resume 字节正确**。真 NVMe 上的二次停车/恢复
 深回退另见 `fp8_100k_p03_test2_ssd.txt`（两轮 restore `cached=46400`、回退 `30400`）。
 
-### 4.2 中断原子性（`ssd_crash_check.py`）
+### 4.2 中断原子性（`scripts/checks/ssd_crash_check.py`）
 
 写中 SIGKILL → `finals=19 temps=1`（无索引引用半成品）；`clean_start` 后目录清空。**`SSD-CRASH-OK`**。
 
-### 4.3 tmpfs 强制分块矩阵（`ssd_matrix.py`）
+### 4.3 tmpfs 强制分块矩阵（`scripts/checks/ssd_matrix.py`）
 
 **18/18 PASS（1 soft）**：
 
@@ -216,7 +216,7 @@ pin/K 保护，结束由 `take_durable_window` 交给保活 entry（34→40）�
 | 矩阵 S3 keep=2 / keep=3 | 0 / 46400 | **30400 / 46400** |
 | 矩阵 S3b 第二轮 keep=2 | — | **30400**（见 §4.3） |
 
-正确性不变：`correctness_check.py baseline/offload` sha 均为 `db8b8e836881534b`、
+正确性不变：`scripts/checks/correctness_check.py baseline/offload` sha 均为 `db8b8e836881534b`、
 0 NaN；`ssd_100k_check` restore sha 一致；单元测试新增
 `test_durable_boundaries_survive_head_free`、
 `test_resumed_session_reclaims_cached_anchors` 与
@@ -248,14 +248,14 @@ bash scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh
 
 export MODEL_PATH=<fp8 model> SERVED_MODEL_NAME=qwen38-27b \
   VLLM_PYTHON=<venv python> RAMTRACE_LOG=<path> KV_CHECK_MAX_TOKENS=64
-python scripts/correctness_check.py baseline
-python scripts/correctness_check.py offload
-python scripts/ssd_100k_check.py
-python scripts/ssd_matrix.py --expected-sha db8b8e836881534b   # tmpfs root 时 staging 用 4e9，见 §4.3
-python scripts/ssd_crash_check.py
+python scripts/checks/correctness_check.py baseline
+python scripts/checks/correctness_check.py offload
+python scripts/checks/ssd_100k_check.py
+python scripts/checks/ssd_matrix.py --expected-sha db8b8e836881534b   # tmpfs root 时 staging 用 4e9，见 §4.3
+python scripts/checks/ssd_crash_check.py
 ```
 
-`p03_restore_revert.py` 支持 `control|test|test2` 三种模式（`test2` 为两轮停车/恢复）。
+`scripts/checks/p03_restore_revert.py` 支持 `control|test|test2` 三种模式（`test2` 为两轮停车/恢复）。
 
 单元测试（140 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领、真 LRU 三个回归测试）：
 

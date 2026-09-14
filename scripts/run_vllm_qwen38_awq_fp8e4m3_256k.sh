@@ -27,7 +27,7 @@ fi
 # --- profile knobs ---------------------------------------------------------
 # --max-model-len 262144 (=256*1024), pool 5.6e9. Measured: 262144 needs a safe
 # pool >= 5,431,296,000; 5.6e9 saves VRAM (safe ceiling ~272,000). Diagnose with
-# scripts/kv_pool_sizing.py (docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5).
+# scripts/tools/kv_pool_sizing.py (docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5).
 : "${MAX_MODEL_LEN:=262144}"
 : "${KV_CACHE_MEMORY_BYTES:=5600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"

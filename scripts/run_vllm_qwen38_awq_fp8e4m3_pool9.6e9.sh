@@ -28,7 +28,7 @@ fi
 # Largest pool that starts on this machine = 9.6e9; 9.7e9 OOMs on the first
 # request. --max-model-len 500800 (=313*1600 blocks) is the safe ceiling at a
 # 9.6e9 pool (~525,816 token capacity minus 16 blocks headroom). Diagnose with
-# scripts/kv_pool_sizing.py (docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5).
+# scripts/tools/kv_pool_sizing.py (docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5).
 # Note: 512k (524288) needs a safe pool of 9,999,155,200 (does not fit here), so
 # full-length deep revert recomputes; use 500800 or less for reliable deep revert.
 : "${MAX_MODEL_LEN:=500800}"

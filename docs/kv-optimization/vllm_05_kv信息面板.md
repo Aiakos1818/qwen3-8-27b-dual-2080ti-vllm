@@ -12,17 +12,17 @@
 
 ---
 
-## 1. 实时监控脚本 `scripts/monitor_host_tier.py`
+## 1. 实时监控脚本 `scripts/tools/monitor_host_tier.py`
 
 默认每 5 秒清屏重绘，分类显示配置与状态（仅用 Python 标准库）。实例用 `--port` 选择：
 面板据此拼出 `http://localhost:<port>` 并同时查 `/metrics` 与 `/host_tier_info`。
 
 ```bash
-python scripts/monitor_host_tier.py            # :8000, 5s 刷新
-python scripts/monitor_host_tier.py --port 8001
-python scripts/monitor_host_tier.py -d 10      # 10s 刷新
-python scripts/monitor_host_tier.py --once     # 打印一次
-python scripts/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本化）
+python scripts/tools/monitor_host_tier.py            # :8000, 5s 刷新
+python scripts/tools/monitor_host_tier.py --port 8001
+python scripts/tools/monitor_host_tier.py -d 10      # 10s 刷新
+python scripts/tools/monitor_host_tier.py --once     # 打印一次
+python scripts/tools/monitor_host_tier.py --json --count 5   # JSON 行（便于脚本化）
 ```
 
 参数：

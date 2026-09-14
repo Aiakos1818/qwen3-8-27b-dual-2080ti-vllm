@@ -9,8 +9,8 @@ set -u
 TAG=$1
 CKPT=$2
 ANCH=$3
-SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)          # scripts/checks
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)             # repo root
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
@@ -41,6 +41,6 @@ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits > "$LOG_D
 ( while true; do nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits >> "$LOG_DIR/anch_${TAG}_samples.txt"; sleep 1; done ) &
 SPID=$!
 
-timeout 300 "$PY" "$REPO_ROOT/scripts/resident_once.py" > "$LOG_DIR/anch_${TAG}_run.log" 2>&1
+timeout 300 "$PY" "$REPO_ROOT/scripts/probes/resident_once.py" > "$LOG_DIR/anch_${TAG}_run.log" 2>&1
 kill $SPID 2>/dev/null
 echo "=== TAG=$TAG ckpt=$CKPT anchors=$ANCH done ==="

@@ -148,10 +148,10 @@ _drain_spill_completions: register_restored_blocks
 | 普通保活复用（不触发 spill，19k 会话 resume） | **cached=17,600 / 2.1s** ✅（`trusted_local` 修复） |
 
 全程：引擎保持 200、无死锁；CPU 占用恒 ≤ 34 槽；store 完成前 GPU 块保持 pinned。
-测试脚本：`scripts/offload_matrix.py`。
+测试脚本：`scripts/checks/offload_matrix.py`。
 
 ### 6c. 输出正确性校验（greedy 生成比对）
-对同一提示，比较“显存命中”与“spill→restore”两条路径的 greedy 输出（`scripts/correctness_check.py`）：
+对同一提示，比较“显存命中”与“spill→restore”两条路径的 greedy 输出（`scripts/checks/correctness_check.py`）：
 
 | 配置 | baseline（显存命中） | offload（restore） | 结论 |
 |---|---|---|---|

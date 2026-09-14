@@ -9,7 +9,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from revert_lib import (SYSTEM, assistant_msg, chrono_requests, filler_fast,
                         ntok, prefix_tokens_est, revert_request, send,
                         user_msg)  # noqa: E402

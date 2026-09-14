@@ -17,7 +17,7 @@
 - patches/vllm-v0.27.1-sm75-qwen3.8.patch：基于 vLLM v0.27.1 的工作树补丁，涵盖 flashqla_legacy GDN prefill、Qwen3.5 MTP 兼容、reasoning 预算、SM75 FlashInfer/采样兼容和 GPU runner 调整。
 - patches/vllm-v0.27.1-kv-offload-2080ti.patch：本 fork（Aiakos1818）追加的 KV 优化补丁（会话保活 / Mamba 锚点 / GPU↔RAM/SSD 分层 offload 与分块流式 / 指标面板），**必须在 sm75-qwen3.8 基础补丁之后应用**。设计与实测见 docs/kv-optimization/。
 - patches/flashqla-sm70-sm75-local.patch：基于固定 FlashQLA commit 的本地导出/SM legacy 调整。
-- scripts/apply_gdn_flashqla_legacy.py：当 git apply 因上游小版本差异无法套用时，用于补充 GDN legacy backend 的辅助脚本。
+- scripts/setup/apply_gdn_flashqla_legacy.py：当 git apply 因上游小版本差异无法套用时，用于补充 GDN legacy backend 的辅助脚本。
 
 补丁来自已验证服务的工作树，不是 vLLM、FlashInfer 或 FlashQLA 的官方发布包。升级任一上游组件后必须重新验证。
 

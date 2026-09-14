@@ -26,21 +26,21 @@
 | [vllm_02_锚点](vllm_02_锚点.md) | revert/截断重发（从历史中间分叉）整段重算的根因；按 cadence（32k）落 Mamba 持久快照，最迟-K 窗口、同等保护、容量/卡死口径、512k 规划。 |
 | [vllm_03_offload_ram](vllm_03_offload_ram.md) | 会话级 park/spill 到 RAM：语义、架构、连接器只作拷贝通道、容量对照、实测；**跨层两档驱逐策略的权威描述（§9）**。 |
 | [vllm_04_offload_ssd](vllm_04_offload_ssd.md) | 两层 GPU↔SSD + 分块流式（无会话大小上限）：架构、配置、实现不变式、435k 真 NVMe 验收、bug 修复、限制与复现。 |
-| [vllm_05_kv信息面板](vllm_05_kv信息面板.md) | Prometheus 指标全集、服务侧 `GET /host_tier_info`（逐条 chain 的 `SESSIONS`）、`scripts/monitor_host_tier.py` 实时面板、`RAMTRACE` 轨迹、env 配置总表。 |
+| [vllm_05_kv信息面板](vllm_05_kv信息面板.md) | Prometheus 指标全集、服务侧 `GET /host_tier_info`（逐条 chain 的 `SESSIONS`）、`scripts/tools/monitor_host_tier.py` 实时面板、`RAMTRACE` 轨迹、env 配置总表。 |
 
 ## 知识参考项
 
 | 文档 | 内容 |
 |---|---|
-| [GPU 显存计算](GPU_MEMORY_CALCULATION.md) | Qwen3.8-27B 双 2080Ti 的显存/KV 池精确计算：层结构、page_size、混合分组、KV 需求公式与验证、参数关系、预算表、OOM 案例、推荐配置。**§4.5 给出 durable 深回退的安全池余量公式**；池容量与 `--kv-cache-memory-bytes` 标定参考，配套工具 `scripts/kv_pool_sizing.py`。 |
+| [GPU 显存计算](GPU_MEMORY_CALCULATION.md) | Qwen3.8-27B 双 2080Ti 的显存/KV 池精确计算：层结构、page_size、混合分组、KV 需求公式与验证、参数关系、预算表、OOM 案例、推荐配置。**§4.5 给出 durable 深回退的安全池余量公式**；池容量与 `--kv-cache-memory-bytes` 标定参考，配套工具 `scripts/tools/kv_pool_sizing.py`。 |
 
 ## 相关入口
 
 - 启动脚本：`scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh`、`scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh`
 - FP8 权重 profile：`scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh`（见下）
-- 观测面板：`scripts/monitor_host_tier.py`
-- 验证脚本：`scripts/ssd_matrix.py`、`scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、`scripts/correctness_check.py`
-- 池容量诊断：`scripts/kv_pool_sizing.py <run.sh>`（只给启动脚本，检查池/上下文是否匹配并给推荐值；`--feasible` 可实际部署一次测 OOM；见 GPU 显存计算 §4.5）
+- 观测面板：`scripts/tools/monitor_host_tier.py`
+- 验证脚本：`scripts/checks/ssd_matrix.py`、`scripts/checks/ssd_100k_check.py`、`scripts/checks/ssd_435k_check.py`、`scripts/checks/ssd_crash_check.py`、`scripts/checks/correctness_check.py`
+- 池容量诊断：`scripts/tools/kv_pool_sizing.py <run.sh>`（只给启动脚本，检查池/上下文是否匹配并给推荐值；`--feasible` 可实际部署一次测 OOM；见 GPU 显存计算 §4.5）
 - 环境变量样例：`config/vllm-435k-ssd.env.example`、`config/vllm-fp8-100k.env.example`
 - 打补丁步骤：`docs/PATCHING.md`
 
@@ -54,5 +54,5 @@ restore 后的深回退锚点命中（见报告 §5）。
 
 > 文档中按名称提到的 `probe_*` / `revert_*` / `resident_*` 等开发期定向探测脚本已收录于
 > `scripts/`（路径/模型经环境变量参数化：`MODEL_PATH`、`VLLM_BASE_URL`、`VLLM_PYTHON`）。
-> `scripts/oc_fixture.json` 为可选的系统提示词 fixture（opencode 负载），设 `KV_TEST_FIXTURE`
+> `scripts/capture/oc_fixture.json` 为可选的系统提示词 fixture（opencode 负载），设 `KV_TEST_FIXTURE`
 > 指向它以复现；不设则用 `scripts/revert_lib.py` 的通用系统提示词。

@@ -3,15 +3,15 @@
 #
 # Usage: run_cmatrix_one.sh <cadence_tokens>
 # Starts the repo 100K profile with VLLM_MAMBA_CKPT_TOKENS=$C, waits for the
-# engine, runs scripts/revert_cmatrix.py once, appends its RESULT rows to a TSV,
+# engine, runs scripts/probes/revert_cmatrix.py once, appends its RESULT rows to a TSV,
 # then stops the engine. Paths/model come from .env (repo root).
 #
 # Env: LOG_DIR (default /tmp/vllm_logs), VLLM_PYTHON, VLLM_BASE_URL.
 set -u
 
 C=$1
-SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)          # scripts/checks
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)             # repo root
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
@@ -41,7 +41,7 @@ if [ -z "$ok" ]; then echo "C=$C ENGINE FAILED TO START" | tee "$RES" >/dev/null
 size=$(grep -a 'GPU KV cache size' "$SERVER_LOG" | tail -1 | grep -oE '[0-9,]+ tokens' | tr -d ' ,')
 conc=$(grep -a 'Maximum concurrency' "$SERVER_LOG" | tail -1 | grep -oE '[0-9.]+x' | head -1)
 
-timeout 900 "$PY" "$REPO_ROOT/scripts/revert_cmatrix.py" > "$LOG" 2>&1
+timeout 900 "$PY" "$REPO_ROOT/scripts/probes/revert_cmatrix.py" > "$LOG" 2>&1
 ec=$?
 echo "=== C=$C kv=$size conc=$conc exit=$ec ===" | tee -a "$RES"
 grep '^RESULT' "$LOG" >> "$RES"

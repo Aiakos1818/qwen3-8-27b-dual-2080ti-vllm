@@ -37,7 +37,7 @@ Agent 场景：会话 A 用掉长上下文后暂停，随后会话 B/C 占用池
   （`To serve at least one request ... estimated maximum model length is 84800`）。
   提至 **2.3e9 字节**后：日志 `GPU KV cache size: 106,288 tokens`、`Maximum concurrency 1.04x`。
 
-### 2.2 主测试 `test_kv_100k.py`（全自动）
+### 2.2 主测试 `scripts/checks/test_kv_100k.py`（全自动）
 
 观测手段（已确认该分支支持）：
 - chat 接口 `usage.prompt_tokens_details.cached_tokens` = 从 block0 起连续命中的 token 数；
@@ -202,7 +202,7 @@ pin 持续持有该块直到 unpin/释放。
 
 ## 8. 验证结果（100k 池 106,288 tokens）
 
-### 8.1 保活生效 `probe_keepalive.py`（默认 16k 阈值）
+### 8.1 保活生效 `scripts/probes/probe_keepalive.py`（默认 16k 阈值）
 
 | 步骤 | A 恢复 cached | 说明 |
 |---|---|---|
@@ -215,7 +215,7 @@ pin 持续持有该块直到 unpin/释放。
 
 ⇒ “缓存最小的先出”成立：C 被准入时释放的是 B 而非 A。
 
-### 8.2 开关回归 `probe_keepalive_off.py`（`VLLM_PIN_MIN_TOKENS=0`）
+### 8.2 开关回归 `scripts/probes/probe_keepalive_off.py`（`VLLM_PIN_MIN_TOKENS=0`）
 
 | 步骤 | A 恢复 cached |
 |---|---|
@@ -248,10 +248,10 @@ pin 持续持有该块直到 unpin/释放。
 | 文件 | 作用 |
 |---|---|
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` | 100k 池启动脚本（池已校准，头注含文档指针） |
-| `scripts/test_kv_100k.py` | 主自动化测试（全命中 / 驱逐后恢复 / 全驱逐） |
-| `scripts/probe_kv_100k.py` `probe_kv_evdir.py` `probe_evict_isolate.py` `probe_one_page.py` `probe_interleave.py` | 驱逐/失效定向探测 |
-| `scripts/probe_keepalive.py` `probe_keepalive_off.py` | 保活特性验证与关闭开关回归 |
-| `scripts/oc_fixture.json` `capture_opencode.json` `capture_proxy.py` | opencode 负载捕获配置与代理 |
+| `scripts/checks/test_kv_100k.py` | 主自动化测试（全命中 / 驱逐后恢复 / 全驱逐） |
+| `scripts/probes/probe_kv_100k.py` `scripts/probes/probe_kv_evdir.py` `scripts/probes/probe_evict_isolate.py` `scripts/probes/probe_one_page.py` `scripts/probes/probe_interleave.py` | 驱逐/失效定向探测 |
+| `scripts/probes/probe_keepalive.py` `scripts/probes/probe_keepalive_off.py` | 保活特性验证与关闭开关回归 |
+| `scripts/capture/oc_fixture.json` `scripts/capture/capture_opencode.json` `scripts/capture/capture_proxy.py` | opencode 负载捕获配置与代理 |
 | `$LOG_DIR/server_100k.log`、`*_run*.log`、`test_kv_100k_results.json` | 各次运行日志/结果留档 |
 
 ---

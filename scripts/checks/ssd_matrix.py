@@ -21,7 +21,8 @@ import subprocess
 import sys
 import time
 
-SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))      # scripts/checks
+SCRIPTS = os.path.dirname(HERE)                        # scripts root (revert_lib)
 sys.path.insert(0, SCRIPTS)
 from openai import OpenAI  # noqa: E402
 from revert_lib import BASE, MODEL, SYSTEM, assistant_msg, filler_fast, send, user_msg  # noqa: E402
@@ -91,7 +92,7 @@ def run_script(name: str, args: list[str], timeout: int = 2400) -> tuple[bool, s
         capture_output=True,
         text=True,
         timeout=timeout,
-        cwd=SCRIPTS,
+        cwd=HERE,
     )
     out = proc.stdout + proc.stderr
     print(out, flush=True)

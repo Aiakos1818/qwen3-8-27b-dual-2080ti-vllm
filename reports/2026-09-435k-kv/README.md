@@ -12,7 +12,7 @@ SSD 上复跑。
 - 保活/锚点：`VLLM_PIN_MIN_TOKENS=16000`、`VLLM_MAMBA_CKPT_ANCHORS=3`、
   `VLLM_HOSTTIER_EVICT_SMALL_TOKENS=32000`；SSD tier（真 NVMe `ssd_kv`，quota 64 GiB，
   限速 800 MiB/s，`SSD_ONLY=1`）。
-- 测试脚本：`scripts/ssd_435k_revert_check.py`（435k）、`scripts/ssd_512k_anchor_check.py`
+- 测试脚本：`scripts/checks/ssd_435k_revert_check.py`（435k）、`scripts/checks/ssd_512k_anchor_check.py`
   （512k）。S 常驻 → T 挤出 S 到 SSD → R 整链恢复 → V 深回退到 cadence 锚点。
 
 ## 2. 435k（PASS）
@@ -62,7 +62,7 @@ V2 命中 352,000（9.9s），`SSD-435K-REVERT-DONE`。RAMTRACE 窗口 = `[31840
   （日志 `alloc gate ... need=3 free=0`），释放 durable 窗口、近尾锚点丢失 → 深回退重算；
   需留 **余量 ≥ 16 块（25,600 token）**。池容量口径与推荐值见
   [`docs/kv-optimization/GPU_MEMORY_CALCULATION.md` §4.5](../../docs/kv-optimization/GPU_MEMORY_CALCULATION.md)
-  与工具 `scripts/kv_pool_sizing.py`（9.6e9 池安全上限 ≈ 500,800 token）。另修复：durable 窗口
+  与工具 `scripts/tools/kv_pool_sizing.py`（9.6e9 池安全上限 ≈ 500,800 token）。另修复：durable 窗口
   改为按 token 位置淘汰（保留近尾 K 个，而非最早插入的），否则恢复会话只留最早几个边界
   （`30400..96000`）而非近尾（`448k..512k`）。
 

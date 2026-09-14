@@ -140,9 +140,9 @@ export VLLM_SSD_ONLY=1
 | `vllm/v1/metrics/{stats,loggers}.py` | SSD 指标（见 [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md)） |
 | `vllm/envs.py` | `VLLM_SSD_*` 声明 |
 | `tests/v1/core/test_host_tier_ssd.py` | 12 个单测（索引/配额 LRU/槽位生命周期/失败清理/在飞保护/分块/两档驱逐/锚点快照） |
-| `scripts/ssd_matrix.py` | 单次启动功能矩阵 |
-| `scripts/ssd_100k_check.py` / `ssd_435k_check.py` | 真 NVMe park/resume |
-| `scripts/ssd_crash_check.py` | 写中 SIGKILL 原子性 + 启动清理 |
+| `scripts/checks/ssd_matrix.py` | 单次启动功能矩阵 |
+| `scripts/checks/ssd_100k_check.py` / `scripts/checks/ssd_435k_check.py` | 真 NVMe park/resume |
+| `scripts/checks/ssd_crash_check.py` | 写中 SIGKILL 原子性 + 启动清理 |
 
 ### 关键不变式
 
@@ -234,7 +234,7 @@ export VLLM_SSD_ONLY=1
 > smoke check（干净的机制验证见 FP8 报告的 RAM/真 NVMe `test2`）。
 >
 > 注：上表 S3/S3b 的 `32000/48000` 为**未开 MTP** 时的边界。部署默认 MTP3（eagle drop）下
-> 边界为 `30400/46400`，见 [`vllm_02_锚点.md`](vllm_02_锚点.md) §2.3；`ssd_matrix.py` 两种
+> 边界为 `30400/46400`，见 [`vllm_02_锚点.md`](vllm_02_锚点.md) §2.3；`scripts/checks/ssd_matrix.py` 两种
 > 取值均接受。
 
 ### 6.4 真 NVMe 435k 验收（分块流式）**PASS**
@@ -243,7 +243,7 @@ export VLLM_SSD_ONLY=1
 **489,789 token**，1.13×）、保活 16000、锚点 32000/K=3、staging 4e9（71 slot）、
 chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 
-`scripts/ssd_435k_check.py`（S≈390k 常驻 → T≈407k 挤出 S → R=S+tail 恢复）：
+`scripts/checks/ssd_435k_check.py`（S≈390k 常驻 → T≈407k 挤出 S → R=S+tail 恢复）：
 
 | 请求 | prompt | cached | wall | sha |
 |---|---|---|---|---|
@@ -269,7 +269,7 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 
 ### 6.5 中断原子性
 
-`scripts/ssd_crash_check.py`：写中 SIGKILL → 18 个完整 `.bin` + 1 个临时文件（无索引引用）；
+`scripts/checks/ssd_crash_check.py`：写中 SIGKILL → 18 个完整 `.bin` + 1 个临时文件（无索引引用）；
 重启 `CLEAN_START=1` 后目录清空。`SSD-CRASH-OK`。
 
 ---
@@ -317,7 +317,7 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
   如 S 515k）长 prefill 会**自我抢占**（`alloc gate ... need=3 free=0`），
   `pop_blocks_for_free` 释放 durable 窗口，近尾锚点丢失 → 深回退重算；尝试"抢占时保留锚点"
   会在重新调度时死锁（锚点占位使准入失败），故需**留足余量**（余量 ≥ 16 块 = 25,600 token）。
-  余量口径用 `scripts/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。另：
+  余量口径用 `scripts/tools/kv_pool_sizing.py` 计算（见 `GPU_MEMORY_CALCULATION.md` §4.5）。另：
   durable 窗口现按 token 位置淘汰（保留近尾 K 个，而非最早插入的），见
   [`reports/2026-09-435k-kv/`](../../reports/2026-09-435k-kv/README.md)。
 - 启动 flakiness（TP warmup CUDA invalid argument）与实现无关；重试前清理
@@ -337,16 +337,16 @@ bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
 #   VLLM_SSD_CHUNK_SLOTS=8 VLLM_SSD_ONLY=1 RAMTRACE=1
 #   --kv-transfer-config ... "cpu_bytes_to_use":2400000000
 #   --kv-cache-memory-bytes 2770000000 --max-num-seqs 4
-python scripts/ssd_matrix.py
+python scripts/checks/ssd_matrix.py
 
 # 100k 真 NVMe（需引擎已按 §3 配置启动）
-python scripts/ssd_100k_check.py
+python scripts/checks/ssd_100k_check.py
 
 # 435k 真盘验收
-python scripts/ssd_435k_check.py
+python scripts/checks/ssd_435k_check.py
 
 # 中断原子性
-python scripts/ssd_crash_check.py
+python scripts/checks/ssd_crash_check.py
 
 # 单元测试
 cd /path/to/vllm
@@ -366,5 +366,5 @@ python -m pytest tests/v1/core/test_host_tier_ssd.py \
 
 ## 11. 指标与监控
 
-Prometheus 指标、`scripts/monitor_host_tier.py` 面板、`RAMTRACE` 轨迹与 env 配置总表见
+Prometheus 指标、`scripts/tools/monitor_host_tier.py` 面板、`RAMTRACE` 轨迹与 env 配置总表见
 [`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md)。

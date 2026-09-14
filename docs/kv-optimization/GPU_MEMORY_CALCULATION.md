@@ -341,14 +341,14 @@ slots          = floor(pool_bytes / slot_bytes)
 max_safe_len   = (slots − mamba_blocks − H) × block_size
 ```
 
-**工具**: `scripts/kv_pool_sizing.py`（纯标准库；**只给启动脚本**，参数全从里面读）。
+**工具**: `scripts/tools/kv_pool_sizing.py`（纯标准库；**只给启动脚本**，参数全从里面读）。
 默认做两项一致性检查并给建议：
 ```bash
 # 默认：检查 profile 的池/上下文是否匹配（两项检查）
-python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh
+python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh
 # 可选：覆盖上下文 / 池
-python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 500k
-python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool-bytes 9.6e9
+python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 500k
+python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool-bytes 9.6e9
 ```
 输出：
 - `[池检查]`：当前池 vs `safe_pool(max-model-len)` → 不足 / 偏小（可启动但满池会自我抢占）/ 符合；不符给推荐池。
@@ -359,9 +359,9 @@ python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.s
 健康探测每 10s，瞬态失败重试 ≤3 次，`CUDA out of memory` 不重试），健康后读 `nvidia-smi` 的
 used − 池字节得**真实非KV**，随即退出部署并清理，再判定 `非KV + 安全池 ≤ 21.5 GiB`。
 ```bash
-python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 512k --feasible
+python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 512k --feasible
 # 不部署的替代：--log <已有启动日志>（估算）或 --non-kv-gib <实测值>
-python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh \
+python scripts/tools/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh \
     --max-len 512k --feasible --log /path/to/server_c5.log
 ```
 `--log` 用 `Model loading took X GiB` + 基线(2.0 GiB) 估非KV；`--non-kv-gib` 直接给实测值
@@ -464,7 +464,7 @@ Based on the available memory, the estimated maximum model length is 233600.
 
 **池容量计算方法** (3.5 节精确公式, 无 MM IPC 扣减):
 - 启动校验最低值: `27,852,800 × (ceil(max_len/1600) + 15)`
-- 深回退安全值: 再加 `H` 块 (见 §4.5)；直接诊断用 `scripts/kv_pool_sizing.py <run.sh>`。
+- 深回退安全值: 再加 `H` 块 (见 §4.5)；直接诊断用 `scripts/tools/kv_pool_sizing.py <run.sh>`。
 
 > 注: `--gpu-memory-utilization` 设了 `kv-cache-memory-bytes` 后被跳过
 > (日志: "skipped memory profiling. This does not respect the gpu_memory_utilization config")，

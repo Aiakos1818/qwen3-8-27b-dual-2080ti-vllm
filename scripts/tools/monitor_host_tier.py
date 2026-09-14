@@ -13,10 +13,10 @@ the derived ``http://localhost:<port>``. Nothing is read from ``/proc``,
 startup logs or snapshot files.
 
 Usage:
-    python scripts/monitor_host_tier.py -d 10
-    python scripts/monitor_host_tier.py --port 8001 --once
-    python scripts/monitor_host_tier.py --json --count 5
-    python scripts/monitor_host_tier.py --no-sessions
+    python scripts/tools/monitor_host_tier.py -d 10
+    python scripts/tools/monitor_host_tier.py --port 8001 --once
+    python scripts/tools/monitor_host_tier.py --json --count 5
+    python scripts/tools/monitor_host_tier.py --no-sessions
 
 Terminology: vLLM has no agent-session entity. A "session" in the metrics is
 one request's KV chain (matched to a later request by prefix hash).
