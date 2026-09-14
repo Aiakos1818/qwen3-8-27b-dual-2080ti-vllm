@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 435K context, SSD-only host tier.
 #
-# Production profile for the KV-optimization branch: keep-alive pin + Mamba/GDN
-# anchors + two-tier GPU/SSD session offload with chunked streaming (no session
-# size limit). The CPU staging pool is used only as a chunked bounce buffer, so
-# sessions far larger than it are streamed both ways.
-# See docs/kv-optimization/vllm_04_offload_ssd.md.
+# Keep-alive pin + Mamba/GDN anchors + two-tier GPU/SSD session offload with
+# chunked streaming (no session size limit). The CPU staging pool is used only
+# as a chunked bounce buffer, so sessions far larger than it are streamed both
+# ways. See docs/kv-optimization/vllm_04_offload_ssd.md.
 #
 # Paths / model come from .env (copy config/vllm-435k-ssd.env.example).
 set -Eeuo pipefail
@@ -20,25 +19,28 @@ fi
 : "${MODEL_PATH:?set MODEL_PATH in .env}"
 : "${VLLM_PYTHON:?set VLLM_PYTHON in .env}"
 : "${FLASHQLA_PATH:?set FLASHQLA_PATH in .env}"
-: "${VLLM_SSD_ROOT:?set VLLM_SSD_ROOT in .env (SSD tier is required for this profile)}"
 : "${SERVED_MODEL_NAME:=qwen38-27b}"
 : "${HOST:=0.0.0.0}"
 : "${PORT:=8000}"
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${OMP_NUM_THREADS:=8}"
 
-# --- KV optimization knobs -------------------------------------------------
+# --- profile knobs ---------------------------------------------------------
+# 435K context on a 9.0e9 pool (306 blocks x 1600 = 489,600 token capacity).
+# Diagnose with scripts/tools/kv_pool_sizing.py
+# (docs/kv-optimization/GPU_MEMORY_CALCULATION.md §4.5).
 : "${MAX_MODEL_LEN:=435200}"                 # 272 blocks * 1600 = 435.2k
 : "${KV_CACHE_MEMORY_BYTES:=9000000000}"     # calibrate to "GPU KV cache size"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-: "${CPU_BYTES_TO_USE:=2400000000}"          # host staging = chunk bounce buffer; <=2e9 breaks cudaHostRegister
+: "${CPU_BYTES_TO_USE:=2400000000}"
 : "${SPEC_NUM_TOKENS:=3}"
 : "${VLLM_PIN_MIN_TOKENS:=16000}"
 : "${VLLM_MAMBA_CKPT_TOKENS:=32000}"
 : "${VLLM_MAMBA_CKPT_ANCHORS:=3}"
 : "${VLLM_HOSTTIER_EVICT_SMALL_TOKENS:=32000}"
-: "${VLLM_SSD_QUOTA_BYTES:=68719476736}"     # 64 GiB
-: "${VLLM_SSD_MAX_MBPS:=800}"                # MiB/s, protects the system disk
+: "${VLLM_SSD_ROOT:=/tmp/vllm_ssd}"
+: "${VLLM_SSD_QUOTA_BYTES:=68719476736}"   # 64 GiB
+: "${VLLM_SSD_MAX_MBPS:=800}"
 : "${VLLM_SSD_CLEAN_START:=1}"
 
 export OMP_NUM_THREADS CUDA_HOME
@@ -48,10 +50,13 @@ export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_QWOPUS_MTP_BF16_DRAFT="${VLLM_QWOPUS_MTP_BF16_DRAFT:-1}"
 export VLLM_SM75_SPEC_SYNC_MODE="${VLLM_SM75_SPEC_SYNC_MODE:-safe}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+# API auth: inherit VLLM_API_KEY from the environment (empty = no auth).
+export VLLM_API_KEY="${VLLM_API_KEY:-}"
 export VLLM_PIN_MIN_TOKENS VLLM_MAMBA_CKPT_TOKENS VLLM_MAMBA_CKPT_ANCHORS
 export VLLM_HOSTTIER_EVICT_SMALL_TOKENS
+# Two-tier GPU/SSD session offload (chunked, no session-size limit).
 export VLLM_SSD_ROOT VLLM_SSD_QUOTA_BYTES VLLM_SSD_MAX_MBPS VLLM_SSD_CLEAN_START
-export VLLM_SSD_ONLY="${VLLM_SSD_ONLY:-1}"
+export VLLM_SSD_ONLY=1
 export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 export PYTHONPATH="$FLASHQLA_PATH"
@@ -67,7 +72,7 @@ ARGS=(
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"
   --enable-prefix-caching --max-num-seqs 1
   --enable-prompt-tokens-details
-  --max-num-batched-tokens 4096 --enable-chunked-prefill
+  --max-num-batched-tokens 1024 --enable-chunked-prefill
   --no-async-scheduling
   --skip-mm-profiling
   --limit-mm-per-prompt '{"image":20,"video":1}'
