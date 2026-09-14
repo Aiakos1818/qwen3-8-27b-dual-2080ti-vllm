@@ -345,10 +345,10 @@ max_safe_len   = (slots − mamba_blocks − H) × block_size
 默认做两项一致性检查并给建议：
 ```bash
 # 默认：检查 profile 的池/上下文是否匹配（两项检查）
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh
+python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh
 # 可选：覆盖上下文 / 池
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 500k
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool-bytes 9.6e9
+python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 500k
+python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool-bytes 9.6e9
 ```
 输出：
 - `[池检查]`：当前池 vs `safe_pool(max-model-len)` → 不足 / 偏小（可启动但满池会自我抢占）/ 符合；不符给推荐池。
@@ -359,10 +359,10 @@ python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --pool
 健康探测每 10s，瞬态失败重试 ≤3 次，`CUDA out of memory` 不重试），健康后读 `nvidia-smi` 的
 used − 池字节得**真实非KV**，随即退出部署并清理，再判定 `非KV + 安全池 ≤ 21.5 GiB`。
 ```bash
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 512k --feasible
+python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh --max-len 512k --feasible
 # 不部署的替代：--log <已有启动日志>（估算）或 --non-kv-gib <实测值>
-python scripts/kv_pool_sizing.py run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh \
-    --max-len 512k --feasible --log fp8-kv-work/server_c5.log
+python scripts/kv_pool_sizing.py scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh \
+    --max-len 512k --feasible --log /path/to/server_c5.log
 ```
 `--log` 用 `Model loading took X GiB` + 基线(2.0 GiB) 估非KV；`--non-kv-gib` 直接给实测值
 （= 运行中 `nvidia-smi` used − 池字节）。
@@ -456,11 +456,11 @@ Based on the available memory, the estimated maximum model length is 233600.
 
 | 模型 | 上下文 | 池 (kv-cache-memory-bytes) | 脚本 |
 |---|---|---|---|
-| FP8 | 180,000 | 4e9 B (3.73 GiB) | `run_vllm_qwen38_zyYuc.sh` |
-| AWQ-INT4 | 102,400 | 2.3e9 B | `run_vllm_qwen38_awq_fp8e4m3_100k.sh` |
-| AWQ-INT4 | 262,144 | 5.6e9 B | `run_vllm_qwen38_awq_fp8e4m3_256k.sh` |
-| AWQ-INT4 | 435,200 | 9.0e9 B | `run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` |
-| AWQ-INT4 | 500,800 | 9.6e9 B | `run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` |
+| FP8 | 180,000 | 4e9 B (3.73 GiB) | `scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh` (`MAX_MODEL_LEN=180000`) |
+| AWQ-INT4 | 102,400 | 2.3e9 B | `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` |
+| AWQ-INT4 | 262,144 | 5.6e9 B | `scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` |
+| AWQ-INT4 | 435,200 | 9.0e9 B | `scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` |
+| AWQ-INT4 | 500,800 | 9.6e9 B | `scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` |
 
 **池容量计算方法** (3.5 节精确公式, 无 MM IPC 扣减):
 - 启动校验最低值: `27,852,800 × (ceil(max_len/1600) + 15)`
@@ -484,11 +484,11 @@ Based on the available memory, the estimated maximum model length is 233600.
 
 | 配置 | 参数 | 状态 |
 |---|---|---|
-| FP8 + 180,000 | `run_vllm_qwen38_zyYuc.sh` (4e9 B) | 稳定 |
-| AWQ-INT4 + 100k | `run_vllm_qwen38_awq_fp8e4m3_100k.sh` (2.3e9 B) | 稳定 (小池实验台) |
-| AWQ-INT4 + 256k | `run_vllm_qwen38_awq_fp8e4m3_256k.sh` (5.6e9 B) | 已验证 |
-| AWQ-INT4 + 435k | `run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` (9.0e9 B) | 已验证 |
-| AWQ-INT4 + 500.8k | `run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` (9.6e9 B) | 已验证 |
+| FP8 + 180,000 | `scripts/run_vllm_qwen38_fp8_fp8e4m3_100k_kv.sh` (4e9 B, `MAX_MODEL_LEN=180000`) | 稳定 |
+| AWQ-INT4 + 100k | `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` (2.3e9 B) | 稳定 (小池实验台) |
+| AWQ-INT4 + 256k | `scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` (5.6e9 B) | 已验证 |
+| AWQ-INT4 + 435k | `scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh` (9.0e9 B) | 已验证 |
+| AWQ-INT4 + 500.8k | `scripts/run_vllm_qwen38_awq_fp8e4m3_pool9.6e9.sh` (9.6e9 B) | 已验证 |
 
 ### 7.4 启动 OOM 回退阶梯
 

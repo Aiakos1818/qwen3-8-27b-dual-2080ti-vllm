@@ -1,7 +1,7 @@
 # vLLM KV 优化 01：会话保活（keep-alive / 前缀缓存保护）
 
 > 对象：`Qwen3.8-27B-AWQ-INT4-yarn512k`（INT4 权重 + fp8_e4m3 KV），Qwen3.5 混合
-> GDN/Mamba 架构的自研 vLLM 分支（`zyYuc-sandbox/src/vllm-0271`，0.27.2.dev0）。
+> GDN/Mamba 架构的自研 vLLM 分支（`vllm` 源码树，0.27.2.dev0；构建见 `docs/PATCHING.md`）。
 > 部署形态：2×RTX 2080 Ti（TP2）、`max-model-len 102400`、KV 池 ~106,288 tokens、
 > `--enable-prefix-caching`、`--max-num-seqs 1`、chunked prefill、MTP 常开。
 > 时间：2026-09。本文件记录“多会话 agent 用法下前缀缓存为何失效、以及如何保活”。
@@ -22,7 +22,7 @@ Agent 场景：会话 A 用掉长上下文后暂停，随后会话 B/C 占用池
 最初问题（池 512k 假设）：A 200k + B 100k 后回 A，A 能增长到池满前不重算；
 一旦第 3 会话挤压到 A 的开头，A 是否整段重算？
 
-本仓 100k 池脚本 `run_vllm_qwen38_awq_fp8e4m3_100k.sh` 即以小尺度复现上述问题，
+本仓 100k 池脚本 `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` 即以小尺度复现上述问题，
 目标是**保活会话的 KV（pin），并让压力下的释放遵循“缓存最小的先出”**。
 
 ---
@@ -128,7 +128,7 @@ Agent 场景：会话 A 用掉长上下文后暂停，随后会话 B/C 占用池
 
 ## 5. 代码改动明细（改动处均已加注释）
 
-分支源码：`zyYuc-sandbox/src/vllm-0271/vllm/`
+分支源码：`vllm/vllm/`（克隆目录见 `docs/PATCHING.md`）
 
 ### 5.1 `v1/core/kv_cache_utils.py` — `KVCacheBlock`
 - 新增字段 `pinned: int = 0`（保活 pin 计数；0=未保活）。见 `kv_cache_utils.py:125` 注释。
@@ -225,7 +225,7 @@ pin 持续持有该块直到 unpin/释放。
 
 ### 8.3 备注
 - 引擎日志全程无异常（除启动阶段 FA2 不支持 7.5 算力的常规 ERROR）。
-- 部署 `run_vllm_qwen38_awq_fp8e4m3_100k.sh` 头注已同步记录方案与实测。
+- 部署 `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` 头注已同步记录方案与实测。
 
 ---
 

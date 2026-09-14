@@ -10,7 +10,7 @@
 > - 锚点：[`vllm_02_锚点.md`](vllm_02_锚点.md)
 > - RAM offload：[`vllm_03_offload_ram.md`](vllm_03_offload_ram.md)
 > - KV 信息面板：[`vllm_05_kv信息面板.md`](vllm_05_kv信息面板.md)
-> - 运行脚本：`run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh`
+> - 运行脚本：`scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh`
 
 ---
 
@@ -329,7 +329,7 @@ chunk 35、SSD quota 64 GiB、`MAX_MBPS=800 MiB/s`、`SSD_ONLY=1`。
 
 ```bash
 # 启动（435k + SSD 分块，真实 NVMe）
-./run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
+bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
 # 标定：日志 "GPU KV cache size" >= 435200*1.05；nvidia-smi ~21G/卡
 
 # 功能矩阵（tmpfs，强制分块：在 100k 启动配置上加）
@@ -349,7 +349,7 @@ python scripts/ssd_435k_check.py
 python scripts/ssd_crash_check.py
 
 # 单元测试
-cd zyYuc-sandbox/src/vllm-0271
+cd /path/to/vllm
 python -m pytest tests/v1/core/test_host_tier_ssd.py \
   tests/v1/core/test_host_tier_spill.py \
   tests/v1/core/test_prefix_caching.py \

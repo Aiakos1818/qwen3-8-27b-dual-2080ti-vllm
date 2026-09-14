@@ -364,7 +364,7 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 - MTP/NaN 调试：`scripts/mtp_probe.py`
 - 结果：`$LOG_DIR/cmatrix_results.tsv`、`$LOG_DIR/anch_*.txt`（显存 A/B）
 - 日志：`$LOG_DIR/revert_ckpt*.log`、`$LOG_DIR/cmatrix_*.log`、`$LOG_DIR/revert_clean.log`
-- 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`logs/server_100k.log`
+- 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`$LOG_DIR/server_100k.log`
 
 测试：`tests/v1/core/test_prefix_caching.py`（89 例）、
 `tests/v1/core/test_mamba_align_chunk_split.py`（23 例，含 §2.3.1 的

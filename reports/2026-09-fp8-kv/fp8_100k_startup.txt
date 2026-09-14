@@ -16,7 +16,7 @@ INFO 09-12 01:35:40 [compilation.py:329] Enabled custom fusions: norm_quant, act
 === Phase 3 (real-NVMe SSD) engine startup ===
 INFO 09-12 02:25:40 [kv_cache_utils.py:2239] GPU KV cache size: 106,288 tokens
 INFO 09-12 02:25:40 [shared_offload_region.py:71] Created mmap file /dev/shm/vllm_offload_a5bb526d-c94e-4b54-8f2b-96993b075dda.mmap (3.68 GiB)
-INFO 09-12 02:26:07 [host_tier_ssd.py:126] HostTierSSDStore: root=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv/a5bb526d-c94e-4b54-8f2b-96993b075dda_02fe1f20e381/sessions quota=8.00GiB O_DIRECT=True
+INFO 09-12 02:26:07 [host_tier_ssd.py:126] HostTierSSDStore: root=<VLLM_SSD_ROOT>/a5bb526d-c94e-4b54-8f2b-96993b075dda_02fe1f20e381/sessions quota=8.00GiB O_DIRECT=True
 INFO 09-12 02:26:07 [scheduler.py:2938] HostTierSSD: staging_slots=71 chunk_slots=35 evict_small=32000 block_size=1600
 
 === Matrix (tmpfs forced chunk) engine startup ===

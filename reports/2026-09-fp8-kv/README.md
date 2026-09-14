@@ -260,7 +260,7 @@ python scripts/ssd_crash_check.py
 单元测试（140 passed，含 pre-cadence 保留、恢复会话认领、抢占不重认领、真 LRU 三个回归测试）：
 
 ```bash
-cd zyYuc-sandbox/src/vllm-0271
+cd /path/to/vllm
 python -m pytest tests/v1/core/test_host_tier_ssd.py \
   tests/v1/core/test_host_tier_spill.py tests/v1/core/test_prefix_caching.py \
   tests/v1/core/test_mamba_align_chunk_split.py -q --noconftest
