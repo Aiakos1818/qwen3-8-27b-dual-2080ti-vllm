@@ -70,10 +70,10 @@ index 000000000..b9ad6d9ac
 +    assert _client(engine).get("/host_tier_info").status_code == 503
 diff --git a/tests/v1/core/test_host_tier_spill.py b/tests/v1/core/test_host_tier_spill.py
 new file mode 100644
-index 000000000..551a8bc45
+index 000000000..9345faff7
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_spill.py
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,540 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the session-level host-tier (RAM) spill/restore helpers.
@@ -306,6 +306,7 @@ index 000000000..551a8bc45
 +        "tokens": 8,
 +        "num_blocks": 2,
 +        "anchors": 3,
++        "last_used": 42.0,
 +        "blocks": [],
 +        "grp_blocks": [[block]],
 +    }
@@ -317,6 +318,8 @@ index 000000000..551a8bc45
 +    assert session["grp_hashes"] == [[b"tailhash"]]
 +    assert session["tokens"] == 8
 +    assert session["anchors"] == 3
++    # Parking must not refresh last_used: eviction is not a use.
++    assert session["last_used"] == 42.0
 +    assert "r" not in manager._spill_hold
 +
 +
@@ -613,10 +616,10 @@ index 000000000..551a8bc45
 +    assert sessions["gpu"][0]["last_used"] > 1_000_000_000.0
 diff --git a/tests/v1/core/test_host_tier_ssd.py b/tests/v1/core/test_host_tier_ssd.py
 new file mode 100644
-index 000000000..5e335be05
+index 000000000..0611ce8a0
 --- /dev/null
 +++ b/tests/v1/core/test_host_tier_ssd.py
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,391 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for the two-tier GPU/SSD host tier (``HostTierSSDStore``).
@@ -991,7 +994,9 @@ index 000000000..5e335be05
 +    """The parked session keeps its anchor count for the monitor snapshot."""
 +    buf, view, flat = make_view(8)
 +    store = make_store(tmp_path, view)
-+    assert store.begin_store("sidA", 3, [[b"\x01" * 16]], tail(0xAA), 96, 2)
++    assert store.begin_store(
++        "sidA", 3, [[b"\x01" * 16]], tail(0xAA), 96, 2, last_used=42.0
++    )
 +    assert store.append_store("sidA", 0, [0, 1, 2], commit=True) is not None
 +    wait_n(store, 1)
 +
@@ -1001,7 +1006,8 @@ index 000000000..5e335be05
 +    assert sess["blocks"] == 3
 +    assert sess["bytes"] == 3 * ROW
 +    assert sess["anchors"] == 2
-+    assert "last_used" in sess
++    # Neither beginning nor committing the store may refresh last_used.
++    assert sess["last_used"] == 42.0
 +
 +    store.shutdown()
 +    close_view(buf, view, flat)
@@ -1796,10 +1802,10 @@ index a64b7e321..4cb11ad9f 100644
      def reset_prefix_cache(self) -> bool:
 diff --git a/vllm/v1/core/host_tier_ssd.py b/vllm/v1/core/host_tier_ssd.py
 new file mode 100644
-index 000000000..69584b335
+index 000000000..7155ba68c
 --- /dev/null
 +++ b/vllm/v1/core/host_tier_ssd.py
-@@ -0,0 +1,602 @@
+@@ -0,0 +1,612 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Session-level SSD parking for the host-tier offload (two-tier GPU/SSD).
@@ -2121,11 +2127,15 @@ index 000000000..69584b335
 +        tail: bytes | None,
 +        tokens: int,
 +        anchors: int = 0,
++        last_used: float | None = None,
 +    ) -> bool:
 +        """Reserve quota for a session that will be written in chunks.
 +
 +        Returns False when the session can never fit the quota or no space
 +        could be freed (caller runs ``evict_for`` first).
++
++        ``last_used`` carries the chain's true last-use time from the GPU tier;
++        eviction must not refresh it. Falls back to now when unknown.
 +        """
 +        total_bytes = total_slots * self._row_bytes
 +        if total_slots <= 0 or total_bytes > self._quota:
@@ -2165,7 +2175,9 @@ index 000000000..69584b335
 +            "bytes": total_bytes,
 +            "anchors": int(anchors),
 +            "dir": directory,
-+            "last_used": time.monotonic(),
++            "last_used": (
++                last_used if last_used is not None else time.monotonic()
++            ),
 +        }
 +        with self._lock:
 +            self._reserved_bytes += total_bytes
@@ -2222,9 +2234,12 @@ index 000000000..69584b335
 +        grp_hashes: list[list[bytes]],
 +        tail: bytes | None,
 +        tokens: int,
++        last_used: float | None = None,
 +    ) -> int | None:
 +        """Whole-session store (single chunk) used by tests/small sessions."""
-+        if not self.begin_store(sid, len(slots), grp_hashes, tail, tokens):
++        if not self.begin_store(
++            sid, len(slots), grp_hashes, tail, tokens, last_used=last_used
++        ):
 +            return None
 +        job_id = self.append_store(sid, 0, slots, commit=True)
 +        if job_id is None:
@@ -2332,8 +2347,9 @@ index 000000000..69584b335
 +                with self._lock:
 +                    self._pending_bytes -= nbytes
 +                    if success and commit and meta is not None:
++                        # Keep the last-use time carried by ``begin_store``:
++                        # committing the store is not a use.
 +                        session = dict(meta)
-+                        session["last_used"] = time.monotonic()
 +                        self._sessions[sid] = session
 +                        self._bytes_used += meta["bytes"]
 +                        self._reserved_bytes -= meta["bytes"]
@@ -2449,7 +2465,7 @@ index 70cd26750..e2ac02b34 100644
  
      def allocate_new_computed_blocks(
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index fcb67726a..928a87383 100644
+index fcb67726a..e7210d239 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,19 +2,26 @@
@@ -2590,7 +2606,7 @@ index fcb67726a..928a87383 100644
              return None
  
          if (
-@@ -577,6 +658,607 @@ class KVCacheManager:
+@@ -577,6 +658,611 @@ class KVCacheManager:
              self.block_pool.free_blocks(pins)
          self.coordinator.free(request.request_id)
  
@@ -3054,7 +3070,11 @@ index fcb67726a..928a87383 100644
 +            "anchors": entry.get("anchors", 0),
 +            "slots": slots or [],
 +            "parked_at": time.monotonic(),
-+            "last_used": time.monotonic(),
++            # Eviction is not a use: keep the chain's true last-use time so the
++            # host-tier LRU order is not perturbed by the spill itself.
++            "last_used": entry.get(
++                "last_used", entry.get("parked_at", time.monotonic())
++            ),
 +        }
 +        if envs.RAMTRACE:
 +            try:
@@ -3240,7 +3260,7 @@ index 9aea06109..885f7238a 100644
      # when the block is full and cached.
      _block_hash: BlockHashWithGroupId | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b4521a2e1..43ca9246e 100644
+index b4521a2e1..c32a92c4d 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1,12 +1,14 @@
@@ -3777,7 +3797,7 @@ index b4521a2e1..43ca9246e 100644
              num_tokens_main_model=full_num_tokens,
              apply_admission_cap=True,
          )
-@@ -2632,6 +3010,740 @@ class Scheduler(SchedulerInterface):
+@@ -2632,6 +3010,741 @@ class Scheduler(SchedulerInterface):
              self._request_remaining_blocks(req) for req in self._inflight_prefills
          )
  
@@ -3912,6 +3932,7 @@ index b4521a2e1..43ca9246e 100644
 +            entry["tail"],
 +            entry["tokens"],
 +            entry.get("anchors", 0),
++            last_used=entry.get("last_used"),
 +        ):
 +            kvm.abort_spill(req_id)
 +            self._host_tier_drops += 1
@@ -4518,7 +4539,7 @@ index b4521a2e1..43ca9246e 100644
      def _update_waiting_for_remote_kv(self, request: Request) -> None:
          """
          KV Connector: update request state after async recv is finished.
-@@ -2724,6 +3836,7 @@ class Scheduler(SchedulerInterface):
+@@ -2724,6 +3837,7 @@ class Scheduler(SchedulerInterface):
  
          if self.connector is not None:
              self.connector.update_connector_output(kv_connector_output)
