@@ -28,7 +28,7 @@ from openai import OpenAI  # noqa: E402
 from revert_lib import BASE, MODEL, SYSTEM, assistant_msg, filler_fast, user_msg  # noqa: E402
 
 _client = OpenAI(base_url=BASE, api_key="EMPTY", timeout=3600)
-SSD_ROOT = os.environ.get("VLLM_SSD_ROOT", "/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv")
+SSD_ROOT = os.environ.get("VLLM_SSD_ROOT", "/tmp/vllm_ssd")
 
 
 def build(uid: int, n_turns: int, a_tok: int, keep: int | None = None,

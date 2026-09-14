@@ -222,7 +222,10 @@ bash scripts/run_vllm_qwen38_awq_fp8e4m3_435k_ssd.sh
 
 复现/验证脚本：`scripts/monitor_host_tier.py`、`scripts/ssd_matrix.py`、
 `scripts/ssd_100k_check.py`、`scripts/ssd_435k_check.py`、`scripts/ssd_crash_check.py`、
-`scripts/correctness_check.py`。指标与 env 总表见 [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md)。
+`scripts/correctness_check.py`。开发期定向探测脚本（`probe_*` / `revert_*` / `resident_*` /
+`test_kv_100k.py` / `offload_matrix.py` / `capture_proxy.py` 等）同样收录于 `scripts/`，
+路径与模型经 `MODEL_PATH` / `VLLM_BASE_URL` / `VLLM_PYTHON` 参数化。
+指标与 env 总表见 [vllm_05 面板](docs/kv-optimization/vllm_05_kv信息面板.md)。
 
 > 文档中的字节一律 1024（`GiB`/`MiB/s`），token 一律 1000（`k=1000`）。
 

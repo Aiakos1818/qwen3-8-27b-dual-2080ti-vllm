@@ -358,9 +358,12 @@ trace 中恢复会话 re-park 的 entry 为 `[3,3,3,30]`（含 3 组各 2 锚点
 
 - 矩阵驱动：`scripts/revert_lib.py`、`scripts/revert_matrix.py`、`scripts/revert_pinprobe.py`
 - A1 检查点 / cadence 矩阵：`scripts/revert_ckpt.py`、`scripts/revert_cmatrix.py`
+- 单 cadence 起停编排：`scripts/run_cmatrix_one.sh`（起引擎 → 跑矩阵 → 停引擎，追加 TSV）
+- 锚点显存采样：`scripts/run_anch_measure.sh`（起引擎 → 跑 resident → 逐秒采 nvidia-smi）
 - resident 探针：`scripts/resident_once.py`、`scripts/resident_big.py`
-- 结果：`logs/cmatrix_results.tsv`、`logs/anch_*.txt`（显存 A/B）
-- 日志：`logs/revert_ckpt*.log`、`logs/cmatrix_*.log`、`logs/revert_clean.log`
+- MTP/NaN 调试：`scripts/mtp_probe.py`
+- 结果：`$LOG_DIR/cmatrix_results.tsv`、`$LOG_DIR/anch_*.txt`（显存 A/B）
+- 日志：`$LOG_DIR/revert_ckpt*.log`、`$LOG_DIR/cmatrix_*.log`、`$LOG_DIR/revert_clean.log`
 - 崩溃/卡死修复相关（见 [`vllm_01_保活.md`](vllm_01_保活.md) §6）：`logs/server_100k.log`
 
 测试：`tests/v1/core/test_prefix_caching.py`（89 例）、

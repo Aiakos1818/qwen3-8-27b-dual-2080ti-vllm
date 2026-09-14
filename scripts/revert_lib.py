@@ -3,6 +3,7 @@
 Talks DIRECTLY to the vLLM server on :8000 (bypasses the :8001 capture proxy so
 the proxy log stays a pure record of the real opencode session).
 """
+import json
 import os
 import time
 
@@ -18,11 +19,18 @@ BASE = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 TOK = AutoTokenizer.from_pretrained(MODEL_DIR)
 _client = OpenAI(base_url=BASE, api_key="EMPTY", timeout=2400)
 
-# Generic system prompt for the long-session harness (no external fixture).
-SYSTEM = os.environ.get(
-    "KV_TEST_SYSTEM",
-    "You are a helpful assistant. Answer precisely and keep replies short.",
-)
+# System prompt for the long-session harness. Default is a short generic prompt;
+# set KV_TEST_FIXTURE to a JSON file with a "system" field (e.g. oc_fixture.json,
+# a captured opencode system prompt) to replay a realistic agent system prompt.
+_fixture = os.environ.get("KV_TEST_FIXTURE")
+if _fixture:
+    with open(_fixture) as _fh:
+        SYSTEM = json.load(_fh)["system"]
+else:
+    SYSTEM = os.environ.get(
+        "KV_TEST_SYSTEM",
+        "You are a helpful assistant. Answer precisely and keep replies short.",
+    )
 
 
 def ntok(text: str) -> int:

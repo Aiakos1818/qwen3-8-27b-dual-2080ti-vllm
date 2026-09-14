@@ -242,18 +242,17 @@ pin 持续持有该块直到 unpin/释放。
 
 ## 10. 产物清单
 
-> 目录归拢（2026-09）：python 脚本与配套配置在 `scripts/`，日志与结果在 `logs/`；
-> 启动脚本 `run_vllm_*.sh` 在仓库根目录。
+> 目录归拢（2026-09）：python 脚本、启动 profile 与配套配置均在 `scripts/`；
+> 日志与结果由脚本写入 `LOG_DIR`（默认 `/tmp/vllm_logs`）或各自的 `*_OUT` 环境变量。
 
 | 文件 | 作用 |
 |---|---|
-| `run_vllm_qwen38_awq_fp8e4m3_100k.sh` | 100k 池启动脚本（池已校准，头注含文档指针） |
-| `start100k_server.sh` | setsid 启动包装（后台运行不随 shell 退出） |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_100k.sh` | 100k 池启动脚本（池已校准，头注含文档指针） |
 | `scripts/test_kv_100k.py` | 主自动化测试（全命中 / 驱逐后恢复 / 全驱逐） |
 | `scripts/probe_kv_100k.py` `probe_kv_evdir.py` `probe_evict_isolate.py` `probe_one_page.py` `probe_interleave.py` | 驱逐/失效定向探测 |
 | `scripts/probe_keepalive.py` `probe_keepalive_off.py` | 保活特性验证与关闭开关回归 |
 | `scripts/oc_fixture.json` `capture_opencode.json` `capture_proxy.py` | opencode 负载捕获配置与代理 |
-| `logs/server_100k.log`、`logs/*_run*.log`、`logs/test_kv_100k_results.json` | 各次运行日志/结果留档 |
+| `$LOG_DIR/server_100k.log`、`*_run*.log`、`test_kv_100k_results.json` | 各次运行日志/结果留档 |
 
 ---
 

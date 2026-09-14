@@ -52,5 +52,7 @@ KV 优化操作的是 KV 块，与权重是 AWQ-INT4 / FP8 无关。FP8 权重 1
 venv 的 `ninja` 放进 PATH（FP8 启用 `norm_quant`/`act_quant` 融合）。唯一行为差异：
 restore 后的深回退锚点命中（见报告 §5）。
 
-> 文档中按名称提到的 `probe_*` / `revert_*` / `resident_*` 等脚本为开发期定向探测，
-> 未随本仓库发布；结论已全部写入上述专题文档。
+> 文档中按名称提到的 `probe_*` / `revert_*` / `resident_*` 等开发期定向探测脚本已收录于
+> `scripts/`（路径/模型经环境变量参数化：`MODEL_PATH`、`VLLM_BASE_URL`、`VLLM_PYTHON`）。
+> `scripts/oc_fixture.json` 为可选的系统提示词 fixture（opencode 负载），设 `KV_TEST_FIXTURE`
+> 指向它以复现；不设则用 `scripts/revert_lib.py` 的通用系统提示词。
