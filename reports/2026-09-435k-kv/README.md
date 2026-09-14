@@ -95,8 +95,32 @@ V2 命中 352,000（9.9s），`SSD-435K-REVERT-DONE`。RAMTRACE 窗口 = `[31840
 S/T 布局一致。
 
 > 注：本次验收跑在 **9.6e9 profile**（当时生产在跑的实例）上。同一时段 `435k_ssd` profile
-> 在本机起不来：TP1 的 `cudaHostRegister` 返回 `cudaErrorInvalidValue`，毒化 CUDA context 后
-> `qwen_triton_warmup` 的 `torch.full` 报 `CUDA error: invalid argument`，引擎挂死。用
-> **移植前的代码**复现同样失败（4/4），故与本次移植无关；9.6e9 profile 同环境 0 次 pin 失败。
-> 两个 profile 的差异项：`--max-num-batched-tokens 4096`（435k）vs `1024`（9.6e9）、池
-> 9.0e9 vs 9.6e9。原因待查。
+> 在本机起不来（`cudaHostRegister` 失败 → 毒化 CUDA context → warmup 报 `CUDA error:
+> invalid argument` → 引擎挂死），**用移植前的代码同样复现**，故与本次移植无关。
+> 该问题后来定位为 **`/dev/shm` 被残留 staging 文件塞满**，已修复，见 §6。
+
+## 6. 最终验收（2026-09-14，固定 `KV_ENGINE_ID` 修复后）
+
+根因：驱动对 `cudaHostRegister` 失败给出的原话是 `Failed to allocate physical memory`——
+`/dev/shm`（本机 7.8 GiB）被历次崩溃残留的 `vllm_offload_<engine_id>.mmap`（2.23 GiB/个，
+只有正常退出才 unlink）塞满后，驱动无法为 staging 区落页，返回 `CUDA_ERROR_INVALID_VALUE`
+并**毒化 CUDA context**（失败后下一次 CUDA 调用必报 `invalid argument`）。旧 `engine_id` 是
+每次启动的随机 UUID，残留永不回收 → 表现为"时好时坏 / 清一下或重启就能起"。
+
+修复：每个 profile 固定 `KV_ENGINE_ID` + 启动前 `rm -f` 自己的 staging 文件（README §5）。
+
+修复后在同一台机器、`435k_ssd` profile（固定 id `qwen38-27b-435k`，`/dev/shm` 29%）复跑
+`scripts/checks/ssd_435k_revert_check.py`：**全 PASS**，原始输出 `awq_435k_final_accept.txt`。
+
+| 请求 | prompt | cached | wall | 说明 |
+|---|---|---|---|---|
+| S 常驻 | 384,704 | 0 | 818.9s | — |
+| **V0 深回退（常驻）** | 352,652 | **350,400** | 8.9s | 锚点命中 |
+| T 小请求（挤出 S） | 160,312 | 0 | 208.4s | — |
+| **R 恢复（SSD 分块）** | 384,714 | **382,400** | 60.8s | sha `db8b8e836881534b` |
+| **V2 深回退（恢复后）** | 352,652 | **350,400** | 8.7s | 重新认领锚点 |
+
+`METRICS stores=3 restores=2`、`SSD-435K-REVERT-DONE`；服务日志除既有 `fa_utils` FA2 提示外
+无 ERROR。另外验证：固定 id 后 SSD 会话目录稳定（`ssd_kv/qwen38-27b-435k_e82d15bfcaae`），
+预先放入的 `dummy_stale.txt` 在重启后被 `VLLM_SSD_CLEAN_START=1` 清掉——`clean_start` 现在
+真正能清**上一次运行**的会话。
