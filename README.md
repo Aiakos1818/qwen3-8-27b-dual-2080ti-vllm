@@ -139,7 +139,8 @@ python3 scripts/tools/monitor_kv_offload.py --port 8001 --once
 python3 scripts/tools/monitor_kv_offload.py --json --count 5
 ~~~
 
-同一个面板还有**浏览器版**（纯标准库、内联 CSS/JS、不依赖外网；滚轮/缩放天生可用）：
+同一个面板还有**浏览器版**（纯标准库、内联 CSS/JS、不依赖外网；滚轮/缩放天生可用；页头显示
+live 解码速率，含 prefill、历史均值与 MTP 接受率）：
 `python3 scripts/tools/monitor_kv_offload_web.py` → `http://127.0.0.1:8199/`。
 
 `CONFIG` 取自 `/proc/<pid>` 与 `vllm:cache_config_info`，`STATUS` 取自 `/metrics`，

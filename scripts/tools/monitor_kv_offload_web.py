@@ -90,6 +90,7 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
     note = ""
     tables: list[dict] = []
     bars: list[dict] = []
+    headline = "decode —"   # stays empty when /metrics is unreachable
 
     if metrics is None:
         note = f"{url}/metrics 不可达 —— vLLM 实例未运行或端口不对"
@@ -246,6 +247,62 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         if not tier_rows:
             tier_rows = [("—", "还没有 tiering 指标（尚未发生 offload）")]
 
+        # Throughput. The engine exports token *counters*, not a rate, so the
+        # live rate is the counter delta over one sampling interval; the first
+        # sample has no previous scrape, and dividing the whole history by the
+        # interval would be nonsense, so it is left empty there.
+        window_gen = delta("vllm:generation_tokens_total")
+        window_prompt = delta("vllm:prompt_tokens_total")
+        live = prev is not None
+        gen_count, gen_sum = hist("vllm:request_generation_tokens")
+        _, decode_sum = hist("vllm:request_decode_time_seconds")
+        avg_decode = (gen_sum / decode_sum) if (gen_sum and decode_sum) else None
+        window_draft = delta("vllm:spec_decode_num_draft_tokens_total")
+        window_accepted = delta("vllm:spec_decode_num_accepted_tokens_total")
+
+        def rate(value: float | None, suffix: str = "tok/s") -> str:
+            return f"{value:,.1f} {suffix}" if value is not None else "—"
+
+        throughput_rows = [
+            (
+                f"decode (live, {interval:g}s window)",
+                f"{rate(window_gen / interval if live else None)}"
+                f"   {fmt_int(window_gen) if live else '—'} tok in window",
+            ),
+            (
+                f"prefill (live, {interval:g}s window)",
+                f"{rate(window_prompt / interval if live else None)}"
+                f"   {fmt_int(window_prompt) if live else '—'} tok in window",
+            ),
+            (
+                "decode (finished requests)",
+                f"{rate(avg_decode)}"
+                f"   {fmt_int(gen_count)} reqs, {fmt_int(gen_sum)} tok"
+                f" in {decode_sum:,.1f}s"
+                if avg_decode
+                else "—",
+            ),
+        ]
+        if window_draft or window_accepted:
+            accepted = (
+                window_accepted / window_draft if window_draft else None
+            )
+            steps = max(window_gen - window_accepted, 1e-9)
+            per_step = 1 + window_accepted / steps
+            throughput_rows.append(
+                (
+                    "spec decode (MTP)",
+                    f"acceptance {ratio_pct(accepted)}"
+                    f"   ≈{per_step:.2f} tok/step (draft {fmt_int(window_draft)},"
+                    f" accepted {fmt_int(window_accepted)})",
+                )
+            )
+        headline = (
+            f"decode {window_gen / interval:,.1f} tok/s"
+            if live
+            else (f"decode {avg_decode:,.1f} tok/s (avg)" if avg_decode else "decode —")
+        )
+
         shm_used, shm_total, regions = shm
         staging = sum(size for size, _, _ in regions)
         procs = sum(count for _, count, _ in regions)
@@ -268,6 +325,7 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         ]
 
         tables = [
+            {"title": "Throughput", "rows": throughput_rows},
             {
                 "title": "Requests",
                 "rows": [
@@ -342,6 +400,7 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         "updated": time.strftime("%H:%M:%S", time.localtime(updated)),
         "interval": interval,
         "note": note,
+        "headline": headline,
         "config": [(str(k), str(v)) for k, v in config],
         "bars": bars,
         "tables": tables,
@@ -471,6 +530,7 @@ header { position:sticky; top:0; z-index:2; display:flex; gap:18px;
 h1 { margin:0; font-size:15px; letter-spacing:.4px; }
 h2 { margin:0 0 8px; font-size:11px; letter-spacing:1px; color:var(--dim);
      text-transform:uppercase; }
+.headline { color:var(--accent); font-weight:600; }
 .meta { color:var(--dim); }
 main { display:grid; gap:14px; padding:14px 16px 8px;
        grid-template-columns:repeat(auto-fit,minmax(360px,1fr));
@@ -501,6 +561,7 @@ footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
 <body>
 <header>
   <h1>KV Offload Monitor</h1>
+  <span class="headline" id="headline">…</span>
   <span class="meta" id="endpoint">…</span>
   <span class="meta" id="clock"></span>
   <label class="meta"><input type="checkbox" id="pause"> 暂停</label>
@@ -542,6 +603,7 @@ async function tick() {
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const v = await resp.json();
     period = Math.max(1000, (v.interval || 5) * 1000);
+    el("headline").textContent = v.headline || "";
     el("endpoint").textContent = v.endpoint;
     el("clock").textContent = `更新 ${v.updated} · tick ${v.tick}`;
     el("note").textContent = v.note || "";
@@ -625,14 +687,50 @@ def self_test() -> int:
     empty = build_view(
         cfg, None, None, [], (0, 0, []), DiskChunks(), None, "http://x", 5.0, 1, now
     )
+    # Throughput needs two scrapes: 100 -> 300 generation tokens in 5s = 40/s.
+    before = Metrics(
+        "vllm:generation_tokens_total 100\n"
+        "vllm:prompt_tokens_total 10\n"
+    )
+    after = Metrics(
+        "vllm:generation_tokens_total 300\n"
+        "vllm:prompt_tokens_total 10\n"
+        "vllm:request_generation_tokens_count 2\n"
+        "vllm:request_generation_tokens_sum 200\n"
+        "vllm:request_decode_time_seconds_count 2\n"
+        "vllm:request_decode_time_seconds_sum 4\n"
+        "vllm:spec_decode_num_draft_tokens_total 60\n"
+        "vllm:spec_decode_num_accepted_tokens_total 30\n"
+    )
+    rate_view = build_view(
+        cfg, after, before, [(0, 1, 2)],
+        (10, 20, [(5, 1, "/dev/shm/vllm_offload_e.mmap")]),
+        disk, {"path": "log", "errors": 0, "last": "-"}, "http://x", 5.0, 2, now,
+    )
+    def table_of(view_, title):
+        return {t["title"]: t for t in view_["tables"]}[title]
+
+    rates = dict(table_of(rate_view, "Throughput")["rows"])
+    live_row = rates["decode (live, 5s window)"]
+    first_live = table_of(view, "Throughput")["rows"][0][1]
+
     checks = [
         ("config_rows", len(view["config"]) >= 12),
+        ("throughput_live", "40.0 tok/s" in live_row and "200 tok in window" in live_row),
+        ("throughput_avg", "50.0 tok/s" in rates["decode (finished requests)"]),
+        ("throughput_mtp", "50.0%" in rates["spec decode (MTP)"]),
+        ("headline", rate_view["headline"] == "decode 40.0 tok/s"),
+        # With no previous scrape there is no window rate to report.
+        ("throughput_first_sample", first_live.startswith("—") and "tok/s" not in first_live),
         ("bars", [b["label"] for b in view["bars"]] == [
             "GPU KV cache", "CPU (primary) tier", "fs (disk) tier quota"]),
         ("gpu_frac", round(view["bars"][0]["frac"], 3) == 0.5),
-        ("tables", len(view["tables"]) == 5),
-        ("external_hits", "60 / 100" in view["tables"][1]["rows"][1][1]),
-        ("tier_row", view["tables"][3]["rows"][0][0] == "1:fs"),
+        ("tables", len(view["tables"]) == 6),
+        (
+            "external_hits",
+            "60 / 100" in dict(table_of(view, "Cache")["rows"])["external (offload)"],
+        ),
+        ("tier_row", table_of(view, "Tiering")["rows"][0][0] == "1:fs"),
         ("chunk_row", view["chunks"]["rows"][0][1] == "1.0 KiB"),
         ("degraded_note", bool(empty["note"]) and empty["tables"] == []),
         ("page_self_contained", "http://" not in PAGE and "https://" not in PAGE

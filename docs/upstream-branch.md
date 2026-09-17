@@ -375,12 +375,19 @@ python3 scripts/tools/monitor_kv_offload_web.py --self-test
 | 端点 | 内容 |
 |---|---|
 | `GET /` | 面板页：CONFIG / STATUS / CHUNKS ON DISK / LOG 四张卡片，进度条 + 刷新时钟 + 暂停勾选 |
-| `GET /api/view` | 页面消费的结构化数据（config 行、bars、tables、chunks、log） |
+| `GET /api/view` | 页面消费的结构化数据（headline、config 行、bars、tables、chunks、log） |
 | `GET /api/snapshot` | 原始采样，形状与终端版 `--json` 一致（指标系列 + proc/disk/shm/gpu） |
 | `GET /healthz` | 存活探测 |
 
 - **采样在后端**：后台线程每 `-d` 秒采一次并缓存，所有浏览器共用同一份，所以"本 tick 增量"
   （如 `last 3s: +N hits`）不会因为多开页面互相稀释；页面只定时 `fetch('/api/view')`。
+- **吞吐**：页头给 live 解码速率，`Throughput` 表给 `decode/prefill (live, N秒窗口)`（取
+  `vllm:generation_tokens_total` / `vllm:prompt_tokens_total` 的窗口增量 ÷ 采样间隔 —— 引擎
+  只导出计数器，没有瞬时速率指标）、`decode (finished requests)`（`request_generation_tokens_sum
+  ÷ request_decode_time_seconds_sum`，历史均值，可用来判断当前波动）与 `spec decode (MTP)`
+  接受率及 `≈N tok/step`。第一帧没有上一个采样点，窗口速率显示 `—` 而不是拿全部历史除以间隔。
+  实测（500K 档、单请求）：live **54.0 tok/s**（4 s 窗口 216 tok），独立测量 56.2 tok/s，
+  历史均值 46.6 tok/s（16 请求 / 64.4 s），MTP 接受率 68.1% → ≈3.04 tok/step。
 - 默认只绑 `127.0.0.1`（payload 含本机路径）；远端用 SSH 隧道
   `ssh -L 8199:127.0.0.1:8199 <host>`。`--host 0.0.0.0` 无鉴权，启动时会打印警告。
 - 只读：只对 vLLM 发 GET，只读 `/proc`、`/dev/shm`、`/proc/meminfo`、`nvidia-smi` 与磁盘层文件。
