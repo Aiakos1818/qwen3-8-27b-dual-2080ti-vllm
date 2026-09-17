@@ -91,10 +91,10 @@ tilelang 降级回去。
 | 脚本 | 用途 |
 |---|---|
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 基础 profile：500.8K 上下文，无 offload，9.6e9 池 |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx15.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 15 条链的环），**本文主要验证对象** |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 4 条链的环），**本文主要验证对象** |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | 500K + 纯 RAM offload（CPU 层即 store，2 条链） |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 500K + RAM staging（1 条链）+ 磁盘 4 条链的环 |
-| `config/vllm-128k-RAMx1-SSDx15.env.example` | 128K profile 的配置模板 |
+| `config/vllm-128k-RAMx1-SSDx4.env.example` | 128K profile 的配置模板 |
 
 profile 命名规律：`<模型>_<量化>_<上下文>[_RAMx<N>[_SSDx<M>]]` —— 后缀即容量
 （`<N>` 个满长上下文常驻 RAM / `<M>` 个在磁盘上成环）；文件名与容量一一对应，

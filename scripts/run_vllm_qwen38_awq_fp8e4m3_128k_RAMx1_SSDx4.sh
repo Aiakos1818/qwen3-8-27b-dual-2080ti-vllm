@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 128K context, tiered KV offload:
-# RAM holds ONE full context (promotion staging), the disk holds FIFTEEN.
+# RAM holds ONE full context (promotion staging), the disk holds FOUR.
 #
 # Purpose: validate upstream's tiered offload on SM75 at a realistic context.
 # The GPU pool holds ~1.1x of one full 128K request, so a second session
@@ -15,7 +15,7 @@
 # sticky-error fix in vllm/v1/kv_offload/cpu/gpu_worker.py (commit bf78fc276)
 # — without it the JIT warmup dies with "CUDA error: invalid argument".
 #
-# Paths / model come from .env (copy config/vllm-128k-RAMx1-SSDx15.env.example).
+# Paths / model come from .env (copy config/vllm-128k-RAMx1-SSDx4.env.example).
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
@@ -64,13 +64,13 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # Disk tier. VLLM_SSD_MAX_BYTES caps what the tier keeps on disk: past the
 # budget the least recently restored blocks are evicted (LRU by file mtime), so
 # the directory can never fill the filesystem (0 = no cap, upstream behavior).
-# 15 full-length 128K contexts = 68.6 GB (~64 GiB), which is what this profile
-# was sized to before the budget existed.
+# Four full-length 128K contexts = 18.3 GB (~17 GiB): the newest four sessions
+# (or prompt variants) stay restorable while older ones age out of the ring.
 # The directory is kept across restarts (the budget reclaims what it needs, and
 # the eviction order is read back from the files' mtimes). Set
 # VLLM_SSD_CLEAN_START=1 to wipe it for a fresh start.
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
-: "${VLLM_SSD_MAX_BYTES:=$(( 15 * CHAIN_BYTES ))}"
+: "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
 : "${VLLM_SSD_CLEAN_START:=0}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
@@ -79,7 +79,7 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # choice for offload: the disk tier is best-effort, and 0-hit degradation beats
 # an aborted request.
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
-: "${KV_ENGINE_ID:=qwen38-27b-128k-RAMx1-SSDx15}"
+: "${KV_ENGINE_ID:=qwen38-27b-128k-RAMx1-SSDx4}"
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -132,12 +132,67 @@ if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
 fi
 vllm_clean_shm_staging "$KV_ENGINE_ID"
 
-# A chain only restores if it fits in the CPU tier while it is promoted.
+# --- sizing self-checks ----------------------------------------------------
+# Measured bytes per pooled token for this model/layout (fp8_e4m3, TP2, MTP=3).
+POOL_BYTES_PER_TOKEN=18278
+gib() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
+
 TIER_CHUNKS=$(( CPU_BYTES_TO_USE / CHUNK_BYTES ))
+SSD_CHAINS=$(( VLLM_SSD_MAX_BYTES / CHAIN_BYTES ))
+POOL_TOKENS=$(( KV_CACHE_MEMORY_BYTES / POOL_BYTES_PER_TOKEN ))
+
+echo "[profile] context=$MAX_MODEL_LEN  chain=$CHAIN_CHUNKS chunks ($(gib "$CHAIN_BYTES") GiB)"
+echo "[profile] staging=$TIER_CHUNKS chunks ($(gib "$CPU_BYTES_TO_USE") GiB)"
+echo "[profile] disk ring ~$SSD_CHAINS contexts ($(gib "$VLLM_SSD_MAX_BYTES") GiB)"
+echo "[profile] GPU pool ~$POOL_TOKENS tokens"
+
+problems=0
 if [ "$TIER_CHUNKS" -lt "$CHAIN_CHUNKS" ]; then
-  echo "[warn] CPU staging holds ~$TIER_CHUNKS chunks but a ${MAX_MODEL_LEN}-token" >&2
-  echo "       chain needs $CHAIN_CHUNKS: restores past ~$((TIER_CHUNKS * 1600)) tokens" >&2
-  echo "       will yield 0 hits (raise CPU_BYTES_TO_USE)." >&2
+  echo "[warn] CPU staging holds $TIER_CHUNKS chunks but a full chain needs" >&2
+  echo "       $CHAIN_CHUNKS: restores of a full-length prompt would yield 0 hits" >&2
+fi
+if [ "$SSD_CHAINS" -lt 4 ]; then
+  echo "[warn] disk budget holds ~$SSD_CHAINS full context(s); the profile targets 4" >&2
+  echo "       (raise VLLM_SSD_MAX_BYTES)" >&2
+fi
+if [ "$POOL_TOKENS" -lt "$MAX_MODEL_LEN" ]; then
+  echo "[warn] GPU pool ~$POOL_TOKENS tokens < MAX_MODEL_LEN: a full-length request" >&2
+  echo "       may not fit (raise KV_CACHE_MEMORY_BYTES)" >&2
+fi
+
+# The staging is a pre-faulted mmap of /dev/shm: a tmpfs that is too small fails
+# mid-startup, so refuse early with an actionable message.
+SHM_BYTES=$(df -B1 --output=size /dev/shm 2>/dev/null | tail -1)
+if [ -z "${SHM_BYTES:-}" ] || [ "$SHM_BYTES" -lt "$CPU_BYTES_TO_USE" ]; then
+  echo "[error] /dev/shm is $(gib "${SHM_BYTES:-0}") GiB but the staging needs" >&2
+  echo "        $(gib "$CPU_BYTES_TO_USE") GiB. With root:" >&2
+  echo "        mount -o remount,size=$(( CPU_BYTES_TO_USE / 1048576 + 2048 ))M /dev/shm" >&2
+  problems=$((problems + 1))
+fi
+AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+# Staging + 4 GiB for the engine, the page cache and the OS.
+NEED_KB=$(( CPU_BYTES_TO_USE / 1024 + 4 * 1024 * 1024 ))
+if [ "${AVAIL_KB:-0}" -lt "$NEED_KB" ]; then
+  echo "[error] MemAvailable $(gib "$(( ${AVAIL_KB:-0} * 1024 ))") GiB < staging + 4 GiB" >&2
+  echo "        ($(gib "$(( NEED_KB * 1024 ))") GiB): the staging is pre-faulted, so" >&2
+  echo "        startup would fail or OOM-kill" >&2
+  problems=$((problems + 1))
+fi
+MEMLOCK_KB=$(ulimit -l)
+if [ "$MEMLOCK_KB" != "unlimited" ] && [ "$MEMLOCK_KB" -lt $(( CPU_BYTES_TO_USE / 1024 )) ]; then
+  echo "[warn] RLIMIT_MEMLOCK=$(gib "$(( MEMLOCK_KB * 1024 ))") GiB < staging: host" >&2
+  echo "       registration fails and DMA stays unpinned (needs commit bf78fc276);" >&2
+  echo "       keep RAM headroom so the staging is never swapped out" >&2
+fi
+
+if [ "$problems" -gt 0 ] && [ "${ALLOW_UNSAFE_LAUNCH:-0}" != "1" ]; then
+  echo "[error] refusing to launch ($problems sizing check(s) failed);" >&2
+  echo "        set ALLOW_UNSAFE_LAUNCH=1 to start anyway" >&2
+  exit 1
+fi
+if [ "${CHECK_ONLY:-0}" = "1" ]; then
+  echo "[profile] CHECK_ONLY=1: sizing checks done, not launching"
+  exit 0
 fi
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
