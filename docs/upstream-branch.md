@@ -285,10 +285,18 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 不合格**拒绝启动**（exit 1），`CHECK_ONLY=1` 只检查不启动，`ALLOW_UNSAFE_LAUNCH=1` 强制放行。
 停实例用 `scripts/tools/stop_server.sh <port>`（`--port`/位置参数，`--list` 列出所有实例的
-pid/端口/engine/model，`--dry-run` 只打印计划不发信号，`--clean-shm` 顺带回收该实例的 staging）：
+pid/端口/engine/model，`--dry-run` 只打印计划不发信号，**默认回收该实例的 staging 文件**，
+`--no-clean-shm` 可关闭）：
 它按端口找到监听进程（`ss` 优先，退回扫描 `/proc/*/cmdline`，不用会自匹配的 `pgrep -f`），
 先 TERM 主进程让其自行收尾，10 s 后升级为整组 TERM，再不行 KILL，最后校验进程与端口都已释放。
 **显式 `--port` 优先于 `.env` 的 `PORT`**（否则会把"测试不存在端口"变成真杀生产实例 —— 实测踩过）。
+
+**为什么必须显式删 staging**：本分支**不会** unlink 这个文件（启动日志只有
+`Created/Opened existing mmap file`，从来没有 `Unlinked mmap file`，源码里 unlink 只在给了 barrier
+的路径上），所以它是真实文件、进程结束后仍然存在，**且继续占着 tmpfs 的页（即内存）**：实测停掉
+128K 实例后 `/dev/shm` 仍是 `used=4.3 GiB`，删掉该文件立刻回到 `used=0 / 7.8 GiB`。因此
+profile 启动前只清**同名**文件（换 engine id 就清不到），而 `stop_server.sh` 现在默认按该实例
+cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 
 `/dev/shm` 清理策略：**只删自己 engine id 的陈旧文件**（且该文件没有进程映射时）；别的实例的文件
 一律不动 —— 空间不够就报错并点名持有者，由人决定。

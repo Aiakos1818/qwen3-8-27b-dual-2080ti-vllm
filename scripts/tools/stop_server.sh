@@ -14,8 +14,16 @@
 #   stop_server.sh --port 8001 --dry-run  # show what would be killed, send nothing
 #   stop_server.sh --list                 # every running vLLM instance
 #   stop_server.sh 8001 --force           # skip the graceful SIGTERM wait
-#   stop_server.sh 8001 --clean-shm       # also drop its stale /dev/shm staging
+#   stop_server.sh 8001 --no-clean-shm    # keep its /dev/shm staging file
 #   stop_server.sh --pid 12345            # stop exactly this pid
+#
+# The CPU offload region is a real file in /dev/shm (/dev/shm/vllm_offload_<id>.mmap,
+# one CPU_BYTES_TO_USE-sized object). This branch never unlinks it -- the startup
+# log says "Created/Opened existing mmap file" and never "Unlinked mmap file" --
+# so it survives the process and keeps holding tmpfs (and therefore RAM) until
+# somebody removes it. Stopping therefore removes this instance's own file by
+# default, and prints the /dev/shm usage before/after so the freed space is
+# visible; files belonging to other instances are never touched.
 #
 # --dry-run prints the pid, its process group, every member and the signal that
 # would be sent -- nothing is executed -- so you can confirm the target first.
@@ -33,7 +41,7 @@ ARG_PORT=
 PID=
 DRY=0
 FORCE=0
-CLEAN_SHM=0
+CLEAN_SHM=1
 TIMEOUT=30
 MODE=stop
 
@@ -49,6 +57,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --force|-f) FORCE=1; shift ;;
     --clean-shm) CLEAN_SHM=1; shift ;;
+    --no-clean-shm) CLEAN_SHM=0; shift ;;
     --list) MODE=list; shift ;;
     -h|--help) usage; exit 0 ;;
     ''|*[!0-9]*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -187,6 +196,10 @@ if [ "$group_safe" = 1 ]; then
 else
   echo "[stop] plan: SIGTERM $PID, then its descendants, then SIGKILL"
 fi
+if [ "$CLEAN_SHM" = 1 ]; then
+  echo "[stop] plan: remove /dev/shm/vllm_offload_${ENGINE:-<no engine_id>}.mmap"
+          # (after the processes are gone; skipped if another process maps it)
+fi
 
 if [ "$DRY" = 1 ]; then
   echo "[stop] --dry-run: nothing was signalled"
@@ -281,10 +294,29 @@ if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$PORT" 2>/dev/null | grep
 fi
 echo "[stop] stopped (port $PORT free)"
 
-if [ "$CLEAN_SHM" = 1 ] && [ -n "$ENGINE" ]; then
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/shm_staging.sh"
-  vllm_clean_shm_staging "$ENGINE"
-  echo "[stop] /dev/shm staging for $ENGINE handled (skipped if still mapped)"
+shm_report() {  # "used / total (free)" in GiB, straight from df
+  # mawk has no `**` operator, so divide by the literal.
+  df -B1 /dev/shm 2>/dev/null | awk 'NR == 2 {
+    printf "%.1f / %.1f GiB (%.1f free)", $3 / 1073741824, $2 / 1073741824, \
+           $4 / 1073741824
+  }'
+}
+
+echo "[stop] /dev/shm after stop: $(shm_report)"
+if [ "$CLEAN_SHM" = 1 ]; then
+  if [ -z "$ENGINE" ]; then
+    echo "[stop] cmdline carries no engine_id; /dev/shm left alone"
+  else
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/shm_staging.sh"
+    vllm_clean_shm_staging "$ENGINE"
+    if [ -e "/dev/shm/vllm_offload_${ENGINE}.mmap" ]; then
+      echo "[stop] staging file still present (mapped by another process?)"
+    else
+      echo "[stop] staging file gone; /dev/shm now: $(shm_report)"
+    fi
+  fi
+else
+  echo "[stop] --no-clean-shm: staging file (if any) left in place"
 fi
 exit 0

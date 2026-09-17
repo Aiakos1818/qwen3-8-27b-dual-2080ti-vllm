@@ -128,6 +128,7 @@ bash scripts/tools/wait_server.sh logs/server.log 600
 bash scripts/tools/stop_server.sh --list              # 列出所有实例：pid / 端口 / engine / model
 bash scripts/tools/stop_server.sh 8000                # 停 8000（先 TERM 主进程，必要时升级整组，最后 KILL）
 bash scripts/tools/stop_server.sh --port 8001 --dry-run   # 只打印将会杀谁，不发信号
+# 默认顺带删掉该实例的 /dev/shm/vllm_offload_<engine_id>.mmap 并打印前后用量（--no-clean-shm 可关）
 ~~~
 
 起来之后用只读看板盯 KV / offload 的实时状态（不需要 dev-mode，只用标准库）：
