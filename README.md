@@ -63,7 +63,7 @@ docs/         打补丁、加速组件与上游分支记录
 patches/      已验证工作树导出的 vLLM / FlashQLA patch
 scripts/      启动 profile 与硬件检查
 scripts/setup/  硬件与依赖准备
-scripts/tools/  启动看护、池容量测算、KV offload 信息面板（终端 + 浏览器）
+scripts/tools/  启动看护 / 精准停止、池容量测算、KV offload 信息面板（终端 + 浏览器）
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
 reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
@@ -120,6 +120,14 @@ bash scripts/run_qwen3.8_27b_sm75.sh
 bash scripts/tools/wait_server.sh logs/server.log 600
 # 0 = ready  1 = 出错（并打印命中的那一行）  2 = 超时
 # 端口默认取 .env 的 PORT（其次 8000）
+~~~
+
+停实例按**端口**精准定位，只动它的进程树（多实例共存时不会误杀）：
+
+~~~bash
+bash scripts/tools/stop_server.sh --list              # 列出所有实例：pid / 端口 / engine / model
+bash scripts/tools/stop_server.sh 8000                # 停 8000（先 TERM 主进程，必要时升级整组，最后 KILL）
+bash scripts/tools/stop_server.sh --port 8001 --dry-run   # 只打印将会杀谁，不发信号
 ~~~
 
 起来之后用只读看板盯 KV / offload 的实时状态（不需要 dev-mode，只用标准库）：

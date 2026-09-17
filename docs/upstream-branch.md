@@ -284,6 +284,12 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 | memlock、cgroup 余量 | warn（不阻断，与 vLLM 自身语义一致） |
 
 不合格**拒绝启动**（exit 1），`CHECK_ONLY=1` 只检查不启动，`ALLOW_UNSAFE_LAUNCH=1` 强制放行。
+停实例用 `scripts/tools/stop_server.sh <port>`（`--port`/位置参数，`--list` 列出所有实例的
+pid/端口/engine/model，`--dry-run` 只打印计划不发信号，`--clean-shm` 顺带回收该实例的 staging）：
+它按端口找到监听进程（`ss` 优先，退回扫描 `/proc/*/cmdline`，不用会自匹配的 `pgrep -f`），
+先 TERM 主进程让其自行收尾，10 s 后升级为整组 TERM，再不行 KILL，最后校验进程与端口都已释放。
+**显式 `--port` 优先于 `.env` 的 `PORT`**（否则会把"测试不存在端口"变成真杀生产实例 —— 实测踩过）。
+
 `/dev/shm` 清理策略：**只删自己 engine id 的陈旧文件**（且该文件没有进程映射时）；别的实例的文件
 一律不动 —— 空间不够就报错并点名持有者，由人决定。
 
