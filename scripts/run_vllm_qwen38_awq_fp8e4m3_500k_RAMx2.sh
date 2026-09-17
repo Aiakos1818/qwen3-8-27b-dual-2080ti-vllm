@@ -112,6 +112,9 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_QWOPUS_MTP_BF16_DRAFT="${VLLM_QWOPUS_MTP_BF16_DRAFT:-1}"
 export VLLM_SM75_SPEC_SYNC_MODE="${VLLM_SM75_SPEC_SYNC_MODE:-safe}"
+# Verify spec drafts on the native FlashInfer decode path so speculative
+# decode keeps full cudagraphs (SM75 has no fused GDN decode / TRT-LLM).
+export VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE="${VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE:-1}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # API auth: inherit VLLM_API_KEY from the environment (empty = no auth).
 export VLLM_API_KEY="${VLLM_API_KEY:-}"
