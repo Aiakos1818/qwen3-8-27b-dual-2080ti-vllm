@@ -321,8 +321,28 @@ python3 scripts/tools/monitor_kv_offload.py                 # :8000，5s 刷新
 python3 scripts/tools/monitor_kv_offload.py --port 8001 -d 2
 python3 scripts/tools/monitor_kv_offload.py --once
 python3 scripts/tools/monitor_kv_offload.py --json --count 5 # 每 tick 一行 JSON
+python3 scripts/tools/monitor_kv_offload.py --append --count 3 # 逐帧完整输出（写日志用）
+python3 scripts/tools/monitor_kv_offload.py --self-test       # 校验终端接管与整屏重画
 python3 scripts/tools/monitor_kv_offload.py --no-chunks --log 'logs/server_128k_*.log'
 ~~~
+
+**像 vim 一样接管屏幕，但只读**：终端上进入 alternate screen（`\033[?1049h`，你原来的回滚缓冲
+不会被写脏）、隐藏光标（`\033[?25l`）、把 tty 设为 cbreak —— 于是**按键既不回显也不被读取**，
+只查看；`Ctrl-C` 是唯一出口，退出时还原光标与终端属性（`TCSAFLUSH` 顺带丢掉这期间敲的键），
+`SIGTERM`/`SIGHUP` 也会走同一套还原。`SIGWINCH` 唤醒等待循环，改窗口大小 0.2 s 内重画而不是
+等满一个间隔。
+
+**整屏重画（已撤掉差量原位重绘）**：shell 的画面已经被 alternate screen 换走，差量重绘要保护的
+东西不复存在，而它的逐行记账正是滚动/改窗口时错位的来源。现在每 tick 就是 `\033[H\033[J` +
+整帧、一次 flush 写出；行宽仍设上限（`--width`，默认 `终端列数-1`）以免换行改变帧的实际高度。
+stdout 不是终端、或显式 `--append`/`--json` 时，退回"逐帧完整文本"，**完全不含转义序列**，
+便于重定向与抓取。
+
+实测（`-d 1 --count 3 --no-chunks`，伪终端下抓字节流）：开头 `\033[?1049h\033[?25l`、结尾
+`\033[?25h\033[?1049l`，`\033[H\033[J` 次数 = 帧数（3），相对光标移动 **0** 次；每帧 ≈2.9 KB（整帧，按 5 s 间隔
+可以忽略；差量版曾是 554 B / 97 B）。`kill -TERM` 中途打断同样以还原序列结尾；管道输出 41 行、**0 个 ESC**。
+`--self-test` 校验进入/退出序列成对且光标恢复、每帧整屏重画、禁用终端时不写任何东西、
+非 tty 输出无转义。
 
 计数器显示 `累计 (+本 tick 增量)`；tier 标签直接取自引擎（`0:primary`、`1:fs`…）。`--json` 的每
 行含 `config / metrics / gpus / shm / disk / log`，便于脚本化告警。

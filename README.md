@@ -131,7 +131,9 @@ python3 scripts/tools/monitor_kv_offload.py --json --count 5
 ~~~
 
 `CONFIG` 取自 `/proc/<pid>` 与 `vllm:cache_config_info`，`STATUS` 取自 `/metrics`，
-`CHUNKS` 取自磁盘层目录（说明见 docs/upstream-branch.md §5.7）。
+`CHUNKS` 取自磁盘层目录。终端上**像 vim 一样接管屏幕**（alternate screen、光标隐藏、
+**只读不接收按键**，`Ctrl-C` 退出并还原终端；`--append` 退回逐帧文本、`--json` 出 JSON 行，
+`--self-test` 自校验）。说明见 docs/upstream-branch.md §5.7。
 
 ### 5. 启动排障（本机实测）
 
