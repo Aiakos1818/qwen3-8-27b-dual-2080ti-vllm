@@ -234,7 +234,20 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
 | 4.6e9（82 chunks） | 是 | **118,400 / 120,000（98.7%）** | **5 s** |
 
 即 staging 配小了不是"没效果"，而是**净亏 I/O**；profile 已内置启动自检，装不下一条满长链
-时会打印 `[warn]`。完整记录（含 10K/40K 小尺度数据、`cudaHostRegister` 粘性错误与对应补丁）
+时会打印 `[warn]`。
+
+另外两点来自实测：
+
+- **磁盘层没有回收机制**：上游 fs 二级层无配额、无 TTL、无淘汰删除，占用随累计 spill 单调
+  增长（约 **4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时清空。
+  外部清理**必须在服务停止时做**，否则索引与磁盘不一致会触发 load 失败。
+- **写满不会崩、也不会中止请求**：只是 offload 静默失效 + 持续刷
+  `Job N block I/O failed`，每个请求退化为全量重算。profile 已把
+  `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail` 会中止受影响请求）。
+
+> 排查提示：单请求下 A→B→A 的第三次可能被 **GPU 前缀缓存**冒领（实测出现过
+> 118,400/120,000、3 s 的"假恢复"）；判断命中来源要看 `tiering_*` 指标，不能只看
+> `cached_tokens`。完整记录（含 10K/40K 小尺度数据、`cudaHostRegister` 粘性错误与对应补丁）
 见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 ## 跑通后的性能验收

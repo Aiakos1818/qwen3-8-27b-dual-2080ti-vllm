@@ -173,6 +173,39 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 对应的启动自检：脚本在 `CPU_BYTES_TO_USE` 装不下一条满长链时会打印 `[warn]`
 （避免这种静默 0 收益）。
 
+### 5.4 磁盘层写满时的行为（实测）
+
+磁盘层**没有任何回收机制**（见 §6）。把 128K profile 的 `VLLM_SSD_ROOT` 指到 1.6 GB
+的 tmpfs 让它真实写满（一条 120K 链约需 4.5 GB）：
+
+| 观察 | 结果 |
+|---|---|
+| 写失败形态 | `ERROR [thread_pool.py:181] Job N block I/O failed: [Errno 5] Input/output error: '<path>'`，每个新请求持续出现（本轮 **324 次**） |
+| 写入撞停点 | **1.615 GB**（tmpfs 98%） |
+| 进行中的请求 | **不受影响**，正常返回 |
+| 后续复用 | 退化为**全量重算**（132~133 s，与冷启一致）；磁盘层仍有少量命中（43 chunk / 2.4 GB 读），但请求侧收益≈0 |
+| 请求被中止 / 短读 / load 失败 | **0 / 0 / 0** |
+
+即：**写满不会崩、不会中止请求，只是 offload 静默失效并持续刷 ERROR 日志**。
+（本机只能在 tmpfs 上触发，errno 是 `EIO` 而非 `ENOSPC`，代码路径相同：
+`batch_store_block` 抛 OSError → `thread_pool.py:181` 记录 → job 失败。）
+
+由此得到两条运维约束：
+
+1. **回收只能靠重启或停机清理**：磁盘层没有 TTL/淘汰，`VLLM_SSD_CLEAN_START=1` 在启动时
+   清空整个目录；**外部清理必须在服务停止时做** —— 运行中删文件会让索引与磁盘不一致，
+   可能触发 load 失败。
+2. **把 `VLLM_SSD_ROOT` 放到有配额的文件系统**，隔离写满对同分区其他数据的影响。
+
+profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`，即中止受影响的
+请求）：磁盘层是尽力而为的，退化为重算优于报错。注意本轮**没有触发 load 失败路径**（写失败
+的 chunk 在索引里直接是 MISS），所以两种策略的差异目前只有代码路径支撑
+（`vllm/v1/core/sched/scheduler.py` 的 "Failing N request(s) due to KV load failure"）。
+
+> **排查提示**：单请求场景下 A→B→A 的第三次很容易被 **GPU 前缀缓存**冒领 —— 实测出现过
+> 118,400/120,000、3 s 的"假恢复"，其实是 A 的块还在 GPU 池里，与磁盘无关。判断命中来源
+> 必须看 `tiering_*` 指标，不能只看 `cached_tokens`。
+
 ---
 
 ## 6. 已知问题与注意事项
@@ -180,7 +213,7 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 | 问题 | 说明 / 处置 |
 |---|---|
 | `RLIMIT_MEMLOCK = 8192 KB`（软硬同） | 无法在不提权的情况下调高（`sudo -n` 要密码；`systemd-run --user -p LimitMEMLOCK=infinity` 报 Unknown assignment）。靠 §5.1 的补丁降级运行 |
-| 磁盘层没有配额参数 | 上游的 fs 二级层不支持配额/限速；磁盘层随工作集增长（实测一次测试就到 8.5–15 GB），长测试要盯 `du -sh ssd_kv` |
+| 磁盘层没有回收机制 | 上游 fs 二级层只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处）。占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。写满后的行为见 §5.4 |
 | 磁盘层目录随 `engine_id` | 不固定 `engine_id` 时每次启动都新目录（孤儿累积）；128K profile 固定为 `qwen38-27b-128k-ssd` 并在启动前清空 |
 | `flash_qla` 依赖钉死导致 pip 冲突 | 已修：`setup.py` 放宽为 `>=` 并重装 editable（§3）；启动脚本仍设 `PYTHONPATH`，但已非必需 |
 | `scripts/tools/kv_pool_sizing.py` 原先解析不了本仓库全部 profile | 已修（见下） |
@@ -197,5 +230,7 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 ## 7. 待办与未覆盖
 
 1. 两个 `sm75-upstream`（vLLM 仓库 / 本仓库）都**未推送**到任何远端。
-2. offload 尚未压测的场景：磁盘层长期增长与驱逐（上游无配额参数）、池接近满时的恢复、
-   `max-num-seqs > 1` 的并发、pinned 与 unpinned DMA 的性能差、多轮 restore 的长时间稳定性。
+2. offload 尚未覆盖：**池接近满时的恢复**（最高优先，唯一可能 stall 的路径）、多轮
+   offload/restore 的长时间稳定性、`max-num-seqs > 1` 的并发，以及 pinned / unpinned DMA
+   的性能差（后者要 root 或 ≤8 MB 的 staging，实际做不了）。
+   磁盘层写满的行为已在 §5.4 实测。
