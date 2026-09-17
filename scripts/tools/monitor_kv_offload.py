@@ -24,49 +24,27 @@ per-request inventory endpoint, so only aggregate occupancy exists for the GPU
 and CPU tiers. The disk tier *is* introspectable, because it is
 hash-addressed: the CHUNKS block lists the real parked chunks by rank/group.
 
-On a terminal the panel takes over the screen the way vim does: it switches to
-the alternate screen buffer (the shell's scrollback is left untouched), hides the
-cursor and puts the tty in cbreak mode, and it is view-only -- keystrokes are
-neither echoed nor read, so Ctrl-C is the only way out. The terminal is restored
-on the way out, including on SIGTERM/SIGHUP. Inside that screen each tick simply
-homes the cursor, clears and writes the whole frame: with the shell's screen out
-of the way there is nothing to protect, and no per-row bookkeeping is needed.
-When stdout is not a terminal, or with --append / --json, whole frames are
-emitted instead and no escape sequences are written at all.
-
 Usage:
-  monitor_kv_offload.py                    # :8000, 5s refresh, in-place redraw
+  monitor_kv_offload.py                    # :8000, 5s refresh
   monitor_kv_offload.py --port 8001 -d 2
   monitor_kv_offload.py --once
   monitor_kv_offload.py --json --count 5
-  monitor_kv_offload.py --append --count 3 # whole frames, for a log
   monitor_kv_offload.py --log 'logs/server_128k_RAMx1_SSDx4_*.log'
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import glob
-import io
 import json
 import math
 import os
 import re
-import shutil
-import signal
 import subprocess
 import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
-
-try:  # POSIX only; this deployment is Linux
-    import termios
-    import tty
-except ImportError:  # pragma: no cover
-    termios = None
-    tty = None
 
 # --------------------------------------------------------------------------
 # formatting helpers
@@ -800,9 +778,7 @@ def render_status(
             "",
             f"evictions {fmt_int(m.counter('vllm:kv_offload_tiering_fs_evictions') or 0)}"
             f" (+{fmt_int(d('vllm:kv_offload_tiering_fs_evictions'))})"
-            f"   evicted {fmt_bytes(
-                m.counter('vllm:kv_offload_tiering_fs_evicted_bytes') or 0
-            )}"
+            f"   evicted {fmt_bytes(m.counter('vllm:kv_offload_tiering_fs_evicted_bytes') or 0)}"
             f" (+{fmt_bytes(d('vllm:kv_offload_tiering_fs_evicted_bytes'))})"
             f"   skipped {fmt_bytes(
                 m.counter('vllm:kv_offload_tiering_fs_skipped_store_bytes') or 0
@@ -894,9 +870,8 @@ def render(
     interval: float,
     show_chunks: bool,
     chunk_lines: int,
-    width: int = 68,
-    view_only: bool = False,
-) -> list[str]:
+) -> str:
+    width = 68
     now = time.strftime("%H:%M:%S")
     title = " KV Offload Monitor "
     fixed = len(title) + len(now) + 1
@@ -916,190 +891,9 @@ def render(
         "",
         " note: upstream has no per-request inventory, so GPU/CPU tiers are",
         "       aggregate-only; the disk tier's chunks are listed for real.",
+        "═" * width,
     ]
-    if view_only:
-        body.append(" keys: none (view-only) -- Ctrl-C quits and restores the screen")
-    body.append("═" * width)
-    return body
-
-
-# --------------------------------------------------------------------------
-# terminal
-# --------------------------------------------------------------------------
-
-
-class Screen:
-    """Full-frame repaint, one frame per tick.
-
-    On the alternate screen there is nothing to protect -- the shell's own screen
-    comes back intact on exit -- so a tick is just ``home`` + ``clear below`` +
-    the frame, written in a single flush. That removes the row bookkeeping the
-    previous differential redraw needed (and with it its scrolling and resize
-    edge cases): whatever the terminal did to the previous frame is irrelevant,
-    because the next one repaints from the same anchor.
-
-    ``width`` stays as a hard cap so a line can never wrap around and make the
-    frame taller than it looks. With a non-terminal stdout the frames are simply
-    appended, and no escape sequences are written at all.
-    """
-
-    HOME_CLEAR = "\033[H\033[J"
-
-    def __init__(self, interactive: bool, width: int = 0) -> None:
-        self.interactive = interactive
-        self.width = width
-        self.painted = False
-
-    def _fit(self, line: str) -> str:
-        if self.width and len(line) > self.width:
-            return line[: self.width]
-        return line
-
-    def draw(self, frame: list[str]) -> None:
-        frame = [self._fit(line) for line in frame]
-        if not self.interactive:
-            sys.stdout.write("\n".join(frame) + "\n")
-        else:
-            sys.stdout.write(self.HOME_CLEAR + "\n".join(frame))
-        sys.stdout.flush()
-        self.painted = True
-
-    def close(self, park: bool = True) -> None:
-        """Leave nothing behind: the alternate screen is restored by Terminal."""
-        if not self.interactive:
-            return
-        self.painted = False
-
-
-# --------------------------------------------------------------------------
-# terminal: alternate screen, hidden cursor, no input
-# --------------------------------------------------------------------------
-
-
-_RESIZED = False
-
-
-def _on_winch(signum, frame) -> None:  # noqa: ARG001
-    """Flag a resize; it must never interrupt a redraw mid-flight."""
-    global _RESIZED
-    _RESIZED = True
-
-
-def _on_fatal(signum, frame) -> None:  # noqa: ARG001
-    """SIGTERM/SIGHUP: unwind through the finally blocks before dying."""
-    raise SystemExit(128 + signum)
-
-
-class Terminal:
-    """A vim-like screen that shows the panel but reads no input.
-
-    Enters the alternate screen buffer (the shell's scrollback stays intact),
-    hides the cursor, and switches the tty to cbreak so stray typing is neither
-    echoed over the panel nor handed to the shell afterwards. Nothing is ever
-    read from stdin: Ctrl-C is the only exit, and the terminal is restored even
-    when the panel is interrupted or signalled.
-    """
-
-    ENTER = "\033[?1049h\033[?25l"
-    LEAVE = "\033[?25h\033[?1049l"
-
-    def __init__(self, enabled: bool, tty_fd: int | None = None) -> None:
-        self.enabled = enabled
-        self.tty_fd = tty_fd if enabled else None
-        self._settings = None
-
-    def __enter__(self) -> "Terminal":
-        if not self.enabled:
-            return self
-        if self.tty_fd is not None and termios is not None:
-            self._settings = termios.tcgetattr(self.tty_fd)
-            tty.setcbreak(self.tty_fd)
-        signal.signal(signal.SIGWINCH, _on_winch)
-        signal.signal(signal.SIGTERM, _on_fatal)
-        signal.signal(signal.SIGHUP, _on_fatal)
-        sys.stdout.write(self.ENTER)
-        sys.stdout.flush()
-        return self
-
-    def wait(self, seconds: float) -> None:
-        """Sleep, waking early on a resize so the repaint feels immediate."""
-        deadline = time.monotonic() + seconds
-        while not _RESIZED:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.2, remaining))
-
-    def __exit__(self, *exc_info) -> None:
-        if not self.enabled:
-            return
-        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGHUP, signal.SIG_DFL)
-        sys.stdout.write(self.LEAVE)
-        sys.stdout.flush()
-        if self._settings is not None:
-            # TCSAFLUSH drops whatever was typed while watching: this panel
-            # ignores input, and the shell should not receive it afterwards.
-            termios.tcsetattr(self.tty_fd, termios.TCSAFLUSH, self._settings)
-
-
-# --------------------------------------------------------------------------
-# self-test
-# --------------------------------------------------------------------------
-
-
-def self_test() -> int:
-    """Check the terminal handshake, the repaint shape and the width cap."""
-    frame = ["alpha", "beta", "gamma"]
-
-    interactive = io.StringIO()
-    with contextlib.redirect_stdout(interactive):
-        with Terminal(True) as terminal:
-            screen = Screen(True, width=0)
-            screen.draw(frame)
-            screen.draw(["alpha", "BETA", "gamma"])
-            screen.close(park=not terminal.enabled)
-    stream = interactive.getvalue()
-
-    quiet = io.StringIO()
-    with contextlib.redirect_stdout(quiet):
-        with Terminal(False):
-            pass
-    plain_buffer = io.StringIO()
-    with contextlib.redirect_stdout(plain_buffer):
-        screen = Screen(False, width=0)
-        screen.draw(frame)
-    plain = plain_buffer.getvalue()
-
-    narrow = io.StringIO()
-    with contextlib.redirect_stdout(narrow):
-        screen = Screen(True, width=4)
-        screen.draw(["truncated", "ok"])
-    clipped = narrow.getvalue()
-
-    checks = [
-        ("enter_screen", stream.startswith(Terminal.ENTER)),
-        ("hidden_cursor", "\033[?25l" in stream),
-        ("leave_last", stream.rstrip().endswith(Terminal.LEAVE)),
-        (
-            "single_enter_leave",
-            stream.count("\033[?1049h") == 1
-            and stream.count("\033[?1049l") == 1
-            and stream.count("\033[?25h") == 1,
-        ),
-        ("home_clear_twice", stream.count(Screen.HOME_CLEAR) == 2),
-        ("no_relative_moves", "\033[A" not in stream and "\033[B" not in stream),
-        ("final_frame", "alpha\nBETA\ngamma" in stream),
-        ("quiet_when_disabled", quiet.getvalue() == ""),
-        ("plain_frames", plain == "alpha\nbeta\ngamma\n" and "\033" not in plain),
-        ("width_cap", Screen.HOME_CLEAR + "trun\nok" == clipped),
-    ]
-    ok = True
-    for name, good in checks:
-        ok = ok and good
-        print(f"  self-test {name}: {'PASS' if good else 'FAIL'}")
-    return 0 if ok else 1
+    return "\n".join(body) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -1120,50 +914,22 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="print once and exit")
     ap.add_argument("--count", type=int, default=0, help="print N times (0 = forever)")
     ap.add_argument("--json", action="store_true", help="one JSON object per tick")
-    ap.add_argument(
-        "--append",
-        "--no-clear",
-        dest="append",
-        action="store_true",
-        help="print whole frames one after another instead of taking over the screen",
-    )
-    ap.add_argument(
-        "--width",
-        type=int,
-        default=0,
-        help="cap the line width (0 = terminal width, and no cap when appending)",
-    )
+    ap.add_argument("--no-clear", action="store_true", help="do not clear the screen")
     ap.add_argument("--no-chunks", action="store_true", help="hide the CHUNKS block")
     ap.add_argument(
         "--chunk-lines", type=int, default=6, help="how many disk chunks to list"
     )
     ap.add_argument("--ssd-root", default=None, help="disk tier root (default: from config)")
     ap.add_argument("--log", default=None, help="server log path/glob for an error count")
-    ap.add_argument("--self-test", action="store_true", help="verify the in-place redraw")
     args = ap.parse_args()
-
-    if args.self_test:
-        return self_test()
 
     url = args.url or f"http://localhost:{args.port}"
     count = 1 if args.once else args.count
 
-    # Take over the screen only on a terminal; piping to a file or --json keeps
-    # whole frames (and no escape sequences) so the output stays greppable.
-    interactive = sys.stdout.isatty() and not args.append and not args.json
-    columns = shutil.get_terminal_size((100, 40)).columns
-    cap = args.width or (max(40, columns - 1) if interactive else 0)
-    panel_width = min(68, cap) if cap else 68
-    screen = Screen(interactive, width=cap)
-    # cbreak needs stdin to be a terminal as well; the alternate screen on its
-    # own is already worth it, so a piped stdin only costs the no-echo part.
-    tty_fd = sys.stdin.fileno() if (interactive and sys.stdin.isatty()) else None
-
     prev: Metrics | None = None
     tick = 0
     start = time.time()
-    with Terminal(interactive, tty_fd=tty_fd) as terminal:
-      try:
+    try:
         while True:
             metrics = fetch_metrics(url)
             pid = args.pid or find_pid(args.port)
@@ -1208,11 +974,9 @@ def main() -> int:
                     flush=True,
                 )
             else:
-                columns = shutil.get_terminal_size((100, 40)).columns
-                screen.width = args.width or (
-                    max(40, columns - 1) if interactive else 0
-                )
-                screen.draw(
+                if not args.no_clear:
+                    sys.stdout.write("\033[H\033[2J")
+                sys.stdout.write(
                     render(
                         metrics,
                         prev,
@@ -1225,19 +989,17 @@ def main() -> int:
                         args.interval,
                         not args.no_chunks,
                         args.chunk_lines,
-                        panel_width,
-                        terminal.enabled,
                     )
                 )
+                sys.stdout.flush()
 
             prev = metrics
             if count and tick >= count:
                 break
-            terminal.wait(args.interval)
-      except KeyboardInterrupt:
-        pass
-      finally:
-        screen.close(park=not terminal.enabled)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        if not args.json:
+            print()
     return 0
 
 
