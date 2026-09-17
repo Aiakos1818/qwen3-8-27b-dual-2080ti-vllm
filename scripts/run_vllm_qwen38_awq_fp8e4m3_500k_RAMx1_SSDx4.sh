@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 500.8K context, tiered KV offload
-# (CPU staging primary + disk/fs secondary) — deployment profile for a 64 GB host.
+# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 500.8K context, tiered KV offload:
+# RAM holds ONE full-length context (promotion staging), the disk holds FOUR.
 #
 # Why a 64 GB host: a promoted chain is retained in the CPU tier and stays pinned
 # until the request consumes it, so the staging must hold one whole chain —
@@ -10,9 +10,18 @@
 # short of a single chain, 64 GB leaves it comfortable (32 GiB). Below the chain
 # size, restores of a full-length prompt silently yield 0 hits.
 #
-# Disk tier: a 3-chain ring. Past VLLM_SSD_MAX_BYTES the least recently restored
-# blocks are evicted (LRU by file mtime), so the directory can never fill the
-# partition; the newest three full-length sessions stay restorable.
+# Top rung of the three 500K profiles: 500k (GPU only, no offload) →
+# 500k_RAMx2 (CPU tier as the store, two contexts) → this one (RAM staging +
+# disk ring, the only rung that keeps several long sessions restorable).
+#
+# Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
+# restored blocks are evicted (LRU by file mtime), so the directory can never
+# fill the partition; the newest four full-length contexts stay restorable, and
+# the RAM tier only has to hold the one being promoted.
+#
+# Validated at the mechanism level on a small run (40K prompts, 61-chunk RAM
+# tier): A -> B -> A restored 94% in 3 s from the offload tier, and the disk
+# ring/byte budget behaves as documented in docs/upstream-branch.md 5.5.
 #
 # This profile targets the upstream-based branch (sm75-upstream) and uses only
 # upstream knobs: prefix caching plus upstream's tiered offload.
@@ -24,7 +33,7 @@
 # RAM headroom: an unpinned staging that gets swapped out destroys the restore
 # path.
 #
-# Paths / model come from .env (copy config/vllm-500k-ssd.env.example).
+# Paths / model come from .env (copy config/vllm-500k-RAMx1-SSDx4.env.example).
 # CHECK_ONLY=1 runs the sizing checks and exits without touching anything.
 set -Eeuo pipefail
 
@@ -44,6 +53,13 @@ fi
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${OMP_NUM_THREADS:=8}"
 
+# --- geometry (measured, one chunk per block) ------------------------------
+# 1600 tokens and ~55.8 MB per chunk (both ranks' shards); the engine derives the
+# real kv_bytes_per_chunk from the canonical layout, which lands slightly under
+# 55.8 MB, so chunk counts round up in our favour.
+CHUNK_TOKENS=1600
+CHUNK_BYTES=55800000
+
 # --- profile knobs ---------------------------------------------------------
 # Calibrate to the "GPU KV cache size" line after a launch;
 # scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
@@ -52,13 +68,16 @@ fi
 : "${MAX_MODEL_LEN:=500800}"
 : "${KV_CACHE_MEMORY_BYTES:=9600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Staging: one whole chain (313 chunks) plus ~10% headroom. Costs /dev/shm and
-# RAM in full — it is pre-faulted before the engine starts.
-: "${CPU_BYTES_TO_USE:=19200000000}"
+# Staging: exactly one full-length context (313 chunks). It only has to hold the
+# chain being promoted, so no headroom is needed; every stored context also lives
+# on disk. Costs /dev/shm and RAM in full — pre-faulted before the engine starts.
+CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
+CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
+: "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
 : "${SPEC_NUM_TOKENS:=3}"
-# Disk tier: 3 full-length chains (3 x 17.5 GB).
+# Disk tier: 4 full-length contexts (4 x 17.5 GB = 69.9 GB).
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
-: "${VLLM_SSD_MAX_BYTES:=52500000000}"
+: "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
 # Keep the directory across restarts (the budget reclaims what it needs, and the
 # eviction order is read back from the files' mtimes). Set 1 to wipe it.
 : "${VLLM_SSD_CLEAN_START:=0}"
@@ -69,24 +88,20 @@ fi
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
-: "${KV_ENGINE_ID:=qwen38-27b-500k-ssd}"
+: "${KV_ENGINE_ID:=qwen38-27b-500k-RAMx1-SSDx4}"
 
 # --- sizing self-checks ----------------------------------------------------
-# Measured, one chunk per block: 1600 tokens, 55.8 MB (both ranks' shards).
-CHUNK_BYTES=55800000
 # Measured bytes per pooled token for this model/layout (fp8_e4m3, TP2, MTP=3).
 POOL_BYTES_PER_TOKEN=18278
 gib() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
 
-CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + 1599) / 1600 ))
-CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 TIER_CHUNKS=$(( CPU_BYTES_TO_USE / CHUNK_BYTES ))
 SSD_CHAINS=$(( VLLM_SSD_MAX_BYTES / CHAIN_BYTES ))
 POOL_TOKENS=$(( KV_CACHE_MEMORY_BYTES / POOL_BYTES_PER_TOKEN ))
 
 echo "[profile] context=$MAX_MODEL_LEN  chain=$CHAIN_CHUNKS chunks ($(gib "$CHAIN_BYTES") GiB)"
 echo "[profile] staging=$TIER_CHUNKS chunks ($(gib "$CPU_BYTES_TO_USE") GiB)"
-echo "[profile] disk ring ~$SSD_CHAINS chains ($(gib "$VLLM_SSD_MAX_BYTES") GiB)"
+echo "[profile] disk ring ~$SSD_CHAINS contexts ($(gib "$VLLM_SSD_MAX_BYTES") GiB)"
 echo "[profile] GPU pool ~$POOL_TOKENS tokens"
 
 problems=0
@@ -94,9 +109,9 @@ if [ "$TIER_CHUNKS" -lt "$CHAIN_CHUNKS" ]; then
   echo "[warn] staging holds $TIER_CHUNKS chunks but a full chain needs $CHAIN_CHUNKS:" >&2
   echo "       restores of a full-length prompt would yield 0 hits" >&2
 fi
-if [ "$SSD_CHAINS" -lt 1 ]; then
-  echo "[warn] disk budget cannot hold one full chain; every store would evict its" >&2
-  echo "       own chain head (raise VLLM_SSD_MAX_BYTES)" >&2
+if [ "$SSD_CHAINS" -lt 4 ]; then
+  echo "[warn] disk budget holds ~$SSD_CHAINS full context(s); the profile targets 4" >&2
+  echo "       (raise VLLM_SSD_MAX_BYTES)" >&2
 fi
 if [ "$POOL_TOKENS" -lt "$MAX_MODEL_LEN" ]; then
   echo "[warn] GPU pool ~$POOL_TOKENS tokens < MAX_MODEL_LEN: a full-length request" >&2

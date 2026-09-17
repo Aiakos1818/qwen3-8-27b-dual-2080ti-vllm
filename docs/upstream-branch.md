@@ -247,28 +247,41 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 ---
 
-### 5.6 500K 部署 profile（64 GB 主机目标）
+### 5.6 500K 部署三档（64 GB 主机目标）
 
-`scripts/run_vllm_qwen38_awq_fp8e4m3_500k_ssd.sh`（+ `config/vllm-500k-ssd.env.example`）把
-§5.1–§5.5 的结论固化成可直接部署的脚本：
+三个 profile 共用同一套 KV/池参数（`MAX_MODEL_LEN=500800`、`KV_CACHE_MEMORY_BYTES=9.6e9`
+→ 525,229 tokens = 1.05×），只有 offload 档位不同：
 
-| 参数 | 值 | 依据 |
-|---|---|---|
-| `MAX_MODEL_LEN` | 500800 | YARN 512K |
-| `KV_CACHE_MEMORY_BYTES` | 9.6e9 → **525,229 tokens（1.05×）** | 实测（§5.2 的每 token KV 口径） |
-| `CPU_BYTES_TO_USE` | **19.2e9（344 chunks）** | 满长链 313 chunks × 55.8 MB = 17.5 GB，+10% 余量 |
-| `VLLM_SSD_MAX_BYTES` | **52.5e9（≈3 条满长链）** | 3 × 17.5 GB，LRU 环形回收 |
-| `VLLM_SSD_CLEAN_START` | 0 | 跨重启保留、自动回收（§5.5） |
+| 档 | 脚本 | tier 配置 | 容量语义 |
+|---|---|---|---|
+| 500k | `run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 无 offload | 只有 GPU 池；重复的长 prompt 全量重算 |
+| 500k_RAMx2 | `run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | `TieringOffloadingSpec` + `secondary_tiers: []` | CPU 层**就是 store**：2 条满长链 = 626 chunks = **32.5 GiB**；恢复只走 PCIe（不经磁盘）；淘汰即丢 |
+| 500k_RAMx1_SSDx4 | `run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 同上 + `fs` secondary（`max_bytes`） | RAM 只做晋升 staging（1 条链 = 313 chunks = **16.3 GiB**），磁盘是 **4 条链的 LRU 环**（65.1 GiB）；唯一能保住多个长会话、且跨重启保留的档 |
 
-**为什么是 64 GB**：staging 是 `/dev/shm` 上的硬预留（启动前整块预 fault），而 tmpfs 默认 = RAM 的
-50% → 32 GB 主机只有 16 GiB，**比一条链还少 0.3 GiB**；64 GB → 32 GiB ✓ 宽裕。
+尺寸全部由 `MAX_MODEL_LEN` 推导（`CHAIN_CHUNKS = ceil(MAX_MODEL_LEN/1600)`、
+`CHAIN_BYTES = CHAIN_CHUNKS × 55.8 MB`），改上下文长度会自动跟随；
+`CPU_BYTES_TO_USE` / `VLLM_SSD_MAX_BYTES` 也都可以用环境变量覆盖。
 
-脚本自带装机自检：`/dev/shm` 是否装得下 staging、`MemAvailable ≥ staging + 4 GiB`、memlock 告警、
-链/磁盘环/GPU 池是否配得上。`CHECK_ONLY=1` 只跑检查不启动；不合格时**拒绝启动**（exit 1 并打印
-可执行的 `mount -o remount,size=...M /dev/shm`），`ALLOW_UNSAFE_LAUNCH=1` 可强制放行。
+**RAM 是硬开销**：tier 是 `/dev/shm` 上启动前预 fault 的 mmap，而 tmpfs 默认 = RAM 的 50%：
 
-本机（16 GB / 7.8 GiB shm）实测：脚本按预期拒绝启动；参数在 vLLM 侧解析正常（日志确认
-`max_model_len: 500800` 与 `secondary_tiers[0].max_bytes: 52500000000`）。**真正跑 500K 恢复
+- `RAMx1_SSDx4`：16.3 GiB ✓ 直接落在 64 GB 主机的 32 GiB tmpfs 内，**无需改系统**；
+- `RAMx2`：32.5 GiB **略超**默认 32 GiB → 需 `mount -o remount,size=36864M /dev/shm`
+  （自检会打印精确命令）。
+
+**装机自检**：`/dev/shm` 是否装得下、`MemAvailable ≥ tier + 4 GiB`、memlock 告警，
+以及 tier / 链 / 磁盘环 / GPU 池是否配得上；不合格**拒绝启动**（exit 1），
+`CHECK_ONLY=1` 只检查不启动，`ALLOW_UNSAFE_LAUNCH=1` 强制放行。
+
+**RAM-only 档已实测**（小规模代跑：40K prompt、2 × 26 chunks、61-chunk tier、小池）：
+`A → B → A` 恢复 **36,800 / 39,170（94%）/ 3 s**，`kv_offload_total_bytes{CPU_to_GPU}=1.44 GB`
+（正好是那条链），磁盘文件数不变 → 证明"空 secondary 的 tiering = 纯 RAM 档"可用。
+
+> 注意 tier 必须装得下**同时要命中的链**：同一轮里 43-chunk tier 因 A+B 需 52 chunks 而
+> 互相挤出 → 0 命中（与 §5.2 的"链必须完整"是同一条规则）。这就是 `RAMx2` 按 2 条链配、
+> `RAMx1_SSDx4` 的 RAM 只当 staging（而磁盘兜住多会话）的原因。
+
+本机（16 GB / 7.8 GiB shm）实测：两档都按预期拒绝启动并打印精确的 `mount -o remount` 命令；
+参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
 要等内存到位**（见 §7）。
 
 ---
@@ -300,3 +313,5 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
    磁盘层写满的行为已在 §5.4 实测，字节上限 + LRU 淘汰已在 §5.5 实现并实测。
 2. 磁盘层预算的**长稳**：多天运行下 mtime 作为 recency 的退化（例如备份/rsync 改写 mtime）
    尚未验证。
+3. **500K 三档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
+   （冷启 → 重发 → 跨会话换出/恢复），并把 `RAMx2` 的 `/dev/shm` remount 纳入装机清单。
