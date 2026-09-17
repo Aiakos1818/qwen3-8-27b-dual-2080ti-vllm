@@ -47,6 +47,11 @@ fi
 : "${VLLM_SSD_CLEAN_START:=1}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
+# A KV load failure (missing/short file on disk) either recomputes the
+# affected tokens or fails the request (vLLM's default). Recompute is the safer
+# choice for offload: the disk tier is best-effort, and 0-hit degradation beats
+# an aborted request.
+: "${KV_LOAD_FAILURE_POLICY:=recompute}"
 : "${KV_ENGINE_ID:=qwen38-27b-16k-ssd}"
 
 export OMP_NUM_THREADS CUDA_HOME
@@ -62,7 +67,7 @@ export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 export PYTHONPATH="$FLASHQLA_PATH"
 
-KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\"}]}}"
+KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\"}]}}"
 
 ARGS=(
   --host "$HOST" --port "$PORT"
