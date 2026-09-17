@@ -1,0 +1,117 @@
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index b2469d0d7..3c85dae0c 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -569,6 +569,13 @@ class FIDecode:
+     q_len_per_req: int = 1
+     """Query tokens per request for uniform speculative decode."""
+ 
++    seq_lens: torch.Tensor | None = None
++    """Device sequence lengths the paged-KV metadata was derived from. The fused
++    draft loop advances them in place and refreshes the metadata on device."""
++
++    block_table: torch.Tensor | None = None
++    """Device block table backing the paged-KV page indices."""
++
+ 
+ class FlashInferDecodeKernel(Enum):
+     """Decode kernels selected inside the FlashInfer backend."""
+@@ -933,6 +940,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             and not self.is_kvcache_nvfp4
+             and self.flashinfer_trtllm_api_decode_kernel is None
+         )
++        # The fused draft loop refreshes the paged-KV metadata on the device
++        # between draft steps instead of rebuilding it on the host.
++        self.supports_draft_decode_metadata_update = self._native_spec_as_decode
+         self._init_reorder_batch_threshold(
+             1,
+             supports_spec_as_decode=(
+@@ -1890,7 +1900,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     q_len_per_req=q_len_per_req,
+                 )
+                 attn_metadata.decode = FIDecode(
+-                    wrapper=decode_wrapper, q_len_per_req=q_len_per_req
++                    wrapper=decode_wrapper,
++                    q_len_per_req=q_len_per_req,
++                    seq_lens=seq_lens[:num_kv_reqs],
++                    block_table=block_table_tensor[:num_kv_reqs],
+                 )
+         return attn_metadata
+ 
+@@ -1903,6 +1916,42 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         # return use_cascade_attention(*args, **kwargs)
+         return False
+ 
++    def update_draft_decode_metadata(self, metadata: FlashInferMetadata) -> None:
++        """Refresh paged-KV metadata for the next fused draft step.
++
++        Sequence lengths advance on the device (``_update_draft_inputs_kernel``)
++        while the draft loop reuses one metadata build, so the paged-KV indptr,
++        last-page lengths and page indices are recomputed from the device state
++        with capture-safe kernels.
++        """
++        decode = metadata.decode
++        if (
++            not self._native_spec_as_decode
++            or not isinstance(decode, FIDecode)
++            or decode.q_len_per_req != 1
++            or decode.seq_lens is None
++            or decode.block_table is None
++        ):
++            return
++
++        num_reqs = decode.seq_lens.shape[0]
++        paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
++        _paged_kv_meta_kernel[(1,)](
++            decode.seq_lens,
++            paged_kv_indptr,
++            self.paged_kv_last_page_len.gpu[:num_reqs],
++            self.page_size,
++            num_reqs,
++            BLOCK_SIZE=max(triton.next_power_of_2(num_reqs), 16),
++        )
++        _copy_page_indices_kernel[(num_reqs,)](
++            self.paged_kv_indices,
++            decode.block_table,
++            decode.block_table.stride(0),
++            paged_kv_indptr,
++            BLOCK_SIZE=1024,
++        )
++
+ 
+ class FlashInferImpl(AttentionImpl):
+     can_return_lse_for_decode: bool = True
+@@ -2845,6 +2894,33 @@ def fast_plan_decode(
+     )
+ 
+ 
++@triton.jit
++def _paged_kv_meta_kernel(
++    seq_lens,
++    paged_kv_indptr,
++    paged_kv_last_page_len,
++    page_size,
++    num_reqs,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Recompute paged-KV metadata from sequence lengths on the device.
++
++    Mirrors ``_compute_flashinfer_kv_metadata`` (ceil division for the block
++    count, page_size for a full last page) so the fused draft loop can refresh
++    the metadata between steps without a host round trip.
++    """
++    offs = tl.arange(0, BLOCK_SIZE)
++    mask = offs < num_reqs
++    seq = tl.load(seq_lens + offs, mask=mask, other=0).to(tl.int32)
++    num_blocks = (seq + page_size - 1) // page_size
++    last_page_len = seq % page_size
++    last_page_len = tl.where(
++        (last_page_len == 0) & (seq != 0), page_size, last_page_len
++    )
++    tl.store(paged_kv_indptr + 1 + offs, tl.cumsum(num_blocks, axis=0), mask=mask)
++    tl.store(paged_kv_last_page_len + offs, last_page_len, mask=mask)
++
++
+ @triton.jit
+ def _copy_page_indices_kernel(
+     page_indices,

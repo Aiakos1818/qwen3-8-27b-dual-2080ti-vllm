@@ -315,7 +315,7 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 
 本机（16 GB / 7.8 GiB shm）实测：两档都按预期拒绝启动并打印精确的 `mount -o remount` 命令；
 参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
-要等内存到位**（见 §7）。
+要等内存到位**（见 §8）。
 
 ### 5.7 信息面板 `scripts/tools/monitor_kv_offload.py`
 
@@ -398,7 +398,115 @@ python3 scripts/tools/monitor_kv_offload_web.py --self-test
 
 ---
 
-## 6. 已知问题与注意事项
+## 6. 单并发解码性能：MTP + cudagraph（SM75 实测）
+
+**口径先行**：单并发稳态 `tok/s = 步频 × (1 + n × MTP 接受率)`。README 表里的 84–101 tok/s 是
+「接受率 ~90% 的前 128 token」口径；长生成（接受率 45–65%）稳态只有 ~45 tok/s，两者都对。
+
+### 6.1 定位：CPU-launch-bound，不是 GPU / 功耗 / 带宽
+
+用 torch profiler（`--profiler-config` + `POST /start_profile`）与高频 `nvidia-smi` 采样实测
+（32K 上下文、单请求、MTP n=3）：
+
+| 观测 | 实测 |
+|---|---|
+| 步耗时 | 57 ms |
+| 单步 CUDA kernel 工作 | ~35 ms（**1280 次 launch/步**） |
+| GPU0 / GPU1 利用率 | 58% / 83% |
+| GPU1 的 kernel 时间构成 | **57% 在 `cross_device_reduce_1stage` 里自旋等 GPU0**（324 µs/次 × 138 次/步） |
+| 功耗 / SM 频率 | 211–218 W（上限 250 W）/ 1850 MHz → **非功耗受限** |
+| Marlin INT4 GEMM | ~416 GB/s（616 峰值 67%）→ **非带宽受限** |
+
+GPU 时间按父 op 归因：`qwen_gdn_attention_core` 24.9%（**490 kernel/步**）、`aten::mm` GEMV
+22.0%（11.6 次 × 667 µs）、`aten::copy_` 系列 ~18%、attention 11.3%。两个结构性原因：
+
+1. **48 个 GDN 层每步走 eager custom op**：SM75 没有融合 GDN decode kernel（要求
+   `compute capability 8.0+`），日志明写 `Falling back to the Triton GDN decode path` /
+   `GDN decode kernel: triton`；该 op 又被 `@eager_break_during_capture` 强制在 eager 段执行。
+2. **MTP 下 cudagraph 被降级为 PIECEWISE**：`FlashInferBackend` 只声明
+   `AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE`（`UNIFORM_BATCH` 仅对 SM90+ 的
+   TRT-LLM/XQA 开放），于是 `setting cudagraph_mode=PIECEWISE`；而 `speculator.py` 在非 FULL
+   解码模式下把草稿多步解码图设成 `NONE`（完全 eager）。
+
+### 6.2 n 扫描（分离"固定开销"与"每 draft 边际成本"）
+
+| 配置 | 步耗时 | tokens/步 | 稳态 |
+|---|---|---|---|
+| 无 MTP | 23.4 ms | 1.00 | 41.5 tok/s |
+| MTP n=1 | ~49 ms | ~1.8 | ~37 |
+| MTP n=3 | 57 ms | ~2.7 | ~45 |
+| MTP n=5 | ~71 ms | ~3.2 | ~45 |
+
+n=0→n=1 一步就多 ~25 ms，之后每个 draft 只加 2–6 ms：贵的是「开启 spec-decode 的固定开销」，
+不是 draft 数量。（上表是 PIECEWISE 时代的数据，§6.4 修好图捕获后同一组对照的斜率见 §6.5。）
+
+### 6.3 已实测并排除的杠杆
+
+| 杠杆 | 结果 |
+|---|---|
+| `VLLM_SM75_SPEC_SYNC_MODE` safe ↔ nosync | 无差别（45 vs 48 tok/s），greedy 输出逐字节相同 |
+| `num_speculative_tokens` 1 / 2 / 5 | 3 最优；1 最差（接受率被摊薄） |
+| 关闭 MTP | 41.5 tok/s（更差） |
+| `VLLM_USE_V2_MODEL_RUNNER=0` | 无差别 |
+| `--no-async-scheduling` | 略差（~42），且**会改变输出** |
+| `--attention-backend TRITON_ATTN` | 启动失败：SM75 不支持 fp8 KV（要求 SM89+） |
+| `TRITON_ATTN` + fp16 KV | 启动成功且启用了融合草稿解码，但 attention 慢 5 倍 → **9–13 tok/s** |
+| 功耗上限（220 → 250 W） | 无影响（实测只到 211–218 W） |
+
+### 6.4 已采纳：native spec-as-decode → 保住 FULL cudagraph
+
+FlashInfer 的 native fa2 decode wrapper **本来就支持** uniform `q_len_per_req > 1`
+（`BatchDecodeWithPagedKVCacheWrapper.plan` 与 `fast_decode_plan` 都有该参数，且
+`is_causal = q_len_per_req > 1`，注释写明为投机解码的验证批次设计），但 vLLM 只在 SM90+ 的
+TRT-LLM/XQA 路径开放它。放开后（`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1`，四个 profile 默认
+开启，`.env` 可覆盖为 0）：
+
+- `get_cudagraph_support` 声明 `UNIFORM_BATCH`；`reorder_batch_threshold = 1 + n`，验证批次留在
+  decode 路径；paged-KV 元数据按**请求数**规划；`q_len_per_req` 透传到 `plan` /
+  `fast_decode_plan`；cudagraph 的 decode wrapper 以 `(num_reqs, q_len_per_req)` 为键（FlashInfer
+  按 wrapper 冻结 q_len）；非 uniform 批次（如 padding 出 0 长度请求）回退 prefill 路径。
+
+| | 之前 | 之后 |
+|---|---|---|
+| cudagraph | 仅 PIECEWISE | **FULL + PIECEWISE（含 prefill FULL）** |
+| 步耗时 | 57 ms | **37.6 ms** |
+| 单并发稳态 | ~45 tok/s | **~65–86 tok/s** |
+
+上游提交：`vllm@sm75-upstream` `059727bfa`；部署侧 `20dbbe5`（profile/env 示例默认开启）。
+
+### 6.5 已评估、未采纳：融合多步草稿解码
+
+草稿循环每步在主机侧重算 attention 元数据（`plan()` + numpy + H2D），因此只能每步单独捕获
+一张图。理论上可以像 `triton_attn` 那样声明 `supports_draft_decode_metadata_update = True`，
+用设备侧 kernel 就地刷新元数据，把整段草稿循环捕获成**一张图**（日志出现
+`Capturing decode CUDA graphs (FULL)`）。
+
+已实现并实测（补丁留档 `docs/patches/2026-09-18-fused-multi-step-draft-decode.patch`，**不套用**；它以 §6.4 的 `059727bfa` 为基线，`git apply --check` 可干净套用）：
+
+- 新增 `_paged_kv_meta_kernel`：从设备端 `seq_lens` 重算 `paged_kv_indptr` +
+  `last_page_len`（逐条对齐主机版 `_compute_flashinfer_kv_metadata`，含
+  `seq % page == 0 && seq != 0 → page_size` 特例），再复用已有的
+  `_copy_page_indices_kernel` 刷新页索引；`update_draft_decode_metadata` 调用它们（捕获安全）。
+- 结果：步耗时 **37.6 → 35.2 ms（+6%）**，稳态同量级；greedy 输出与基线逐字节一致，接受率
+  可比；开关置 0 时完全回到原行为。
+
+**结论：不采纳。** 收益仅 ~6%——每个 draft 的主机元数据重建实际只值 ~1.2 ms，而非原先估的
+~3 ms（剩下的每 draft ~4 ms 主要是草稿前向 + 采样 + 必要的设备侧更新）——却要多带一个设备侧
+kernel 与相应的捕获安全面。此处仅作记录，便于将来需要时复看。
+
+### 6.6 改动注意力路径时的正确性验证方法
+
+用**逐字节对照**，不要只看指标：
+
+1. `temperature=0`、固定 seed 的 greedy 生成，比较**全文**（不只比 hash）；
+2. 覆盖短（~40 token）、中（256 token）与**长 prompt（30,351 token）**三种规模——长 prompt 才能
+   同时压到 prefill 的 FULL 图；
+3. 把开关置 0 跑一次回归，确认完全回到原行为（cudagraph 降级告警、融合回退日志、输出 hash
+   均复原）。
+
+---
+
+## 7. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |
 |---|---|
@@ -417,7 +525,7 @@ python3 scripts/tools/monitor_kv_offload_web.py --self-test
 
 ---
 
-## 7. 待办与未覆盖
+## 8. 待办与未覆盖
 
 1. offload 尚未覆盖：**池接近满时的恢复**（最高优先，唯一可能 stall 的路径）、多轮
    offload/restore 的长时间稳定性、`max-num-seqs > 1` 的并发，以及 pinned / unpinned DMA

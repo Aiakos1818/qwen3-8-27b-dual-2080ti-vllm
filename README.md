@@ -316,6 +316,23 @@ python benchmarks/run_context_ttft.py \
 
 复现时应先锁定 docs/environment-lock.md，再按 benchmarks/README.md 的方法测试。相同硬件的合理验收范围是约 ±10%；显著偏离时按顺序检查：NVLink 是否为 NV2、TP 是否为 2、补丁是否生效、FlashQLA legacy 是否被日志选中、是否使用 FP8 KV、是否有其他 GPU 占用。
 
+### 本分支实测：单并发稳态解码（2026-09-18）
+
+口径与上表不同——这里是**长生成**的稳态（接受率 45–65%），不是前 128 token：
+
+| 配置 | 步耗时 | 单并发稳态 decode |
+| :-- | --: | --: |
+| 原始（MTP 下 cudagraph 被降级为 PIECEWISE） | 57 ms | ~45 tok/s |
+| 让 spec 验证留在 decode 路径、恢复 FULL cudagraph 后 | 37.6 ms | ~65–86 tok/s |
+
+`tok/s = 步频 × (1 + n × MTP 接受率)`，所以上表的 84–101 与这里的 ~45 并不矛盾：接受率 ~90%
+时每个 4-token 步能出 3–4 个 token，接受率 ~50% 时只出 ~2.5 个。
+
+定位过程（profiler + GPU 采样：CPU-launch-bound，非功耗/带宽受限）、n 扫描、已排除的杠杆，
+以及一项**已评估未采纳**的改动（融合多步草稿解码，实测仅 +6%）见
+[`docs/upstream-branch.md`](docs/upstream-branch.md) §6。开关 `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`
+（四个 profile 默认开启）置 0 即可回到原行为。
+
 ## 2026-09 性能更新：W8A8 vs FP8（同硬件、同 180K 条件）
 
 2026-09-07 在同一台双 2080 Ti 上，把权重从 FP8 换成 W8A8（imatrix），保持 fp8_e4m3 KV + 180K 上下文不变，与上方 2026-08-25 基线同条件对比。W8A8 两列分别为 MTP3 与 MTP5。
