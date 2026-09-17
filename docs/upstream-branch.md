@@ -193,9 +193,10 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 
 由此得到两条运维约束：
 
-1. **回收只能靠重启或停机清理**：磁盘层没有 TTL/淘汰，`VLLM_SSD_CLEAN_START=1` 在启动时
-   清空整个目录；**外部清理必须在服务停止时做** —— 运行中删文件会让索引与磁盘不一致，
-   可能触发 load 失败。
+1. **未设上限时回收只能靠重启或停机清理**：那时磁盘层没有 TTL/淘汰，只能靠
+   `VLLM_SSD_CLEAN_START=1` 在启动时清空整个目录（两个 profile 现在默认 0 = 不清，
+   因为上限会自己回收，见 §5.5）；**外部清理必须在服务停止时做** —— 运行中删文件会让
+   索引与磁盘不一致，可能触发 load 失败。
 2. **把 `VLLM_SSD_ROOT` 放到有配额的文件系统**，隔离写满对同分区其他数据的影响。
 
 profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`，即中止受影响的
@@ -251,7 +252,7 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 | 问题 | 说明 / 处置 |
 |---|---|
 | `RLIMIT_MEMLOCK = 8192 KB`（软硬同） | 无法在不提权的情况下调高（`sudo -n` 要密码；`systemd-run --user -p LimitMEMLOCK=infinity` 报 Unknown assignment）。靠 §5.1 的补丁降级运行 |
-| 上游 fs 层默认没有回收机制 | 上游只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处），占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。本线已补 `max_bytes` 字节预算 + LRU 淘汰（§5.5），128K/16K 两个 profile 默认 128 GiB |
+| 上游 fs 层默认没有回收机制 | 上游只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处），占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。本线已补 `max_bytes` 字节预算 + LRU 淘汰（§5.5），128K/16K 两个 profile 默认 64 GiB、且不再在启动时清空目录 |
 | 磁盘层目录随 `engine_id` | 不固定 `engine_id` 时每次启动都新目录（孤儿累积）；128K profile 固定为 `qwen38-27b-128k-ssd` 并在启动前清空 |
 | `flash_qla` 依赖钉死导致 pip 冲突 | 已修：`setup.py` 放宽为 `>=` 并重装 editable（§3）；启动脚本仍设 `PYTHONPATH`，但已非必需 |
 | `scripts/tools/kv_pool_sizing.py` 原先解析不了本仓库全部 profile | 已修（见下） |

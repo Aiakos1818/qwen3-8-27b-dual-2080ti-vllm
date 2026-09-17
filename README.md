@@ -140,8 +140,9 @@ offload 的 staging 区是 `/dev/shm/vllm_offload_<engine_id>.mmap`，大小等�
 
 对策（128K profile 已内置）：**固定 `KV_ENGINE_ID`**（每个 profile 一个，互不重复），
 并在启动前 `rm -f /dev/shm/vllm_offload_<id>.mmap`，残留不再累积。磁盘二级层的目录由
-模型路径派生（与 `engine_id` 无关），所以 profile 用 `VLLM_SSD_CLEAN_START=1` 在启动前
-清空 `VLLM_SSD_ROOT`，否则上一次运行的会话目录会成为孤儿、永远不回收。
+模型路径派生（与 `engine_id` 无关），所以目录会跨重启复用（这是恢复的前提）；
+磁盘占用由 `VLLM_SSD_MAX_BYTES`（默认 64 GiB）自动回收，需要推倒重来时再设
+`VLLM_SSD_CLEAN_START=1` 清空 `VLLM_SSD_ROOT`。
 
 > **起不来的第一反应：先清 `/dev/shm`（一键，别先查别的）**
 >
@@ -238,7 +239,7 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
 
 另外两点来自实测：
 
-- **磁盘层有字节上限（`VLLM_SSD_MAX_BYTES`，默认 128 GiB）**：上游 fs 层默认不回收，
+- **磁盘层有字节上限（`VLLM_SSD_MAX_BYTES`，默认 64 GiB）**：上游 fs 层默认不回收，
   占用随累计 spill 单调增长（约 **4.5 GB / 条 120K 链**）；本线让 tier 自管预算，超了就按
   **LRU** 淘汰最旧（恢复过的块算"用过"）整块文件，磁盘再也不会被写满。上限至少要装得下
   一条满长链，且假设 tier 独占该目录（多实例共享 `root_dir` 时不要设）。

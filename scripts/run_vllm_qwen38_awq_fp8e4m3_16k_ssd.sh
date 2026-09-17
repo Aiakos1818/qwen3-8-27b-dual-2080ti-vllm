@@ -44,9 +44,12 @@ fi
 # Disk tier. VLLM_SSD_MAX_BYTES caps what the tier keeps on disk: past the
 # budget the least recently restored blocks are evicted, so the directory can
 # never fill the filesystem (0 = no cap, i.e. upstream behavior).
+# The directory is kept across restarts (the budget reclaims what it needs, and
+# the eviction order is read back from the files' mtimes). Set
+# VLLM_SSD_CLEAN_START=1 to wipe it for a fresh start.
 : "${VLLM_SSD_ROOT:=${REPO_ROOT}/ssd_kv}"
-: "${VLLM_SSD_MAX_BYTES:=137438953472}"
-: "${VLLM_SSD_CLEAN_START:=1}"
+: "${VLLM_SSD_MAX_BYTES:=68719476736}"
+: "${VLLM_SSD_CLEAN_START:=0}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
 # A KV load failure (missing/short file on disk) either recomputes the
@@ -99,8 +102,8 @@ if [ -n "${CHAT_TEMPLATE:-}" ]; then
   ARGS+=(--chat-template "$CHAT_TEMPLATE")
 fi
 
-# A fixed engine id re-opens the previous run's staging file (it is never
-# unlinked) and would reuse the previous run's SSD session dir; start clean.
+# A fixed engine id names the run's SSD session dir; leave its contents alone
+# unless asked to start clean, so a restart can still restore blocks.
 mkdir -p "$VLLM_SSD_ROOT"
 if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
