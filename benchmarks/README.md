@@ -45,5 +45,16 @@ DSH 全任务平均首字是另一套真实业务任务集指标。没有该任�
 3. 每档至少串行运行 3 次，使用唯一 prompt，避免 Prefix Cache 把 prefill 成绩虚高。
 4. 测试输出固定为 128 tokens，并记录 prompt_tokens、TTFT、total latency、prefill tok/s、decode tok/s；TTFT 必须按首个 reasoning/content 字符记录。
 5. 与上表比较时，允许约 ±10% 波动；超过这个范围先检查 flashqla_legacy、TP=2、NVLink=NV2、FP8 KV 和 MTP。
+6. 服务开启鉴权时（本机 profile 会导出 `VLLM_API_KEY`）脚本必须带 key，否则一律 401：
+
+~~~bash
+python3 benchmarks/run_context_ttft.py --model qwen38-27b \
+  --word-counts 2700 5400 8100 --runs 3 --max-tokens 128 \
+  --api-key "$VLLM_API_KEY" --output out.json
+~~~
+
+   也可以只 `export VLLM_API_KEY=...`（脚本按 `--api-key` → `$VLLM_API_KEY` → `$OPENAI_API_KEY`
+   顺序取，并在开始时打印用的是哪一个，不打印 key 本身）；遇到 401/403 立即退出（exit 2）并给出提示，
+   不会把整个档位矩阵跑成一片失败。`--timeout` 可调单请求读超时（默认 900 s）。
 
 不同模型权重、显示器占用、温度/功耗墙、显卡改装规格、PCIe/NVLink 状态、驱动与 CUDA 小版本都会改变速度。本仓库给出可比的验收区间，不承诺每台机器得到逐位相同数字。
