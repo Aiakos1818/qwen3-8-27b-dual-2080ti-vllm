@@ -251,7 +251,8 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
   （CPU 层当 store，容 2 条满长链 32.5 GiB，需把 /dev/shm remount 到 ~36 GiB）→
   `..._500k_RAMx1_SSDx4.sh`（RAM 只当 staging 16.3 GiB + 磁盘 4 条链的 LRU 环）。
   三档共用同一套 KV/池参数、尺寸由 `MAX_MODEL_LEN` 推导、自带装机自检
-  （`CHECK_ONLY=1` 只检查不启动）。见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
+  （`/dev/shm` 总量与**剩余**空间、可用内存；不足即拒绝启动，`CHECK_ONLY=1` 只检查）。
+  见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
 
 > 排查提示：单请求下 A→B→A 的第三次可能被 **GPU 前缀缓存**冒领（实测出现过
 > 118,400/120,000、3 s 的"假恢复"）；判断命中来源要看 `tiering_*` 指标，不能只看

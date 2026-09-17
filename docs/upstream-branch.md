@@ -273,9 +273,23 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 - `RAMx2`：32.5 GiB **略超**默认 32 GiB → 需 `mount -o remount,size=36864M /dev/shm`
   （自检会打印精确命令）。
 
-**装机自检**：`/dev/shm` 是否装得下、`MemAvailable ≥ tier + 4 GiB`、memlock 告警，
-以及 tier / 链 / 磁盘环 / GPU 池是否配得上；不合格**拒绝启动**（exit 1），
-`CHECK_ONLY=1` 只检查不启动，`ALLOW_UNSAFE_LAUNCH=1` 强制放行。
+**装机自检**（三个 offload profile 共用 `scripts/tools/offload_sizing.sh`）：
+
+| 检查 | 级别 |
+|---|---|
+| `/dev/shm` **总量** ≥ staging | error（打印精确的 `mount -o remount,size=...M`） |
+| `/dev/shm` **剩余** ≥ staging | error（同名文件被 unlink 后仍在 `/proc/*/maps` 里，会连同可见文件一起列出持有者） |
+| `MemAvailable` ≥ staging + 4 GiB | error（staging 启动前整块预 fault） |
+| tier / 链 / 磁盘环 / GPU 池 是否配得上目标 | warn |
+| memlock、cgroup 余量 | warn（不阻断，与 vLLM 自身语义一致） |
+
+不合格**拒绝启动**（exit 1），`CHECK_ONLY=1` 只检查不启动，`ALLOW_UNSAFE_LAUNCH=1` 强制放行。
+`/dev/shm` 清理策略：**只删自己 engine id 的陈旧文件**（且该文件没有进程映射时）；别的实例的文件
+一律不动 —— 空间不够就报错并点名持有者，由人决定。
+
+实测（本机，128K 档）：给自己的 id 放一个 1 GiB 陈旧文件 → `CHECK_ONLY` 打印
+`removing stale staging file ...` 并正常通过（exit 0）；放一个**别的 id** 的 4 GiB 文件 →
+**不删**，报 `has only 3.8 GiB free of 7.8 GiB` 并列出持有者，exit 1。
 
 **RAM-only 档已实测**（小规模代跑：40K prompt、2 × 26 chunks、61-chunk tier、小池）：
 `A → B → A` 恢复 **36,800 / 39,170（94%）/ 3 s**，`kv_offload_total_bytes{CPU_to_GPU}=1.44 GB`

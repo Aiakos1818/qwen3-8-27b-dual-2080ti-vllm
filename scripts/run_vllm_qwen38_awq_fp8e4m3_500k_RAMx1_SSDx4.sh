@@ -41,6 +41,8 @@ SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 # shellcheck source=tools/shm_staging.sh
 source "$SCRIPT_DIR/tools/shm_staging.sh"
+# shellcheck source=tools/offload_sizing.sh
+source "$SCRIPT_DIR/tools/offload_sizing.sh"
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
@@ -92,64 +94,23 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # Give every profile its own id; two instances must not share one.
 : "${KV_ENGINE_ID:=qwen38-27b-500k-RAMx1-SSDx4}"
 
-# --- sizing self-checks ----------------------------------------------------
-# Measured bytes per pooled token for this model/layout (fp8_e4m3, TP2, MTP=3).
-POOL_BYTES_PER_TOKEN=18278
-gib() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
-
-TIER_CHUNKS=$(( CPU_BYTES_TO_USE / CHUNK_BYTES ))
-SSD_CHAINS=$(( VLLM_SSD_MAX_BYTES / CHAIN_BYTES ))
-POOL_TOKENS=$(( KV_CACHE_MEMORY_BYTES / POOL_BYTES_PER_TOKEN ))
-
-echo "[profile] context=$MAX_MODEL_LEN  chain=$CHAIN_CHUNKS chunks ($(gib "$CHAIN_BYTES") GiB)"
-echo "[profile] staging=$TIER_CHUNKS chunks ($(gib "$CPU_BYTES_TO_USE") GiB)"
-echo "[profile] disk ring ~$SSD_CHAINS contexts ($(gib "$VLLM_SSD_MAX_BYTES") GiB)"
-echo "[profile] GPU pool ~$POOL_TOKENS tokens"
-
-problems=0
-if [ "$TIER_CHUNKS" -lt "$CHAIN_CHUNKS" ]; then
-  echo "[warn] staging holds $TIER_CHUNKS chunks but a full chain needs $CHAIN_CHUNKS:" >&2
-  echo "       restores of a full-length prompt would yield 0 hits" >&2
-fi
-if [ "$SSD_CHAINS" -lt 4 ]; then
-  echo "[warn] disk budget holds ~$SSD_CHAINS full context(s); the profile targets 4" >&2
-  echo "       (raise VLLM_SSD_MAX_BYTES)" >&2
-fi
-if [ "$POOL_TOKENS" -lt "$MAX_MODEL_LEN" ]; then
-  echo "[warn] GPU pool ~$POOL_TOKENS tokens < MAX_MODEL_LEN: a full-length request" >&2
-  echo "       may not fit (raise KV_CACHE_MEMORY_BYTES)" >&2
-fi
-
-# The staging is a pre-faulted mmap of /dev/shm: a tmpfs that is too small
-# fails mid-startup, so refuse early with an actionable message.
-SHM_BYTES=$(df -B1 --output=size /dev/shm 2>/dev/null | tail -1)
-if [ -z "${SHM_BYTES:-}" ] || [ "$SHM_BYTES" -lt "$CPU_BYTES_TO_USE" ]; then
-  echo "[error] /dev/shm is $(gib "${SHM_BYTES:-0}") GiB but the staging needs" >&2
-  echo "        $(gib "$CPU_BYTES_TO_USE") GiB. With root:" >&2
-  echo "        mount -o remount,size=$(( CPU_BYTES_TO_USE / 1048576 + 2048 ))M /dev/shm" >&2
-  problems=$((problems + 1))
-fi
-AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-# Staging + 4 GiB for the engine, the page cache and the OS.
-NEED_KB=$(( CPU_BYTES_TO_USE / 1024 + 4 * 1024 * 1024 ))
-if [ "${AVAIL_KB:-0}" -lt "$NEED_KB" ]; then
-  echo "[error] MemAvailable $(gib "$(( ${AVAIL_KB:-0} * 1024 ))") GiB < staging + 4 GiB" >&2
-  echo "        ($(gib "$(( NEED_KB * 1024 ))") GiB): the staging is pre-faulted, so" >&2
-  echo "        startup would fail or OOM-kill" >&2
-  problems=$((problems + 1))
-fi
-MEMLOCK_KB=$(ulimit -l)
-if [ "$MEMLOCK_KB" != "unlimited" ] && [ "$MEMLOCK_KB" -lt $(( CPU_BYTES_TO_USE / 1024 )) ]; then
-  echo "[warn] RLIMIT_MEMLOCK=$(gib "$(( MEMLOCK_KB * 1024 ))") GiB < staging: host" >&2
-  echo "       registration fails and DMA stays unpinned (needs commit bf78fc276);" >&2
-  echo "       keep RAM headroom so the staging is never swapped out" >&2
-fi
-
-if [ "$problems" -gt 0 ] && [ "${ALLOW_UNSAFE_LAUNCH:-0}" != "1" ]; then
-  echo "[error] refusing to launch ($problems sizing check(s) failed);" >&2
-  echo "        set ALLOW_UNSAFE_LAUNCH=1 to start anyway" >&2
-  exit 1
-fi
+# --- sizing preflight ------------------------------------------------------
+# Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
+# refuses to launch when the host cannot back the pre-faulted /dev/shm staging
+# region — the mount's total size, its *free* space (a stale or another
+# instance's staging file can eat it), and physical headroom — and warns when a
+# capacity target is undersized. CHECK_ONLY=1 stops after the checks.
+vllm_clean_shm_staging "$KV_ENGINE_ID"
+OFFLOAD_LABEL="staging"
+OFFLOAD_STAGING_BYTES=$CPU_BYTES_TO_USE
+OFFLOAD_CHAIN_BYTES=$CHAIN_BYTES
+OFFLOAD_CHAIN_CHUNKS=$CHAIN_CHUNKS
+OFFLOAD_RAM_CHAINS=1
+OFFLOAD_SSD_BYTES=$VLLM_SSD_MAX_BYTES
+OFFLOAD_SSD_CHAINS=4
+OFFLOAD_POOL_BYTES=$KV_CACHE_MEMORY_BYTES
+OFFLOAD_POOL_BYTES_PER_TOKEN=18278
+vllm_check_offload_sizing || exit 1
 if [ "${CHECK_ONLY:-0}" = "1" ]; then
   echo "[profile] CHECK_ONLY=1: sizing checks done, not launching"
   exit 0
@@ -204,6 +165,5 @@ mkdir -p "$VLLM_SSD_ROOT"
 if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
 fi
-vllm_clean_shm_staging "$KV_ENGINE_ID"
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
