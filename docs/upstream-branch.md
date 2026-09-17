@@ -303,6 +303,45 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
 要等内存到位**（见 §7）。
 
+### 5.7 信息面板 `scripts/tools/monitor_kv_offload.py`
+
+本分支没有 fork 的 `GET /host_tier_info`（那是 fork 在 `Scheduler` 里加的端点），所以面板完全
+建立在**这类服务本来就暴露的数据**上：只读、只用标准库、不需要 dev-mode。
+
+| 区块 | 数据来源 |
+|---|---|
+| `CONFIG` | `/proc/<pid>/cmdline`（启动参数 + `--kv-transfer-config` JSON：`engine_id`、tier 尺寸、策略）与 `vllm:cache_config_info`（`block_size`、池 token 数、dtype、mamba 参数） |
+| `STATUS` | `/metrics`：请求数、prefix / external 命中、GPU 池占用、connector 的 store/load 字节与直方图、tiering 的逐 tier 查询/命中/读写/job/失败、fs 配额与淘汰 |
+| `CHUNKS` | 直接扫磁盘层目录：chunk 数、字节、rank/group 分布、最新/最旧时间、最近写入的若干条 |
+| `Resources` | `nvidia-smi`、`/dev/shm`（含被 unlink、只能从 `/proc/*/maps` 看到的 staging 映射及其进程数）、`MemAvailable` |
+| `LOG`（可选 `--log`）| 日志尾部 256 KiB 的错误行计数与最后一条 |
+
+~~~bash
+python3 scripts/tools/monitor_kv_offload.py                 # :8000，5s 刷新
+python3 scripts/tools/monitor_kv_offload.py --port 8001 -d 2
+python3 scripts/tools/monitor_kv_offload.py --once
+python3 scripts/tools/monitor_kv_offload.py --json --count 5 # 每 tick 一行 JSON
+python3 scripts/tools/monitor_kv_offload.py --no-chunks --log 'logs/server_128k_*.log'
+~~~
+
+计数器显示 `累计 (+本 tick 增量)`；tier 标签直接取自引擎（`0:primary`、`1:fs`…）。`--json` 的每
+行含 `config / metrics / gpus / shm / disk / log`，便于脚本化告警。
+
+**与 fork 面板的差别（诚实说明）**：上游没有逐请求清单端点，所以 GPU/CPU 层只能看聚合占用；
+磁盘层是按 chunk hash 存放的，因此 `CHUNKS` 列的是**真实落盘的 chunk**（按 rank/group 分布），
+而不是 fork 的"逐条会话"。
+
+**实测**（128K profile）：
+
+- 冷启 120K 请求 → `Store GPU→CPU 7.2 GiB in 0.76 s (9.45 GiB/s)`、
+  `fs quota 54.2% (9.2 GiB / 17.0 GiB)`、`CHUNKS 178 file(s)`（group `g0/g1/g2` 各 11、`g3` 145）；
+- 挤掉 GPU 块后重发同一条 120K → `External queries 363,080 hits 155,200 (42.7%)`、
+  `Load CPU→GPU 5.3 GiB in 0.51 s (10.51 GiB/s)`、`tier 1:fs lookups 112 hits 104 (92.9%)`、
+  `read 5.4 GiB in 5.41 s`；请求本身 **4.6 s** 返回、命中 118,400/120,000（98.7%）；
+- 端口写错 / 服务不可达 → `(unavailable: no api_server process with --port N)` 与
+  `server down / metrics unavailable`，**不串台**（pid 只按 `--port` 严格匹配，靠解析
+  `/proc/*/cmdline` 而非 `pgrep -f`——后者会匹配到命令行里恰好含该字符串的 shell）。
+
 ---
 
 ## 6. 已知问题与注意事项
