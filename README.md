@@ -247,6 +247,10 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
   `Job N block I/O failed`，每个请求退化为全量重算。profile 已把
   `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail` 会中止受影响请求）。
 
+- **500K 部署**：`scripts/run_vllm_qwen38_awq_fp8e4m3_500k_ssd.sh`（64 GB 主机目标：staging 19.2 GB、
+  磁盘环 3 条满长链；自带装机自检，`CHECK_ONLY=1` 只检查不启动）。细节见
+  [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
+
 > 排查提示：单请求下 A→B→A 的第三次可能被 **GPU 前缀缓存**冒领（实测出现过
 > 118,400/120,000、3 s 的"假恢复"）；判断命中来源要看 `tiering_*` 指标，不能只看
 > `cached_tokens`。完整记录（含 10K/40K 小尺度数据、`cudaHostRegister` 粘性错误与对应补丁）

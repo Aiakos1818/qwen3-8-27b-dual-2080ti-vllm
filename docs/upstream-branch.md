@@ -247,6 +247,32 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 ---
 
+### 5.6 500K 部署 profile（64 GB 主机目标）
+
+`scripts/run_vllm_qwen38_awq_fp8e4m3_500k_ssd.sh`（+ `config/vllm-500k-ssd.env.example`）把
+§5.1–§5.5 的结论固化成可直接部署的脚本：
+
+| 参数 | 值 | 依据 |
+|---|---|---|
+| `MAX_MODEL_LEN` | 500800 | YARN 512K |
+| `KV_CACHE_MEMORY_BYTES` | 9.6e9 → **525,229 tokens（1.05×）** | 实测（§5.2 的每 token KV 口径） |
+| `CPU_BYTES_TO_USE` | **19.2e9（344 chunks）** | 满长链 313 chunks × 55.8 MB = 17.5 GB，+10% 余量 |
+| `VLLM_SSD_MAX_BYTES` | **52.5e9（≈3 条满长链）** | 3 × 17.5 GB，LRU 环形回收 |
+| `VLLM_SSD_CLEAN_START` | 0 | 跨重启保留、自动回收（§5.5） |
+
+**为什么是 64 GB**：staging 是 `/dev/shm` 上的硬预留（启动前整块预 fault），而 tmpfs 默认 = RAM 的
+50% → 32 GB 主机只有 16 GiB，**比一条链还少 0.3 GiB**；64 GB → 32 GiB ✓ 宽裕。
+
+脚本自带装机自检：`/dev/shm` 是否装得下 staging、`MemAvailable ≥ staging + 4 GiB`、memlock 告警、
+链/磁盘环/GPU 池是否配得上。`CHECK_ONLY=1` 只跑检查不启动；不合格时**拒绝启动**（exit 1 并打印
+可执行的 `mount -o remount,size=...M /dev/shm`），`ALLOW_UNSAFE_LAUNCH=1` 可强制放行。
+
+本机（16 GB / 7.8 GiB shm）实测：脚本按预期拒绝启动；参数在 vLLM 侧解析正常（日志确认
+`max_model_len: 500800` 与 `secondary_tiers[0].max_bytes: 52500000000`）。**真正跑 500K 恢复
+要等内存到位**（见 §7）。
+
+---
+
 ## 6. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |
