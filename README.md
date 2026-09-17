@@ -211,6 +211,32 @@ rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/psm_*
 `torch.full` 报 `invalid argument`）。清理后**多等约 20 秒**让驱动/nvrm 收尾再启动，成功率
 明显更高；仍偶发失败时再重试即可。
 
+## 128K 部署：tiered offload 要点
+
+`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` 在 128K 上下文上启用上游的 tiering
+offload（CPU staging 主层 + 磁盘 fs 二级层）。实测出的关键约束：
+
+**CPU staging 层必须装得下整条链。** 上游会把促销（promote）回来的 chunk 保留在 CPU 层，
+而不是只把它当流式 bounce buffer，所以容量不足时整次恢复作废
+（表现为 `vllm:kv_offload_tiering_promotion_allocation_failures` 计数）：
+
+~~~text
+CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
+    实测 chunk 几何：55.8 MB/chunk，1 chunk = 1 block = 1600 tokens
+    128K -> 82 chunks ≈ 4.58e9
+~~~
+
+同一 120K 会话被挤出后重发：
+
+| staging | 是否装得下 | A 重发命中 | 耗时 |
+| --- | --- | --- | --- |
+| 2.4e9（43 chunks） | 否 | **0**（且已白写 11.24 GB、白读 2.4 GB） | 132 s（=冷启） |
+| 4.6e9（82 chunks） | 是 | **118,400 / 120,000（98.7%）** | **5 s** |
+
+即 staging 配小了不是"没效果"，而是**净亏 I/O**；profile 已内置启动自检，装不下一条满长链
+时会打印 `[warn]`。完整记录（含 10K/40K 小尺度数据、`cudaHostRegister` 粘性错误与对应补丁）
+见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
+
 ## 跑通后的性能验收
 
 > **数据来源**：本节及下一节（含 `reports/`）的实测数据来自原项目（zyYuc）在其机器

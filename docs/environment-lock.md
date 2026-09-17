@@ -30,7 +30,8 @@ nvidia-cusparselt-cu13 0.8.1
 头文件与 torch cu130 不匹配）。构建侧的其余修补见
 [upstream-branch.md](upstream-branch.md) §3。
 
-已知 pip 依赖冲突（运行时实测无害）：`flash-qla` 声明 `tilelang==0.1.8` /
-`apache-tvm-ffi==0.1.9`，实际安装 0.1.12 / 0.1.11。
+`flash-qla` 的 `setup.py` 原先把上述两个包钉死在 `tilelang==0.1.8` /
+`apache-tvm-ffi==0.1.9`，与本环境（0.1.12 / 0.1.11，与 flashinfer 0.6.18 共存）冲突；
+已放宽为 `>=`，`pip check` 无冲突，见 [upstream-branch.md](upstream-branch.md) §3。
 
 系统 nvcc 是否在 PATH 并不是 vLLM 运行的唯一判断条件；本环境依靠 PyTorch 的 CUDA 运行时。若从源码编译 vLLM、FlashInfer 或 FlashQLA，仍需要准备匹配的 CUDA 编译工具链。

@@ -69,17 +69,18 @@ fbf2c5e8b  [Frontend] Add per-request metrics to Responses API (#55084)   ← �
 5. **手动 clone cutlass 源码**到 `.deps/cutlass-src`（`v4.7.1`，HEAD `cb4247394`），配合 `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` 规避离线构建时的下载。
 
 构建参数：`TORCH_CUDA_ARCH_LIST=7.5`、`MAX_JOBS=6`、`CUDA_HOME` 指向 pip 的 cu13，耗时约 **52 分钟**。
-可复现脚本：`/tmp/opencode/build_vllm.sh`（**仍在 /tmp，未入库**）。
+可复现脚本：`scripts/setup/build_vllm.sh`（`VLLM_SRC=<vLLM checkout> bash …`；
+`CHECK_ONLY=1` 只跑预检，会核对上表 5 项修补是否到位）。
 
-已知 pip 依赖冲突（**运行时实测无害**）：
+本机 FlashQLA checkout 取分支 `sm75-qwen3.8` 的 HEAD（`7c30b56`，已含本地 SM75 改动，
+即 `patches/flashqla-sm70-sm75-local.patch` 的内容），以 editable 方式装在当前 checkout
+路径上（`pip check` 干净）。
 
-```
-flash-qla 0.1.0+3ab27d7 requires tilelang==0.1.8, but you have tilelang 0.1.12
-flash-qla 0.1.0+3ab27d7 requires apache-tvm-ffi==0.1.9, but you have apache-tvm-ffi 0.1.11
-```
-
-> 注意：`flash_qla` 的 editable 记录指向 **`/home/aiakos/zyYuc-sandbox/...`（已不存在的旧路径）**，
-> 实际生效靠启动脚本里的 `PYTHONPATH=<新路径>/src/FlashQLA-SM70-SM75`。
+`flash_qla` 的 `setup.py` 已把 `tilelang` / `apache-tvm-ffi` 从 `==0.1.8` / `==0.1.9`
+放宽为 `>=`：内核按这两个版本开发，但在 tilelang 0.1.12 + apache-tvm-ffi 0.1.11
+（与 flashinfer 0.6.18 共存）上实测可跑，硬钉会让 pip 报冲突
+（见 `docs/environment-lock.md`）。重装时用 `pip install -e . --no-deps`，避免把
+tilelang 降级回去。
 
 ---
 
@@ -89,11 +90,13 @@ flash-qla 0.1.0+3ab27d7 requires apache-tvm-ffi==0.1.9, but you have apache-tvm-
 
 | 脚本 | 用途 |
 |---|---|
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 基础 profile：500.8K 上下文，无 offload，9.6e9 池 |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` | 128K 上下文 + 上游两层 offload（CPU+disk），**本文主要验证对象** |
-| `config/vllm-128k-ssd.env.example` | 上者的配置模板 |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_16k_ssd.sh` | 16K + 小池 offload 快速实验台（秒级触发驱逐/恢复） |
+| `config/vllm-128k-ssd.env.example` | 128K profile 的配置模板 |
 
-最小配置（无 offload，9.6e9 池 + `max-model-len 500800`）目前仍在 `/tmp/opencode/run_sm75_upstream.sh`，
-**尚未入库**（待定放置位置）。
+三个 profile 都从 `.env` 取路径（`MODEL_PATH` / `VLLM_PYTHON` / `FLASHQLA_PATH` /
+`CHAT_TEMPLATE`），profile 参数在脚本内有默认值、可用环境变量覆盖。
 
 共同参数：`--dtype half`、TP=2、`--device-ids 0,1`、`--kv-cache-dtype fp8_e4m3`、
 `--gdn_prefill_backend=flashqla_legacy`、MTP `num_speculative_tokens=3`、
@@ -179,7 +182,7 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 | `RLIMIT_MEMLOCK = 8192 KB`（软硬同） | 无法在不提权的情况下调高（`sudo -n` 要密码；`systemd-run --user -p LimitMEMLOCK=infinity` 报 Unknown assignment）。靠 §5.1 的补丁降级运行 |
 | 磁盘层没有配额参数 | 上游的 fs 二级层不支持配额/限速；磁盘层随工作集增长（实测一次测试就到 8.5–15 GB），长测试要盯 `du -sh ssd_kv` |
 | 磁盘层目录随 `engine_id` | 不固定 `engine_id` 时每次启动都新目录（孤儿累积）；128K profile 固定为 `qwen38-27b-128k-ssd` 并在启动前清空 |
-| `flash_qla` editable 指向失效旧路径 | 靠启动脚本 `PYTHONPATH` 生效（§3） |
+| `flash_qla` 依赖钉死导致 pip 冲突 | 已修：`setup.py` 放宽为 `>=` 并重装 editable（§3）；启动脚本仍设 `PYTHONPATH`，但已非必需 |
 | `scripts/tools/kv_pool_sizing.py` 原先解析不了本仓库全部 profile | 已修（见下） |
 
 `kv_pool_sizing.py` 的修复（`a323e60`）：原来只认 `${VAR:-默认}`，导致
@@ -191,7 +194,8 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 
 ---
 
-## 7. 待办
+## 7. 待办与未覆盖
 
-1. 最小配置启动脚本（`/tmp/opencode/run_sm75_upstream.sh`）入库位置待定。
-2. §5.2/§5.3 的"CPU 层须装下整条链 / 装不下则净亏 I/O"是否再摘要进 README 待定。
+1. 两个 `sm75-upstream`（vLLM 仓库 / 本仓库）都**未推送**到任何远端。
+2. offload 尚未压测的场景：磁盘层长期增长与驱逐（上游无配额参数）、池接近满时的恢复、
+   `max-num-seqs > 1` 的并发、pinned 与 unpinned DMA 的性能差、多轮 restore 的长时间稳定性。
