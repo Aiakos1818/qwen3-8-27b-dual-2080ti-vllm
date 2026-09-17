@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 VLLM_PYTHON=python
-if [ -f .env ]; then
-  source .env
+if [ -f "$REPO_ROOT/.env" ]; then
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.env"
 fi
 
 "$VLLM_PYTHON" - <<'PY'

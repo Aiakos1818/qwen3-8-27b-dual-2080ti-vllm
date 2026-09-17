@@ -6,6 +6,7 @@ content delta. It therefore counts the first streamed thinking character.
 """
 import argparse
 import json
+import os
 import random
 import time
 import urllib.request
@@ -27,7 +28,7 @@ def build_prompt(target_words, seed):
     ).format(seed, " ".join(pieces))
 
 
-def request_once(base_url, model, prompt, max_tokens):
+def request_once(base_url, model, prompt, max_tokens, api_key=None):
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -37,10 +38,13 @@ def request_once(base_url, model, prompt, max_tokens):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
     req = urllib.request.Request(
         base_url + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     started = time.perf_counter()
@@ -93,6 +97,11 @@ def main():
     parser.add_argument("--word-counts", type=int, nargs="+", default=[2700, 5400, 8100])
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("OPENAI_API_KEY"),
+        help="Bearer token; defaults to $OPENAI_API_KEY",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     all_results = []
@@ -103,6 +112,7 @@ def main():
                 args.model,
                 build_prompt(word_count, word_count * 100 + run),
                 args.max_tokens,
+                args.api_key,
             )
             result["target_words"] = word_count
             result["run"] = run

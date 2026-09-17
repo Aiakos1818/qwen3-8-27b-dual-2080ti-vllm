@@ -1,12 +1,29 @@
-# Qwen3.8-27B：双 RTX 2080 Ti 22GB + NVLink 的 vLLM 抄作业配置
+# Qwen3.8-27B：双 RTX 2080 Ti 22GB + NVLink 的 vLLM 部署（上游分支）
+
+> **本分支 `sm75-upstream`**：把 SM75 部署改动重新落到**上游 vLLM main** 上。
+> 开分支 / 移植范围 / 编译环境修补 / 部署与 128K offload 实测记录见
+> [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 这是一个独立的开源部署项目，面向 2 张魔改 RTX 2080 Ti 22GB、并且两卡之间已连接双 NVLink 的用户。
 
 目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
 
-适合：单机双卡、单请求优先、180K 上下文、个人/小团队 API、长文档与代码任务。
+适合：单机双卡、单请求优先、180K / 435K 上下文、个人/小团队 API、长文档与代码任务。
 
 不包含：模型权重、API Key、内网地址、个人目录、SSH 或隧道配置。
+
+## 本分支新增
+
+本分支从**上游**（[zyYuc](https://github.com/zyYuc)）切出，把 SM75 部署改动重新落在上游
+vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
+
+- **SM75 / Qwen3.8 移植**：9 个文件（FlashQLA legacy GDN prefill、Qwen3.5 MTP、SM75
+  spec-decode 同步、FlashInfer 的 SM75 支持判定等），即
+  `patches/vllm-v0.27.1-sm75-qwen3.8.patch` 对应的改动。
+- **128K 部署 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` —— 128K 上下文
+  + 上游 tiering offload（CPU staging 主层 + 磁盘二级层）。
+- **编译环境修补**、上游 offload 在本机踩到的 `cudaHostRegister` 粘性错误，以及 128K
+  驱逐/恢复实测，见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 ## 已验证环境
 
@@ -15,16 +32,16 @@
 | GPU | 2 × NVIDIA GeForce RTX 2080 Ti 22GB（22,528 MiB / 卡） |
 | GPU 架构 | Turing / SM75 / Compute Capability 7.5 |
 | GPU 互联 | NV2：每张卡 2 条 NVLink；单条实测约 25.781 GB/s |
-| CPU | AMD Ryzen 7 5700X，8 核 16 线程 |
-| 内存 | 32 GiB |
-| OS / Kernel | Ubuntu 24.04.4 LTS / Linux 6.17.0-29-generic |
-| NVIDIA Driver | 580.159.03 |
+| CPU | Intel Xeon E5-2696 v3，18 核 36 线程 @2.30GHz |
+| 内存 | 15 GiB（swap 64 GiB） |
+| OS / Kernel | Ubuntu 24.04.4 LTS / Linux 7.0.0-31-generic |
+| NVIDIA Driver | 580.173.02 |
 | CUDA Runtime | 13.0 |
 | Python | 3.12.3 |
 | PyTorch | 2.13.0+cu130 |
-| vLLM | 0.27.1，上游 v0.27.1 commit 6e448d0ea9bf3d88d898b65449ca6dc2aec170ac + 本仓库 patch |
-| Transformers / Triton | 5.15.1 / 3.7.1 |
-| FlashInfer | 0.6.16 |
+| vLLM | 0.27.2.dev0+g6e448d0ea（上游 commit 6e448d0ea9bf3d88d898b65449ca6dc2aec170ac，即 v0.27.1 + 本仓库 patch） |
+| Transformers / Triton | 5.16.1 / 3.7.1 |
+| FlashInfer | 0.6.16.post3 |
 | NCCL | 2.29.7 |
 
 ## 这套配置的目标
@@ -41,10 +58,12 @@
 ## 目录
 
 ~~~text
-config/       环境变量样例
-docs/         打补丁、加速组件和引用说明
+config/       环境变量样例（含 128K offload profile）
+docs/         打补丁、加速组件与上游分支记录
 patches/      已验证工作树导出的 vLLM / FlashQLA patch
-scripts/      启动、硬件检查、FlashInfer 检查、GDN 辅助脚本
+scripts/      启动 profile 与硬件检查
+scripts/setup/  硬件与依赖准备
+scripts/tools/  启动看护、池容量测算
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
 reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
@@ -55,7 +74,7 @@ reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原�
 ### 1. 验证硬件
 
 ~~~bash
-bash scripts/verify_hardware.sh
+bash scripts/setup/verify_hardware.sh
 ~~~
 
 关键拓扑应包含：
@@ -94,7 +113,110 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 bash scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
+引擎要加载权重并编译数分钟，而且**失败也正是发生在这段时间内**（见下一节）。别用固定
+`sleep` 去盯，用仓库自带的看门狗——`/health` 变 200 或日志里出现致命模式时**立即返回**：
+
+~~~bash
+bash scripts/tools/wait_server.sh logs/server.log 600
+# 0 = ready  1 = 出错（并打印命中的那一行）  2 = 超时
+# 端口默认取 .env 的 PORT（其次 8000）
+~~~
+
+### 5. 启动排障（本机实测）
+
+三项都不涉及模型本身，但会直接导致"起不来"或"时好时坏"：
+
+**1. `/dev/shm` 必须留够空间（最重要）**
+
+offload 的 staging 区是 `/dev/shm/vllm_offload_<engine_id>.mmap`，大小等于
+`CPU_BYTES_TO_USE`（128K profile 为 **4.57 GiB**），加上 vLLM 自身的 POSIX shm 约 0.7 GiB，
+**单实例需 ≈5.3 GiB**（本机 tmpfs 共 7.8 GiB）。
+进程被 kill/崩溃时该文件不会被删（只有正常退出才 `unlink`）；若 `engine_id` 是每次启动
+随机的 UUID，残留文件永远不会被回收 → `/dev/shm`（本机 7.8 GiB）累积几次即满 →
+驱动 `cuMemHostRegister_v2` 无法为 staging 落页，报
+`Failed to allocate physical memory` 并返回 `CUDA_ERROR_INVALID_VALUE` →
+**毒化 CUDA context** → warmup 里 `torch.full` 报 `CUDA error: invalid argument` → 引擎挂死。
+表现就是"有时能起、清一下或重启就能起"。
+
+对策（128K profile 已内置）：**固定 `KV_ENGINE_ID`**（每个 profile 一个，互不重复），
+并在启动前 `rm -f /dev/shm/vllm_offload_<id>.mmap`，残留不再累积。磁盘二级层的目录由
+模型路径派生（与 `engine_id` 无关），所以 profile 用 `VLLM_SSD_CLEAN_START=1` 在启动前
+清空 `VLLM_SSD_ROOT`，否则上一次运行的会话目录会成为孤儿、永远不回收。
+
+> **起不来的第一反应：先清 `/dev/shm`（一键，别先查别的）**
+>
+> 只要服务是**异常退出或被 `kill`**（不是正常关机），staging 文件就会残留；换了
+> `KV_ENGINE_ID` 反复试更是会一次留一个（128K profile 每个 ≈4.57 GiB）。启动前无论 `engine_id`
+> 是什么，直接清干净：
+>
+> ~~~bash
+> df -h /dev/shm                       # 看是否接近 100%（本机 tmpfs 7.8 GiB）
+> ls -la /dev/shm/*.mmap               # 看残留了哪些
+> rm -f /dev/shm/vllm_offload_*.mmap   # 一键清理（通配所有 engine_id）
+> ~~~
+>
+> **判据**：日志里出现 `Insufficient space in /dev/shm`，或 warmup 阶段
+> `torch.full` / `cuMemHostRegister_v2` 报 `CUDA error: invalid argument`
+> （`qwen_triton_warmup.py` 附近），**几乎可以直接判定是这条**——`/dev/shm` 满或半满，
+> 先清 shm 再谈其他，否则会白白怀疑补丁/编译/模型。
+>
+> **但先别只看 shm**：第 2 条（linger 未开）会给出**同样的** invalid argument 症状。
+> 启动失败时**两条都做**：`loginctl enable-linger $USER` + 清 `/dev/shm`；
+> 若是 `kill -9` 之后重启，清理完还要**多等约 20 秒**再启（见第 3 条）。
+
+**2. 启动前先开 linger（不开也会让启动失败，不只是"会话结束被杀"）**
+
+`loginctl enable-linger $USER` 是**一次性**设置，务必先做。linger 未开时，除了"SSH
+会话一结束，systemd 停掉 `user@<uid>`、移除整个 user slice、**该用户所有进程被杀**"
+（日志表现为 worker `died unexpectedly (exit code: None)` 且无 Python 栈）之外，
+**实测还会在启动阶段让 `cudaHostRegister` 失败并毒化 CUDA context**——症状与第 1 条
+**完全一样**（`Failed to allocate physical memory` →
+warmup 的 `torch.full` 报 `CUDA error: invalid argument`），极易误判成 `/dev/shm`
+问题。所以每次排查启动失败，先确认 `linger=yes`：
+
+~~~bash
+sudo loginctl enable-linger $USER      # 一次性
+loginctl show-user $USER -p Linger     # 期望 Linger=yes
+~~~
+
+或者从常驻会话 / 系统服务启动（见下文 systemd 一节）。
+
+> 实测记录：连续多次启动失败、按第 1 条清理 `/dev/shm` 也没稳定起，执行
+> `loginctl enable-linger aiakos` 后再启动即成功。两条诱因会给出**同样的** invalid
+> argument 症状，**先 linger、再 shm**，或两条都做。
+
+**3. `cudaHostRegister` 偶发失败 → 清 shm + 等 20 秒再启**
+
+`/dev/shm` 空间充足时该调用仍偶发返回 `cudaErrorInvalidValue`，且**失败即毒化 CUDA
+context**（实测：失败后下一次 CUDA 调用必报 `invalid argument`）。带
+`CUDA_LOG_FILE=stderr` 启动可看到驱动给的确切原因：
+
+~~~text
+[CUDA][E] Failed to allocate physical memory
+[CUDA][E] Returning 1 (CUDA_ERROR_INVALID_VALUE) from cuMemHostRegister_v2
+~~~
+
+**实测最稳的"重启三连"**（`kill -9` 之后尤其重要）：
+
+~~~bash
+pkill -9 -f "[v]llm.entrypoints"; sleep 2
+pkill -9 -f "[V]LLM::Worker"; pkill -9 -f "[E]ngineCore"
+sleep 20                                  # ← 关键：等驱动回收 pinned 页 / mmap
+rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/psm_*
+# 然后再启动
+~~~
+
+`kill -9` 会打断正在进行的 CUDA 操作、留下未 unregister 的 pinned 内存与残留 mmap，
+**立即重启时 `cudaHostRegister` 最容易失败**（且失败即毒化 context，表现为 warmup 的
+`torch.full` 报 `invalid argument`）。清理后**多等约 20 秒**让驱动/nvrm 收尾再启动，成功率
+明显更高；仍偶发失败时再重试即可。
+
 ## 跑通后的性能验收
+
+> **数据来源**：本节及下一节（含 `reports/`）的实测数据来自原项目（zyYuc）在其机器
+> （AMD Ryzen 7 5700X / 32 GiB）上的运行；本分支的运行机器为 Intel Xeon E5-2696 v3 / 15 GiB，
+> 硬件不同，下列数字仅供形态参考，未在本机复测。本分支自己的实测见
+> [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 这一步是“AI 能否真的帮你跑到相近速度”的关键，而不是只看到服务能启动。这里的首字时间严格按模型流式输出的第一个思考字符或答案字符计算；Qwen 开始输出 think 中第一个字符，就视为首字。
 
@@ -192,7 +314,7 @@ python benchmarks/run_context_ttft.py \
 
 | 环境变量 | 值 | 作用 |
 | --- | --- | --- |
-| OMP_NUM_THREADS | 8 | 与 5700X 物理核心数匹配。 |
+| OMP_NUM_THREADS | 8 | 本机 Xeon E5-2696 v3 为 18 核 36 线程，取 8 以控制线程开销。 |
 | VLLM_USE_DEEP_GEMM | 0 | 关闭此配置未使用的 DeepGEMM 路径。 |
 | VLLM_USE_FLASHINFER_SAMPLER | 0 | 关闭 FlashInfer top-k/top-p sampler。 |
 | VLLM_QWOPUS_MTP_BF16_DRAFT | 1 | Qwen3.5 MTP draft 层兼容设置。 |
@@ -226,3 +348,7 @@ sudo systemctl status qwen3.8-27b-vllm --no-pager
 ## 引用与致谢
 
 感谢并请引用：vLLM、PyTorch、Hugging Face Transformers、FlashInfer、FlashQLA-SM70-SM75、NCCL、Triton-Turing（SM75 fork，reports 战役引用）。详细链接、commit 和许可证在 docs/ACCELERATION_AND_ATTRIBUTION.md。
+
+本分支（`sm75-upstream`）把 SM75 部署改动重新落到上游 vLLM `main` 上，并新增 128K
+offload profile，记录见 [`docs/upstream-branch.md`](docs/upstream-branch.md)，由
+[Aiakos1818](https://github.com/Aiakos1818) 贡献，按本仓库 MIT 许可发布。

@@ -2,7 +2,8 @@
 # Verified launch profile for Qwen3.8-27B on 2x RTX 2080 Ti 22GB + NVLink.
 set -Eeuo pipefail
 
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 if [ -f "$REPO_ROOT/.env" ]; then
   source "$REPO_ROOT/.env"
 fi
@@ -26,7 +27,7 @@ PYTHONPATH=$(printenv PYTHONPATH || true)
 
 export CUDA_HOME OMP_NUM_THREADS VLLM_USE_DEEP_GEMM VLLM_USE_FLASHINFER_SAMPLER
 export VLLM_QWOPUS_MTP_BF16_DRAFT VLLM_SM75_SPEC_SYNC_MODE VLLM_USE_V2_MODEL_RUNNER
-export PATH="$CUDA_HOME/bin:$PATH"
+export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 export PYTHONPATH="$FLASHQLA_PATH"
 
