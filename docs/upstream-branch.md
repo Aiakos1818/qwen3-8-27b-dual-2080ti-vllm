@@ -91,9 +91,14 @@ tilelang 降级回去。
 | 脚本 | 用途 |
 |---|---|
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 基础 profile：500.8K 上下文，无 offload，9.6e9 池 |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` | 128K 上下文 + 上游两层 offload（CPU+disk），**本文主要验证对象** |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_16k_ssd.sh` | 16K + 小池 offload 快速实验台（秒级触发驱逐/恢复） |
-| `config/vllm-128k-ssd.env.example` | 128K profile 的配置模板 |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx15.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 15 条链的环），**本文主要验证对象** |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | 500K + 纯 RAM offload（CPU 层即 store，2 条链） |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 500K + RAM staging（1 条链）+ 磁盘 4 条链的环 |
+| `config/vllm-128k-RAMx1-SSDx15.env.example` | 128K profile 的配置模板 |
+
+profile 命名规律：`<模型>_<量化>_<上下文>[_RAMx<N>[_SSDx<M>]]` —— 后缀即容量
+（`<N>` 个满长上下文常驻 RAM / `<M>` 个在磁盘上成环）；文件名与容量一一对应，
+尺寸在脚本内由 `MAX_MODEL_LEN` 推导。
 
 三个 profile 都从 `.env` 取路径（`MODEL_PATH` / `VLLM_PYTHON` / `FLASHQLA_PATH` /
 `CHAT_TEMPLATE`），profile 参数在脚本内有默认值、可用环境变量覆盖。
@@ -292,7 +297,7 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 |---|---|
 | `RLIMIT_MEMLOCK = 8192 KB`（软硬同） | 无法在不提权的情况下调高（`sudo -n` 要密码；`systemd-run --user -p LimitMEMLOCK=infinity` 报 Unknown assignment）。靠 §5.1 的补丁降级运行 |
 | 上游 fs 层默认没有回收机制 | 上游只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处），占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。本线已补 `max_bytes` 字节预算 + LRU 淘汰（§5.5），128K/16K 两个 profile 默认 64 GiB、且不再在启动时清空目录 |
-| 磁盘层目录随 `engine_id` | 不固定 `engine_id` 时每次启动都新目录（孤儿累积）；128K profile 固定为 `qwen38-27b-128k-ssd` 并在启动前清空 |
+| 磁盘层目录随模型/配置，不随 `engine_id` | 目录名由模型路径+配置摘要派生（`<root>/<model>_<digest>_r<rank>/`），所以换 `engine_id` 不会留下孤儿；`engine_id` 只决定 `/dev/shm` 的 staging 文件名，每个 profile 各自固定 |
 | `flash_qla` 依赖钉死导致 pip 冲突 | 已修：`setup.py` 放宽为 `>=` 并重装 editable（§3）；启动脚本仍设 `PYTHONPATH`，但已非必需 |
 | `scripts/tools/kv_pool_sizing.py` 原先解析不了本仓库全部 profile | 已修（见下） |
 

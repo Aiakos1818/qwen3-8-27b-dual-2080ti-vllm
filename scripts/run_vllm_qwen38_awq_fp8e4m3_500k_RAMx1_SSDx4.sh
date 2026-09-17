@@ -39,6 +39,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=tools/shm_staging.sh
+source "$SCRIPT_DIR/tools/shm_staging.sh"
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
@@ -202,6 +204,6 @@ mkdir -p "$VLLM_SSD_ROOT"
 if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
 fi
-rm -f "/dev/shm/vllm_offload_${KV_ENGINE_ID}.mmap"
+vllm_clean_shm_staging "$KV_ENGINE_ID"
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

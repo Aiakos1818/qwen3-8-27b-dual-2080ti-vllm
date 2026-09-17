@@ -20,8 +20,8 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 - **SM75 / Qwen3.8 移植**：9 个文件（FlashQLA legacy GDN prefill、Qwen3.5 MTP、SM75
   spec-decode 同步、FlashInfer 的 SM75 支持判定等），即
   `patches/vllm-v0.27.1-sm75-qwen3.8.patch` 对应的改动。
-- **128K 部署 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` —— 128K 上下文
-  + 上游 tiering offload（CPU staging 主层 + 磁盘二级层）。
+- **128K 部署 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx15.sh` —— 128K
+  上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 15 条链的环）。
 - **编译环境修补**、上游 offload 在本机踩到的 `cudaHostRegister` 粘性错误，以及 128K
   驱逐/恢复实测，见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
@@ -214,7 +214,7 @@ rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/psm_*
 
 ## 128K 部署：tiered offload 要点
 
-`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_ssd.sh` 在 128K 上下文上启用上游的 tiering
+`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx15.sh` 在 128K 上下文上启用上游的 tiering
 offload（CPU staging 主层 + 磁盘 fs 二级层）。实测出的关键约束：
 
 **CPU staging 层必须装得下整条链。** 上游会把促销（promote）回来的 chunk 保留在 CPU 层，
