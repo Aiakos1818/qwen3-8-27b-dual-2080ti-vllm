@@ -342,6 +342,39 @@ python3 scripts/tools/monitor_kv_offload.py --no-chunks --log 'logs/server_128k_
   `server down / metrics unavailable`，**不串台**（pid 只按 `--port` 严格匹配，靠解析
   `/proc/*/cmdline` 而非 `pgrep -f`——后者会匹配到命令行里恰好含该字符串的 shell）。
 
+#### 浏览器面板 `scripts/tools/monitor_kv_offload_web.py`
+
+终端版打印的是文本帧：`--once`/`--json`/`--append` 与 grep 都合适，但字符网格不适合"看"状态。
+浏览器天生有滚轮、缩放与滚动条，卡片和进度条画起来也不花成本；而真正麻烦的**采集**部分是同
+一套代码，所以本脚本直接 `import monitor_kv_offload` 复用 `Metrics` / `collect_config` /
+`scan_chunks` / `shm_stats` / `gpu_memory` 等，不重复实现。**纯标准库**，页面内联 CSS/JS，
+**不引用任何外部资源**（离线主机可用）：
+
+~~~bash
+python3 scripts/tools/monitor_kv_offload_web.py                   # http://127.0.0.1:8199/
+python3 scripts/tools/monitor_kv_offload_web.py --port 9000 -d 2
+python3 scripts/tools/monitor_kv_offload_web.py --vllm-port 8001 --log 'logs/server_128k_*.log'
+python3 scripts/tools/monitor_kv_offload_web.py --host 0.0.0.0     # 局域网（无鉴权，慎用）
+python3 scripts/tools/monitor_kv_offload_web.py --self-test
+~~~
+
+| 端点 | 内容 |
+|---|---|
+| `GET /` | 面板页：CONFIG / STATUS / CHUNKS ON DISK / LOG 四张卡片，进度条 + 刷新时钟 + 暂停勾选 |
+| `GET /api/view` | 页面消费的结构化数据（config 行、bars、tables、chunks、log） |
+| `GET /api/snapshot` | 原始采样，形状与终端版 `--json` 一致（指标系列 + proc/disk/shm/gpu） |
+| `GET /healthz` | 存活探测 |
+
+- **采样在后端**：后台线程每 `-d` 秒采一次并缓存，所有浏览器共用同一份，所以"本 tick 增量"
+  （如 `last 3s: +N hits`）不会因为多开页面互相稀释；页面只定时 `fetch('/api/view')`。
+- 默认只绑 `127.0.0.1`（payload 含本机路径）；远端用 SSH 隧道
+  `ssh -L 8199:127.0.0.1:8199 <host>`。`--host 0.0.0.0` 无鉴权，启动时会打印警告。
+- 只读：只对 vLLM 发 GET，只读 `/proc`、`/dev/shm`、`/proc/meminfo`、`nvidia-smi` 与磁盘层文件。
+- 实测：`/api/view` 3 条进度条（GPU 0.0% / CPU 0.0% / fs 54.2%）、5 张表、13 行 CONFIG、
+  60 行 chunk，`external 174,400/388,058 (44.9%)`、`Store 7.2 GiB in 0.76 s (9.45 GiB/s)`；
+  页面 5.3 KB 无外链；`/api/snapshot` 含 81 个指标系列；`--self-test` 用桩数据渲染一遍 view，
+  防属性名/结构漂移（开发时正是它抓到 `cache_layout` 写错）。
+
 ---
 
 ## 6. 已知问题与注意事项

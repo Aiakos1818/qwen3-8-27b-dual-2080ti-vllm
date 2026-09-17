@@ -63,7 +63,7 @@ docs/         打补丁、加速组件与上游分支记录
 patches/      已验证工作树导出的 vLLM / FlashQLA patch
 scripts/      启动 profile 与硬件检查
 scripts/setup/  硬件与依赖准备
-scripts/tools/  启动看护、池容量测算、KV offload 信息面板
+scripts/tools/  启动看护、池容量测算、KV offload 信息面板（终端 + 浏览器）
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
 reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
@@ -129,6 +129,9 @@ python3 scripts/tools/monitor_kv_offload.py            # :8000，5s 刷新
 python3 scripts/tools/monitor_kv_offload.py --port 8001 --once
 python3 scripts/tools/monitor_kv_offload.py --json --count 5
 ~~~
+
+同一个面板还有**浏览器版**（纯标准库、内联 CSS/JS、不依赖外网；滚轮/缩放天生可用）：
+`python3 scripts/tools/monitor_kv_offload_web.py` → `http://127.0.0.1:8199/`。
 
 `CONFIG` 取自 `/proc/<pid>` 与 `vllm:cache_config_info`，`STATUS` 取自 `/metrics`，
 `CHUNKS` 取自磁盘层目录（说明见 docs/upstream-branch.md §5.7）。

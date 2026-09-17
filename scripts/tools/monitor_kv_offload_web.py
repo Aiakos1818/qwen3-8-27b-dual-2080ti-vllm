@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Browser panel for the KV-offload data the terminal monitor collects.
 
-The terminal monitor spends most of its code fighting the terminal: escape
-sequences, a fixed character grid, an alternate screen with no scrollback, and
-"the frame must not be taller than the window". A browser has none of those
-problems -- mouse wheel, resize and scrolling are free -- while the genuinely
-hard part, collecting the numbers, is identical. So this serves that data over
-HTTP and draws it as one live page.
+The terminal monitor prints text frames: ideal for --once, --json, --append and
+for grepping, but a character grid is a poor surface for *looking* at the state.
+A browser brings mouse wheel, resize and scrolling for free, and cards and bars
+cost nothing to draw. The genuinely hard part -- collecting the numbers -- is
+identical either way, so this imports the collector instead of duplicating it and
+serves one live page over HTTP.
 
 Usage:
   monitor_kv_offload_web.py                        # http://127.0.0.1:8199
