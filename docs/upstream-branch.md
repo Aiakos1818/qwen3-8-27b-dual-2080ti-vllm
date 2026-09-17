@@ -175,8 +175,9 @@ None（`vllm/v1/kv_offload/tiering/manager.py:455`），计数
 
 ### 5.4 磁盘层写满时的行为（实测）
 
-磁盘层**没有任何回收机制**（见 §6）。把 128K profile 的 `VLLM_SSD_ROOT` 指到 1.6 GB
-的 tmpfs 让它真实写满（一条 120K 链约需 4.5 GB）：
+下面是**未设上限**（`max_bytes=0`，上游默认行为）时的情况；设了上限见 §5.5。
+把 128K profile 的 `VLLM_SSD_ROOT` 指到 1.6 GB 的 tmpfs 让它真实写满
+（一条 120K 链约需 4.5 GB）：
 
 | 观察 | 结果 |
 |---|---|
@@ -208,12 +209,49 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 ---
 
+### 5.5 磁盘层字节上限 + LRU 淘汰（实现，已实测）
+
+上游 fs 层没有容量概念（无配额、无 TTL、无淘汰），占用随累计 spill 单调增长
+（实测 ~4.5 GB / 条 120K 链）。本线补了 **tier 自管字节预算**：配置
+`max_bytes` 后，tier 在**自己的 I/O 线程**上淘汰整块文件（不会阻塞调度线程），
+空间不够就删到够为止。配套还做了：
+
+- **LRU 而非 FIFO**：晋升（磁盘→CPU/GPU）只把块拷进 primary，**磁盘副本保留**
+  （`_complete_promotion` 不删 secondary 副本）→ 被反复恢复的块就是有价值的块，
+  所以按"最近使用"淘汰。recency 就是文件 mtime，恢复成功时 `os.utime` 刷新；
+  重启后从磁盘读回，顺序依然正确。
+- **写满兜底**：写如果仍以 `ENOSPC`/`EDQUOT`/`EIO` 失败（例如同分区被别的数据占满），
+  就再淘汰一批并重试（`evict_retries`，默认 3 次）。
+- **不淘汰在途 load 的块**（in-flight 路径集合），避免自己制造 load 失败。
+- **启动盘点**：init 时扫描目录（~10–30 ms / 3000 文件），所以 `CLEAN_START=0`
+  的续用场景也正确；顺带清掉被 kill 的进程留下的孤儿 `.tmp`。
+- **指标**：`vllm:kv_offload_tiering_fs_{used_bytes,evictions,evicted_bytes,skipped_store_bytes}`。
+
+实测（128K profile，`VLLM_SSD_MAX_BYTES=6.05 GiB`，一条 120K 链需 4.58 GB）：
+
+| 步骤 | cached | 用时 | 磁盘占用 |
+|---|---|---|---|
+| A（冷启） | 0 / 120,000 | 132 s | 4.3 GiB |
+| A 重发 | **118,400（98.7%）** | **3 s** | 4.3 GiB |
+| C（新链，触发淘汰） | 0 / 120,000 | 132 s | **6.1 GiB（被 cap 住）** |
+| C 重发 | **118,400（98.7%）** | **3 s** | 6.1 GiB |
+
+- **0 次 `block I/O failed`、0 次请求中止、0 次短读**（对比 §5.4 未设上限时的 324 次）。
+- 淘汰计数 46 块 / 2.39 GiB，`used_bytes` 稳定在 6.02 GiB ≤ cap；被淘汰的正是
+  最旧的 A（C 更新），最新链 C 完好 → LRU 行为符合预期。
+
+注意两点：**上限假设 tier 独占该目录**（多实例共享 `root_dir` 时互相删块无法判断谁在用，
+此时不要设 `max_bytes`）；**cap 至少要装得下一条满长链**，否则每次 store 都会把自己
+链头淘汰掉，收益退化为 0（此时 tier 会打一条 `warning_once` 并跳过该批 store）。
+
+---
+
 ## 6. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |
 |---|---|
 | `RLIMIT_MEMLOCK = 8192 KB`（软硬同） | 无法在不提权的情况下调高（`sudo -n` 要密码；`systemd-run --user -p LimitMEMLOCK=infinity` 报 Unknown assignment）。靠 §5.1 的补丁降级运行 |
-| 磁盘层没有回收机制 | 上游 fs 二级层只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处）。占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。写满后的行为见 §5.4 |
+| 上游 fs 层默认没有回收机制 | 上游只有 `root_dir` / 读写线程数 / `locality`，**无配额、无 TTL、无淘汰删除**（`os.remove` 仅出现在探测文件、写失败的临时文件、短读判定损坏三处），占用随累计 spill 单调增长（实测 **~4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时回收。本线已补 `max_bytes` 字节预算 + LRU 淘汰（§5.5），128K/16K 两个 profile 默认 128 GiB |
 | 磁盘层目录随 `engine_id` | 不固定 `engine_id` 时每次启动都新目录（孤儿累积）；128K profile 固定为 `qwen38-27b-128k-ssd` 并在启动前清空 |
 | `flash_qla` 依赖钉死导致 pip 冲突 | 已修：`setup.py` 放宽为 `>=` 并重装 editable（§3）；启动脚本仍设 `PYTHONPATH`，但已非必需 |
 | `scripts/tools/kv_pool_sizing.py` 原先解析不了本仓库全部 profile | 已修（见下） |
@@ -229,8 +267,9 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 ## 7. 待办与未覆盖
 
-1. 两个 `sm75-upstream`（vLLM 仓库 / 本仓库）都**未推送**到任何远端。
-2. offload 尚未覆盖：**池接近满时的恢复**（最高优先，唯一可能 stall 的路径）、多轮
+1. offload 尚未覆盖：**池接近满时的恢复**（最高优先，唯一可能 stall 的路径）、多轮
    offload/restore 的长时间稳定性、`max-num-seqs > 1` 的并发，以及 pinned / unpinned DMA
    的性能差（后者要 root 或 ≤8 MB 的 staging，实际做不了）。
-   磁盘层写满的行为已在 §5.4 实测。
+   磁盘层写满的行为已在 §5.4 实测，字节上限 + LRU 淘汰已在 §5.5 实现并实测。
+2. 磁盘层预算的**长稳**：多天运行下 mtime 作为 recency 的退化（例如备份/rsync 改写 mtime）
+   尚未验证。

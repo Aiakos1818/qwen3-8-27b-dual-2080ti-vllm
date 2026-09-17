@@ -48,9 +48,12 @@ fi
 # full, so a smaller MAX_MODEL_LEN is the cheaper way to stay honest.
 : "${CPU_BYTES_TO_USE:=4600000000}"
 : "${SPEC_NUM_TOKENS:=3}"
-# Disk tier. Upstream has no quota knob: the tier grows with the working set,
-# so watch the directory size during long tests.
+# Disk tier. VLLM_SSD_MAX_BYTES caps what the tier keeps on disk: past the
+# budget the least recently restored blocks are evicted, so the directory can
+# never fill the filesystem (0 = no cap, i.e. upstream behavior). 128 GiB is
+# ~28 full-length 128K sessions, leaving headroom on the 168 GiB partition.
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
+: "${VLLM_SSD_MAX_BYTES:=137438953472}"
 : "${VLLM_SSD_CLEAN_START:=1}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
@@ -74,7 +77,7 @@ export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 export PYTHONPATH="$FLASHQLA_PATH"
 
-KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\"}]}}"
+KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\",\"max_bytes\":$VLLM_SSD_MAX_BYTES}]}}"
 
 ARGS=(
   --host "$HOST" --port "$PORT"

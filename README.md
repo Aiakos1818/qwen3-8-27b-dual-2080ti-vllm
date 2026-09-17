@@ -238,10 +238,11 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
 
 另外两点来自实测：
 
-- **磁盘层没有回收机制**：上游 fs 二级层无配额、无 TTL、无淘汰删除，占用随累计 spill 单调
-  增长（约 **4.5 GB / 条 120K 链**），只能靠 `VLLM_SSD_CLEAN_START=1` 在启动时清空。
-  外部清理**必须在服务停止时做**，否则索引与磁盘不一致会触发 load 失败。
-- **写满不会崩、也不会中止请求**：只是 offload 静默失效 + 持续刷
+- **磁盘层有字节上限（`VLLM_SSD_MAX_BYTES`，默认 128 GiB）**：上游 fs 层默认不回收，
+  占用随累计 spill 单调增长（约 **4.5 GB / 条 120K 链**）；本线让 tier 自管预算，超了就按
+  **LRU** 淘汰最旧（恢复过的块算"用过"）整块文件，磁盘再也不会被写满。上限至少要装得下
+  一条满长链，且假设 tier 独占该目录（多实例共享 `root_dir` 时不要设）。
+- **不为上限时，写满不会崩、也不会中止请求**：只是 offload 静默失效 + 持续刷
   `Job N block I/O failed`，每个请求退化为全量重算。profile 已把
   `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail` 会中止受影响请求）。
 
