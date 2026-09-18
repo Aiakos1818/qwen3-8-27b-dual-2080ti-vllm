@@ -979,13 +979,17 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   - greedy 输出两者都变（int4 第 223 字符、int8 第 370 字符起，都是语义等价的改写），
     说明 head 量化**确实改变输出分布**，不是无损 —— int8 的扰动小得多。
 
-  **当前默认仍是原 checkpoint（head 为 bf16）**。两个变体目录、工具、临时 launcher
-  （`~/Temp/opencode/run_500k_head4bit.sh`、`run_500k_head8bit.sh`）都留着。
+  **默认（不带开关）仍是原 checkpoint（head 为 bf16）**，`--head8bit` 才启用 int8。
+  两个变体目录和工具都留着；int4 变体没有开关，只能用临时 launcher
+  `~/Temp/opencode/run_500k_head4bit.sh` 跑。
 
   **下一步候选**：
 
-  1. **采用 int8**：profile 的 `MODEL_PATH` 指到 `…-yarn512k-head8bit` 并加上上面那条
-     `LD_LIBRARY_PATH`（一行），即得 +17~21%。建议切换前先跑一遍业务侧质量回归。
+  1. ~~采用 int8~~ **已采用（2026-09-19）**：不改脚本、不加脚本，7 个
+     `run_vllm_qwen38_awq_*.sh` profile 都接受 `--head8bit` 开关 —— 它把 `MODEL_PATH`
+     追加 `-head8bit`，并把 venv 的 `nvidia/cu13/lib` 追加到 `LD_LIBRARY_PATH`。启动日志
+     出现 `Using HummingLinearKernel` 即生效（启动多约 2 分钟）。默认（不带开关）仍是原
+     checkpoint。仍建议在业务流量上先跑一遍质量回归。
   2. int4 的**更细 MSE 搜索**或 GPTQ 式误差补偿：把 8.42% 压到接近 int8 的水平，同时
      保住 10 ms 的收益（理论收益上限最高，但要校准 Hessian）。
   3. head 量化后每卡空出的显存（int8 ~0.4 GB、int4 ~1.15 GB）可以再换成 KV 预算。

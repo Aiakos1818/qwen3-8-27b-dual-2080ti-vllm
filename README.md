@@ -454,9 +454,10 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
   31.5K 52.1→46.3 ms、215K 71.0→65.2 ms（省 5.8 ms），MTP 接受率与基线持平 → 净吞吐
   **+21.3% / +17.5%**。int4（0.68 GiB、走 Marlin、省 10 ms）更快但相对误差 8.42% 把接受率
   压下 2.6~7.9 点，净收益只有 +8~10%。工具 `scripts/tools/quantize_lm_head.py`，变体
-  `models/…-yarn512k-head{4,8}bit/`，默认未采用；int8 需把 venv 的
-  `nvidia/cu13/lib` 追加进 `LD_LIBRARY_PATH`（否则 Humming 的 NVRTC JIT 起不来）。
-  详见 docs/upstream-branch.md §6.15。
+  `models/…-yarn512k-head{4,8}bit/`（只有改写过的分片是真实文件，其余是链接，共 1.3G）。
+  **已采用**：7 个 `run_vllm_qwen38_awq_*.sh` 都支持 `--head8bit` 开关启用（默认不带＝原
+  checkpoint）；开关同时把 venv 的 `nvidia/cu13/lib` 追加进 `LD_LIBRARY_PATH`，否则
+  Humming 的 NVRTC JIT 起不来。详见 docs/upstream-branch.md §6.15。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**

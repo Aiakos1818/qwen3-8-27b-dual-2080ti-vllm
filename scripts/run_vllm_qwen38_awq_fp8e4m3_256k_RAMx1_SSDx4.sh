@@ -124,6 +124,40 @@ if [ "${CHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
+# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
+# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
+# the yarn directory it only rewrites the shard that holds lm_head, so the
+# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
+# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
+# is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --head8bit)
+      case "$MODEL_PATH" in
+        *-head8bit) ;;
+        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
+      esac
+      EXTRA_LD_LIBRARY_PATH=$(
+        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+      )
+      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
+        exit 2
+      fi
+      ;;
+    -h | --help)
+      echo "usage: $(basename "$0") [--head8bit]"
+      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      exit 0
+      ;;
+    *)
+      echo "$0: unknown option: $_arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
@@ -137,7 +171,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # API auth: inherit VLLM_API_KEY from the environment (empty = no auth).
 export VLLM_API_KEY="${VLLM_API_KEY:-}"
 export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${EXTRA_LD_LIBRARY_PATH:+:$EXTRA_LD_LIBRARY_PATH}"
 export PYTHONPATH="$FLASHQLA_PATH"
 
 KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\",\"max_bytes\":$VLLM_SSD_MAX_BYTES}]}}"
