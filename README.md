@@ -444,8 +444,10 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 - **代价是 decode 略慢**（-11%~-30%，128-token 口径）；MTP5 的 decode 更接近 FP8 基线。长输出优先的场景可看 W4A16（decode 约 2×，TTFT 劣于 W8A8，见 reports）。
 - **MTP 的 n 越大解码越快**（2026-09-18 更正本行旧结论）：接受率虽随 n 下降，但一轮里 draft 只跑
   1 层、verify 跑全部 64 层，所以「每 token 成本」随 n 下降。稳态实测（31.5K/128K/250K）：
-  n=3 → 70/54/45 tok/s，**n=5 → 85/67/62**（250K +37%），n=6 再快约 5%；n≥7 启动即失败。
-  各 profile 默认已从 n=3 改为 n=5。旧结论"MTP3 是甜点位"是按每步耗时（而非每 token 吞吐）判的。
+  n=3 → 70/54/45 tok/s（31.5K/128K/250K），**n=5 → 85/67/62**（250K +37%），**n=6 在
+  31.5K/215K/250K/449K 四处再快 +4.8~13%**。**500K 四档默认 n=6**（零代价：池 509,877 仍装得下
+  500,800），256K/128K 档默认 n=5。n=7 能启动（早先"启动即失败"是 KV 池差 0.09 GiB），但每 token
+  慢约 60%，所以停在 5–6。旧结论"MTP3 是甜点位"是按每步耗时（而非每 token 吞吐）判的。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**
@@ -471,7 +473,7 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 | --enable-prefix-caching | 开启 | 缓存重复系统提示词和前缀。 |
 | --enable-chunked-prefill | 开启 | 长输入分块 prefill。 |
 | --enable-prompt-tokens-details | 开启 | 响应里返回 prompt token 明细。 |
-| --speculative-config | mtp / 5 | 每步最多预测 5 个 token（n 越大每 token 成本越低，见 docs/upstream-branch.md §6.2）。 |
+| --speculative-config | mtp / 5（500K 四档为 6） | 每步最多预测的 token 数；n 越大每 token 成本越低（见 docs/upstream-branch.md §6.2 与 §6.14）。 |
 | --additional-config | flashqla_legacy | SM75 GDN prefill 后端。 |
 | --reasoning-parser | qwen3 | Qwen3 thinking 输出解析。 |
 | --tool-call-parser | qwen3_xml | Qwen3 XML tool calling 解析。 |
