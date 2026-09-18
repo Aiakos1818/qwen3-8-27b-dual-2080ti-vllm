@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -112,8 +113,6 @@ def main():
     rows, k = head.shape
     if k % args.group_size:
         sys.exit(f"K={k} is not a multiple of group_size={args.group_size}")
-    if rows % 8:
-        sys.exit(f"N={rows} is not a multiple of 8 (needed for packed zero points)")
     dtype = head.dtype
     src_bytes = head.numel() * head.element_size()
     print(f"  source head : {HEAD} {tuple(head.shape)} {dtype} ({src_bytes / 2**30:.2f} GiB)")
@@ -122,14 +121,17 @@ def main():
         print(f"  note        : the shard also holds {len(others)} other tensors, copied through")
 
     scale_dtype = dtype if args.keep_dtype else torch.bfloat16
-    packed = torch.empty(rows, k // 8, dtype=torch.int32)
+    pack_factor = 32 // args.bits  # values per int32 (8 for int4, 4 for int8)
+    if rows % pack_factor:
+        sys.exit(f"N={rows} is not a multiple of {pack_factor} (needed for packed zero points)")
+    packed = torch.empty(rows, math.ceil(k * args.bits / 32), dtype=torch.int32)
     scales = torch.empty(rows, k // args.group_size, dtype=scale_dtype)
-    zeros = torch.empty(rows // 8, k // args.group_size, dtype=torch.int32)
+    zeros = torch.empty(rows // pack_factor, k // args.group_size, dtype=torch.int32)
     q_signed = torch.empty(rows, k, dtype=torch.int8)
     zp_signed = torch.empty(rows, k // args.group_size, dtype=torch.int8)
     sq_err = abs_err = src_abs = 0.0
     chunk = args.row_chunk
-    assert chunk % 8 == 0
+    assert chunk % pack_factor == 0
     for start in range(0, rows, chunk):
         stop = min(start + chunk, rows)
         w = head[start:stop].to(torch.float32)
@@ -138,7 +140,9 @@ def main():
         zp_signed[start:stop] = zp
         scales[start:stop] = scale.to(scale_dtype)
         packed[start:stop] = pack_to_int32(q, args.bits, packed_dim=1)
-        zeros[start // 8 : stop // 8] = pack_to_int32(zp, args.bits, packed_dim=0)
+        zeros[start // pack_factor : stop // pack_factor] = pack_to_int32(
+            zp, args.bits, packed_dim=0
+        )
         deq = (
             (q.to(torch.float32).reshape(stop - start, -1, args.group_size)
              - zp.to(torch.float32).unsqueeze(2))
@@ -191,19 +195,33 @@ def main():
     quant = config["quantization_config"]
     if "lm_head" not in quant["ignore"]:
         sys.exit("source config does not ignore lm_head; refusing to guess")
-    touched = False
-    for group in quant["config_groups"].values():
-        targets = group.get("targets", [])
-        if "Linear" in targets and "language_model.lm_head" not in targets:
-            # vLLM's prefix for the head is language_model.lm_head (the multimodal
-            # wrapper mounts the language model there), while a text-only top level
-            # would call it lm_head.  Match both: the target list is matched by exact
-            # layer name before the class name, and ParallelLMHead's MRO has no
-            # LinearBase, so targets=["Linear"] alone can never reach the head.
-            group["targets"] = [*targets, "lm_head", "language_model.lm_head"]
-            touched = True
-    if not touched:
+    # vLLM's prefix for the head is language_model.lm_head (the multimodal wrapper
+    # mounts the language model there), while a text-only top level calls it lm_head.
+    # Match both: targets are matched by exact layer name before class name, and
+    # ParallelLMHead's MRO has no LinearBase, so targets=["Linear"] never reaches it.
+    head_names = ["lm_head", "language_model.lm_head"]
+    trunk = next(
+        (g for g in quant["config_groups"].values() if "Linear" in g.get("targets", [])),
+        None,
+    )
+    if trunk is None:
         sys.exit("no config group targets Linear; refusing to guess")
+    if args.bits == trunk["weights"]["num_bits"]:
+        trunk["targets"] = [*trunk["targets"], *head_names]
+    else:
+        # The head is also the MTP draft's output layer, so it is more sensitive to
+        # precision than the trunk: give it its own group with more bits.
+        for group in quant["config_groups"].values():
+            group["targets"] = [t for t in group.get("targets", []) if t not in head_names]
+        weights = dict(trunk["weights"])
+        weights["num_bits"] = args.bits
+        quant["config_groups"]["head"] = {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": list(head_names),
+            "weights": weights,
+        }
     quant["ignore"] = [entry for entry in quant["ignore"] if entry != "lm_head"]
     (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"  config      : wrote {dst / 'config.json'} (targets +lm_head, ignore -lm_head)")

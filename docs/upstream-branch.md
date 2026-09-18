@@ -885,7 +885,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
    **零代价**：同样的 KV 预算（不用加内存、不用降上下文）、接受率不变（说明输出质量路径没动）。
    n=6 至此在 31.5K / 215K / 250K / 449K 四处实测都比 n=5 快（+4.7% ~ +13%）。
 
-  ### 6.15 lm_head 量化（改 checkpoint）：每步省 10 ms，但 MTP 接受率下降（2026-09-19）
+  ### 6.15 lm_head 量化（改 checkpoint）：int8 是甜点（+17~21%），int4 换速度但掉接受率（2026-09-19）
 
   §6.12 的成本账把 lm_head 列为除注意力外最大的单项（n=5 时 ~13 ms/步 ≈ 22%），并注明
   "只能靠量化 head，改 checkpoint，含精度/接受率风险"。本节是这条路的实测。
@@ -931,30 +931,64 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   | 净吞吐 @215K | 38.8 tok/s | 42.6 tok/s | +9.8% |
   | greedy 输出 | `79c93904b4648be3`（542 字符） | `19258efd04a014be`（557 字符） | 第 223 字符起改写 |
 
+  **int8 变体（更优折中）**：同一工具加 `--bits 8`，head 走**独立的 config group**
+  （`head`，num_bits=8、group 32、非对称），主干的 group_0 只剩 `Linear`。量化误差
+  **相对 0.517%**（int4 是 8.42%，小 16 倍），head 1.30 GiB。
+
+  | 指标 | 基线 | int4 | **int8** |
+  |---|---|---|---|
+  | 每步耗时 @31.5K | 52.1 ms | 42.4 | **46.3** |
+  | 每步耗时 @215K | 71.0 ms | 61.0 | **65.2** |
+  | 节省 | — | 9.7 / 10.0 ms | **5.8 / 5.8 ms** |
+  | MTP 接受率 @31.5K | 34.4% | 28.4% | **38.3%** |
+  | MTP 接受率 @215K | 29.3% | 26.7% | **32.9%** |
+  | 净吞吐 @31.5K | 58.7 tok/s | 63.8（+8.6%） | **71.2（+21.3%）** |
+  | 净吞吐 @215K | 38.9 tok/s | 42.6（+9.7%） | **45.7（+17.5%）** |
+  | greedy 首个差异 | — | 第 223 字符 | **第 370 字符** |
+  | 每卡显存 | 21.6 GB | 20.85 | **21.14** |
+
+  **int8 明显更优**：每步只多花 4 ms（省 5.8 vs 10.0），但接受率回到基线水平（+4~6 点，
+  统计上与基线不可分 —— 3 次 run 的接受率本身就有 ±10 点抖动），greedy 的扰动点也推迟了
+  147 个字符。**净吞吐 +17.5~21.3%，是 int4 的两倍**。结论：**要改 checkpoint 就上 int8**。
+
+  **int8 的两个部署坑（都踩过）**：
+
+  1. **int8 WNA16 不走 Marlin，走 `HummingLinearKernel`**。实测
+     `choose_mp_linear_kernel(..., cc=75)`：int4 → `MarlinLinearKernel`（min_cap 75）；
+     int8 → `HummingLinearKernel`（`humming-kernels 0.1.12`，NVRTC JIT）。Humming 是 CUDA
+     上唯一能实现 uint8 WNA16 的 kernel（Machete/AllSpark/Conch/Exllama/Triton 都不行）。
+     好在它的带宽效率接近 Marlin：字节模型预测省 6.4 ms、实测 5.8 ms。
+  2. **Humming 的 NVRTC JIT 需要把 venv 的 cu13 库目录加进 `LD_LIBRARY_PATH`**。profile 里
+     `export LD_LIBRARY_PATH="$CUDA_HOME/lib64"`（CUDA 12.8）会把 pip 装的 cu13 库挤出搜索
+     路径，导致 `nvrtc: error: failed to open libnvrtc-builtins.so.13.0` →
+     `RuntimeError: NVRTCCompiler run failed`，模型直接起不来。库其实在
+     `venv/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.13.0`，
+     **追加**（不是替换）该目录即可：
+     `LD_LIBRARY_PATH="$CUDA_HOME/lib64:$VENV/lib/python3.12/site-packages/nvidia/cu13/lib"`。
+     代价是启动多约 2 分钟（Humming 首次 JIT 编译）。
+
   **结论与判断**：
 
-  - **纯速度效果确凿**：每步省 **9.7~10.0 ms**，两种上下文几乎一致（head 成本与上下文
-    长度无关，正合预期）；同配置内 σ≈0.5 ms。**评估这个改动要看每步耗时，不要看
-    tok/s** —— tok/s 会被接受率波动污染（同配置 3 次 run 的接受率能差 15 点）。
-  - **代价是接受率**：head 同时是 MTP draft 的输出层（`mtp` 模块没有自己的 head，
-    15 个键里没有任何 head，draft 复用主 `lm_head`），量化后 draft 的 logits 变糙 →
-    接受率下降 2.6~7.9 点。greedy 输出从第 223 字符起改写（"for the following
-    reasons" → "because"，语义等价），说明 head 量化**确实改变了输出分布**，不是无损。
-  - **净吞吐只 +8~10%**，因为接受率的损失吃掉了大半步耗时收益。
-  - 量化误差：mean|dW| = 0.00091、相对 8.42%、RMSE 0.00110（int4 group-32 的正常量级）。
+  - **纯速度**：head 量化的收益是每步 **5.8 ms（int8）/ 9.7~10.0 ms（int4）**，两种上下文
+    几乎一致（head 成本与上下文无关）；同配置内 σ≈0.5~1 ms。**评估这类改动要看每步耗时，
+    不要看 tok/s** —— tok/s 被接受率抖动污染（同配置 3 次 run 的接受率能差 15 点以上）。
+  - **代价**：head 同时是 MTP draft 的输出层（`mtp` 模块没有自己的 head，15 个键里没有
+    任何 head，draft 复用主 `lm_head`），所以 head 的量化精度直接决定 draft 质量。int4 的
+    相对误差 8.42% 足以把接受率压下去（−2.6~−7.9 点），int8 的 0.517% 则基本不影响。
+  - 量化误差：int4 mean|dW|=0.00091（相对 8.42%、RMSE 0.00110）；int8 0.00006（0.517%）。
+  - greedy 输出两者都变（int4 第 223 字符、int8 第 370 字符起，都是语义等价的改写），
+    说明 head 量化**确实改变输出分布**，不是无损 —— int8 的扰动小得多。
 
-  **未采用**：默认 profile 仍指向原 checkpoint（head 为 bf16）。变体目录、工具、以及
-  临时 launcher（`~/Temp/opencode/run_500k_head4bit.sh`，sed 注入 MODEL_PATH）都留着，
-  切换只需把 `MODEL_PATH` 指到变体目录。
+  **当前默认仍是原 checkpoint（head 为 bf16）**。两个变体目录、工具、临时 launcher
+  （`~/Temp/opencode/run_500k_head4bit.sh`、`run_500k_head8bit.sh`）都留着。
 
   **下一步候选**：
 
-  1. **int8 head**：只省 ~5 ms/步，但精度损失应小得多 → 接受率几乎不掉，很可能是比
-     int4 更优的折中。工具已支持 `--bits 8`（需给 head 单开一个 num_bits=8 的
-     config group，并把它的名字从 group_0 的 targets 里去掉）。
-  2. int4 的**更细 MSE 搜索**或 GPTQ 式误差补偿，把 8.42% 的相对误差压下去。
-  3. head 量化后每卡空出 1.15 GB → KV 预算可再加 ~0.9e9（约 +9.5 万 token 池），
-     与量化收益叠加。
+  1. **采用 int8**：profile 的 `MODEL_PATH` 指到 `…-yarn512k-head8bit` 并加上上面那条
+     `LD_LIBRARY_PATH`（一行），即得 +17~21%。建议切换前先跑一遍业务侧质量回归。
+  2. int4 的**更细 MSE 搜索**或 GPTQ 式误差补偿：把 8.42% 压到接近 int8 的水平，同时
+     保住 10 ms 的收益（理论收益上限最高，但要校准 Hessian）。
+  3. head 量化后每卡空出的显存（int8 ~0.4 GB、int4 ~1.15 GB）可以再换成 KV 预算。
 
   ---
 
