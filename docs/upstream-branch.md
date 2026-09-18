@@ -72,8 +72,8 @@ fbf2c5e8b  [Frontend] Add per-request metrics to Responses API (#55084)   ← �
 可复现脚本：`scripts/setup/build_vllm.sh`（`VLLM_SRC=<vLLM checkout> bash …`；
 `CHECK_ONLY=1` 只跑预检，会核对上表 5 项修补是否到位）。
 
-本机 FlashQLA checkout 取分支 `sm75-qwen3.8` 的 HEAD（`7c30b56`，已含本地 SM75 改动，
-即 `patches/flashqla-sm70-sm75-local.patch` 的内容），以 editable 方式装在当前 checkout
+本机 FlashQLA checkout 取分支 `2080ti_dual_qwen38-27B` 的 HEAD（`4459b70`，已含本地 SM75
+改动，即 `patches/flashqla-sm70-sm75-local.patch` 的内容），以 editable 方式装在当前 checkout
 路径上（`pip check` 干净）。
 
 `flash_qla` 的 `setup.py` 已把 `tilelang` / `apache-tvm-ffi` 从 `==0.1.8` / `==0.1.9`
