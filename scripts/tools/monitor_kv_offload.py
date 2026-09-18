@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Live KV-offload / tiering monitor for this branch.
 
-The fork's ``monitor_host_tier.py`` leans on a purpose-built
-``GET /host_tier_info`` served by its patched scheduler. This branch keeps
-vLLM's offloading/tiering layer unmodified, so the panel is assembled from what
-an upstream-shaped server actually exposes:
+This branch keeps vLLM's offloading/tiering layer unmodified, so the panel is
+assembled from what an upstream-shaped server actually exposes:
 
   * ``GET /metrics`` -- the scheduler's prefix / external-cache counters, the
     offloading connector's store / load bytes and histograms, and the tiering
@@ -19,7 +17,7 @@ an upstream-shaped server actually exposes:
     region the engine mmapped, which it unlinks and which is therefore
     invisible to ``ls``), ``/proc/meminfo``, and the disk tier's files.
 
-Not reproducible here: the fork's per-chain SESSIONS block. Upstream has no
+Not available here: a per-chain SESSIONS block. Upstream has no
 per-request inventory endpoint, so only aggregate occupancy exists for the GPU
 and CPU tiers. The disk tier *is* introspectable, because it is
 hash-addressed: the CHUNKS block lists the real parked chunks by rank/group.

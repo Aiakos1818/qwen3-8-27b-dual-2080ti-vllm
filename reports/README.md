@@ -1,6 +1,6 @@
 # 优化战役报告
 
-本目录存放 SM75 双卡优化战役的全部报告与原始数据，按"支线"组织：每条支线一个子目录，含 README（结论先行）、原始报告与 `raw/`（原始 JSON）。
+本目录存放 SM75 双卡优化战役的全部报告与原始数据，按"支线"组织：每条支线一个子目录，含 README（结论先行）、原始报告，部分支线附 `raw/`（原始 JSON）。
 
 ## 2026-09-sm75-optimization（2026-09-06 ~ 09-07）
 
@@ -21,5 +21,8 @@
 
 - 所有数据在上述硬件实测，不构成对其他环境的承诺。
 - 模型权重 / 量化 checkpoint 不包含在本仓库。
+- 部分报告引用的原始数据（`benchmarks/2026-09-06-*`、`benchmarks/2026-09-07-*`、若干顶层
+  `reports/2026-09-0*.md`）产生于实验机器，**未随仓库发布**；正文已内联结论与关键表格，那些
+  链接仅作溯源标注。
 - W8A8 / W4A16 未做业务侧质量回归，切换前需自行评测。
 - 引用与鸣谢（FlashQLA-SM70-SM75、Triton-Turing fork 等，均 MIT）：见 [docs/ACCELERATION_AND_ATTRIBUTION.md](../docs/ACCELERATION_AND_ATTRIBUTION.md)。

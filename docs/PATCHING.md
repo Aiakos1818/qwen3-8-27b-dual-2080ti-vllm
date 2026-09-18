@@ -9,6 +9,25 @@
   开分支、移植范围、编译环境修补（CUDA 工具链、`.deps` 路径、cutlass）与部署记录见
   [upstream-branch.md](upstream-branch.md)。
 
+## 本分支路线（`2080ti_dual_qwen38-27B`，推荐）
+
+这套服务的实际源码就在下面两条分支上，直接 clone 即可，不需要手工套 patch：
+
+~~~bash
+git clone https://github.com/Aiakos1818/vllm.git
+cd vllm
+git checkout 2080ti_dual_qwen38-27B   # 上游 main + 5 个提交（含 9 文件移植）
+
+git clone https://github.com/Aiakos1818/FlashQLA-SM70-SM75.git
+cd FlashQLA-SM70-SM75
+git checkout 2080ti_dual_qwen38-27B   # 3ab27d77 + 本地 SM75 改动
+~~~
+
+编译：`scripts/setup/build_vllm.sh` 先核对 [upstream-branch.md](upstream-branch.md) §3 的 5 项
+编译环境修补（CUDA 工具链、`.deps` 路径、cutlass 等），再执行 `pip install -e .`
+（本机约 52 分钟）；FlashQLA 用 `pip install -e . --no-deps`。依赖版本按
+[environment-lock.md](environment-lock.md) 固定。
+
 ## vLLM（上游 v0.27.1 + 本仓库 patch）
 
 ~~~bash

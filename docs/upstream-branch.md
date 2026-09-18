@@ -319,8 +319,8 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 
 ### 5.7 信息面板 `scripts/tools/monitor_kv_offload.py`
 
-本分支没有 fork 的 `GET /host_tier_info`（那是 fork 在 `Scheduler` 里加的端点），所以面板完全
-建立在**这类服务本来就暴露的数据**上：只读、只用标准库、不需要 dev-mode。
+本分支不改 vLLM 的 offload / tiering 层，也没有额外的私有端点，所以面板完全建立在**这类服务
+本来就暴露的数据**上：只读、只用标准库、不需要 dev-mode。
 
 | 区块 | 数据来源 |
 |---|---|
@@ -341,9 +341,9 @@ python3 scripts/tools/monitor_kv_offload.py --no-chunks --log 'logs/server_128k_
 计数器显示 `累计 (+本 tick 增量)`；tier 标签直接取自引擎（`0:primary`、`1:fs`…）。`--json` 的每
 行含 `config / metrics / gpus / shm / disk / log`，便于脚本化告警。
 
-**与 fork 面板的差别（诚实说明）**：上游没有逐请求清单端点，所以 GPU/CPU 层只能看聚合占用；
+**能看什么、不能看什么（诚实说明）**：上游没有逐请求清单端点，所以 GPU/CPU 层只能看聚合占用；
 磁盘层是按 chunk hash 存放的，因此 `CHUNKS` 列的是**真实落盘的 chunk**（按 rank/group 分布），
-而不是 fork 的"逐条会话"。
+而不是逐条会话。
 
 **实测**（128K profile）：
 
