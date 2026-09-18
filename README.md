@@ -99,7 +99,7 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   不作为服务 profile。
 - max-num-seqs=1：优先长上下文单请求，不按高并发路线配置。
 - Prefix Cache + Chunked Prefill：改善固定系统提示词和超长输入。
-- MTP=3 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在
+- MTP=5 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在
   decode 路径，MTP 下不再降级为 PIECEWISE（各 profile 默认开启）。
 - flashqla_legacy：为 SM70/SM75 的 Qwen GDN prefill 提供兼容加速路径。
 - Qwen3 thinking、XML tool calling、修复版 chat template：全部包含在启动配置中。
@@ -442,7 +442,10 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 
 - **W8A8（imatrix）权重量化是本轮最大单项收益**：首字时间降 19~29%，prefill 升 18~42%（SM75 无 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，W8A8 直接走 INT8 Tensor Core）。
 - **代价是 decode 略慢**（-11%~-30%，128-token 口径）；MTP5 的 decode 更接近 FP8 基线。长输出优先的场景可看 W4A16（decode 约 2×，TTFT 劣于 W8A8，见 reports）。
-- **MTP3 是甜点位**：MTP5 深层位置接收率坍缩（平均 44.8% vs 62.9%），不建议。
+- **MTP 的 n 越大解码越快**（2026-09-18 更正本行旧结论）：接受率虽随 n 下降，但一轮里 draft 只跑
+  1 层、verify 跑全部 64 层，所以「每 token 成本」随 n 下降。稳态实测（31.5K/128K/250K）：
+  n=3 → 70/54/45 tok/s，**n=5 → 85/67/62**（250K +37%），n=6 再快约 5%；n≥7 启动即失败。
+  各 profile 默认已从 n=3 改为 n=5。旧结论"MTP3 是甜点位"是按每步耗时（而非每 token 吞吐）判的。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**
@@ -468,7 +471,7 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 | --enable-prefix-caching | 开启 | 缓存重复系统提示词和前缀。 |
 | --enable-chunked-prefill | 开启 | 长输入分块 prefill。 |
 | --enable-prompt-tokens-details | 开启 | 响应里返回 prompt token 明细。 |
-| --speculative-config | mtp / 3 | 每步最多预测 3 个 token。 |
+| --speculative-config | mtp / 5 | 每步最多预测 5 个 token（n 越大每 token 成本越低，见 docs/upstream-branch.md §6.2）。 |
 | --additional-config | flashqla_legacy | SM75 GDN prefill 后端。 |
 | --reasoning-parser | qwen3 | Qwen3 thinking 输出解析。 |
 | --tool-call-parser | qwen3_xml | Qwen3 XML tool calling 解析。 |

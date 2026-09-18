@@ -106,7 +106,7 @@ profile 命名规律：`<模型>_<量化>_<上下文>[_RAMx<N>[_SSDx<M>]]` —�
 `CHAT_TEMPLATE`），profile 参数在脚本内有默认值、可用环境变量覆盖。
 
 共同参数：`--dtype half`、TP=2、`--device-ids 0,1`、`--kv-cache-dtype fp8_e4m3`、
-`--gdn_prefill_backend=flashqla_legacy`、MTP `num_speculative_tokens=3`、
+`--gdn_prefill_backend=flashqla_legacy`、MTP `num_speculative_tokens=5`（§6.2）、
 `--max-num-seqs 1`、`--max-num-batched-tokens 1024` + chunked prefill。
 
 ### 4.2 实测启动与后端确认
@@ -454,12 +454,31 @@ GPU 时间按父 op 归因：`qwen_gdn_attention_core` 24.9%（**490 kernel/步*
 n=0→n=1 一步就多 ~25 ms，之后每个 draft 只加 2–6 ms：贵的是「开启 spec-decode 的固定开销」，
 不是 draft 数量。（上表是 PIECEWISE 时代的数据，§6.4 修好图捕获后同一组对照的斜率见 §6.5。）
 
+> **2026-09-18 更正：上表按「每步耗时」看会得出 n=3 最优，但该看的是「每 token 成本」
+> = 每步耗时 / (1 + n × 接受率)。** 同一天的稳态实测（每配置 2–3 次，按接受率归一）：
+>
+> | n | 31.5K | 128K | 250K |
+> |---|---|---|---|
+> | 3 | 70.1 tok/s | 54.3 | 45.1 |
+> | 4 | 75.6 | 64.4 | — |
+> | 5 | **85.1** | **66.7** | **61.7** |
+> | 6 | 89.2 | — | 64.6 |
+>
+> 每 token 成本随 n 单调下降（31.5K：39.5 → 36.6 → 35.1 → 35.1 ms），因为一轮里 draft 只跑
+> 1 层（MTP 头）、verify 才跑全部 64 层——draft 越多，verify 摊得越薄。接受率确实随 n 塌
+> （31.5K 从 58.8% 掉到 35.5%），但 tokens/轮 仍升到 ~3.1，净收益为正。**因此 profile 默认从
+> n=3 改为 n=5**；n=6 再快约 5%（31.5K/250K 实测），**n≥7 启动即失败**（verify 的 q_len 超出
+> 已捕获的形状）。
+>
+> 输出影响：n=4/5/6 的 greedy 结果彼此**逐字节相同**，与 n=3 在第 ~90 个 token 处有一次
+> 近平分叉（两侧都是合理续写），属不同批形状下的浮点差异，不是逻辑差异。
+
 ### 6.3 已实测并排除的杠杆
 
 | 杠杆 | 结果 |
 |---|---|
 | `VLLM_SM75_SPEC_SYNC_MODE` safe ↔ nosync | 无差别（45 vs 48 tok/s），greedy 输出逐字节相同 |
-| `num_speculative_tokens` 1 / 2 / 5 | 3 最优；1 最差（接受率被摊薄） |
+| `num_speculative_tokens` 1 / 2 / 5（当时未测 4/6） | 旧结论「3 最优」；**2026-09-18 更正为 n=5**（每 token 成本随 n 下降，见 §6.2） |
 | 关闭 MTP | 41.5 tok/s（更差） |
 | `VLLM_USE_V2_MODEL_RUNNER=0` | 无差别 |
 | `--no-async-scheduling` | 略差（~42），且**会改变输出** |
@@ -570,7 +589,7 @@ GPU 时间构成：**注意力 ≈42%**（`BatchPrefillWithPagedKVCacheKernel` 3
 `"$VAR"` / `${VAR:=默认}` 全留字面量（**6 个 profile 全部 ValueError**）；
 参数正则 `[^\s\\]+` 遇反斜杠截断，导致转义 JSON 参数（`speculative-config`）
 解析失败、**MTP 恒为 0**（连带块大小算成 1568 而非 1600）。修复后 6 个 profile
-均正确报告 `MTP=3 block=1600`；128K profile 经其校验为
+均正确报告 `MTP=5 block=1600`；128K profile 经其校验为
 "池 3.0e9 → 安全上限 142,400 ≥ 131,072 ✓"。
 
 ---

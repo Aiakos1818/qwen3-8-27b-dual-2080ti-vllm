@@ -62,7 +62,12 @@ CHUNK_BYTES=55800000
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
-: "${SPEC_NUM_TOKENS:=3}"
+# Speculative depth: 5 beats 3 on decode throughput at every context measured
+# (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
+# sub-linearly with n because only the verify runs all 64 layers, while the
+# acceptance does drop (40% vs 59%). n >= 7 fails to start (verify batch out
+# of the captured shapes); n=6 measured ~5% faster again.
+: "${SPEC_NUM_TOKENS:=5}"
 # Disk tier. VLLM_SSD_MAX_BYTES caps what the tier keeps on disk: past the
 # budget the least recently restored blocks are evicted (LRU by file mtime), so
 # the directory can never fill the filesystem (0 = no cap, upstream behavior).
