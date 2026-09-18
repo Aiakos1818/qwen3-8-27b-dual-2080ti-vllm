@@ -53,7 +53,7 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
-  （262,144）、无 offload，池 278,253 tokens（实测），显存 17.5 GB/卡；另有
+  （262,144）、无 offload，池 267,842 tokens（n=5 实测；n=3 时 278,253），显存 17.5 GB/卡；另有
   `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
   需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、

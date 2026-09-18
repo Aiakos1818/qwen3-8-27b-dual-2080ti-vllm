@@ -322,7 +322,7 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 ### 5.6b 256K offload 档（同一套两层 offload，链更短）
 
 `run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` 把同一套两层 offload 用在 256K：
-`MAX_MODEL_LEN=262144`、池 5.3e9 → 278,253 tokens（≈1.06× 一个满请求），链 =
+`MAX_MODEL_LEN=262144`、池 5.3e9 → 267,842 tokens（n=5 实测；n=3 时 278,253，≈1.06× 一个满请求），链 =
 `ceil(262144/1600)` = **164 chunks = 9.15 GB**，磁盘是 4 条链的 **36.6 GB** LRU 环。
 
 staging 是启动前预 fault 的 `/dev/shm` 硬预留，所以这档要 **~10 GB tmpfs（约 32 GB 主机）**：
