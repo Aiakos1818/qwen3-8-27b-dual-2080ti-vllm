@@ -92,6 +92,7 @@ tilelang 降级回去。
 |---|---|
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` | 生产档：256K（模型原生上限），无 offload，5.3e9 池 |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 长上下文基础档：500.8K 上下文，无 offload，9.6e9 池 |
+| `scripts/run_vllm_qwen38_awq_fp16_225k.sh` | **速度取向档**：225,280 上下文 + **fp16 KV + n=6**，用与 500K 档同样的 9.6e9 预算（fp16 使池降到 252,223 token）；215K 实测比 fp8/n=5 快 **+13%**（§6.14） |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 4 条链的环），**本文主要验证对象** |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` | 256K + 同样两层 offload（staging 9.15 GB，需 ~32 GB 主机） |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | 500K + 纯 RAM offload（CPU 层即 store，2 条链） |
@@ -844,6 +845,36 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 4. 未做：offload 三档（`RAMx1_SSDx4` 16.3 GiB / `RAMx2` 32.5 GiB staging，需 64 GB 主机）；
    n 在 449K 下的最优值（接受率略高于 250K，理论上更大 n 更划算，但每换一次 n 需重启 + 18 min
    prefill）。
+
+### 6.14 fp16 KV + n=6：本机最大可跑上下文档的 A/B（2026-09-19）
+
+新建 `scripts/run_vllm_qwen38_awq_fp16_225k.sh`（自 `500k.sh` 复制，只改三处：`--kv-cache-dtype
+float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9），在本机实测：
+
+- 容量：池 **252,223 token**（fp16 是 fp8 的 ~2× 每 token 体量：38.06 KB/token），≥ 225,280 且
+  余量 12%；每卡显存 21.7 GB（与 500K/fp8 档相同，实测可跑）；
+- 本机可跑的**最大上下文**由此确定：`max_model_len` 最高 ≈ **248K**，取 225,280（220K）留裕度。
+
+**同一 prompt（215,026 token）的 A/B**：
+
+| | fp8_e4m3 + n=5（256K 档，基线） | **fp16 + n=6（新档）** | 变化 |
+|---|---|---|---|
+| TTFT / prefill | 321.6 s / 668.5 tok/s | 318.3 s / **675.6 tok/s** | 持平（fp16 不拖慢 prefill） |
+| **稳态 decode** | **37.8 tok/s** | **42.7 tok/s** | **+13.0%** |
+| 稳态接受率 | 29.8% | **31.7%** | 略升 |
+| 每 token 成本 | 26.5 ms | 23.4 ms | **−11.6%** |
+| 每轮 token 数 | 2.49 | **2.90** | +16% |
+
+解读：
+
+1. **+13% 高于 §6.11 预估的 +7~8%**，多出来的部分来自**接受率同时上升**（29.8% → 31.7%）：fp16
+   KV 更精确 → draft 采得更准 → 每轮 token 数从 2.49 升到 2.90（+16%），而每轮成本只升 3%
+   （n=6 多出的那次 draft，被 fp16 省下的注意力开销抵掉大半）——两个效应同向叠加。
+2. **prefill 不受影响**（668.5 → 675.6 tok/s）：fp16 让 KV 读量翻倍，但省掉了软件 fp8 反量化，
+   prefill 是算力受限，两者相抵。
+3. **代价是上下文**：这个档最高 225K，**不能替代 500K 需求**；把它当作"≤225K 场景下的速度取向档"。
+4. 另一个**不需要 fp16** 的动作：500K 档把 `SPEC_NUM_TOKENS` 由 5 改 6（接受率在长上下文下不降，
+   n=6 在 31.5K/250K 实测 +4.7%），预期 +3~5%，未实测。
 
 ---
 
