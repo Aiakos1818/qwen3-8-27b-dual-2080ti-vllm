@@ -774,6 +774,40 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 所以"停止 kernel 重写"的结论不变；但"2 字节粒度 smem 写 + 软件 fp8 反量化在 Turing 上很贵"
 这两条教训是通用且可迁移的，已记录在此。
 
+### 6.12 250K 单步成本完整账（n=3 trace 实测 + n=3/5/7 对照）
+
+对已有 250K trace（rank0，`n=3` 时采集）取 5 个连续 step（每步 63.8 ms，含 profiler 约 1.38×
+放大）按 kernel 分类，得到可对齐的完整账目：
+
+| 类别 | 次/步 | μs/步 | 占比 | 可动性 |
+|---|---|---|---|---|
+| 注意力 causal（16 层 verify + MTP 层） | 17 | 19896 | 37.5% | 见 §6.9–6.11，**关闭** |
+| 注意力 non-causal（draft 用，见下） | 2 | 2371 | 4.5% | 关闭 |
+| Marlin INT4（主干 GEMM） | 255 | 15467 | 29.1% | 已在带宽下限（§6.7） |
+| **lm_head（`gemvx`，vocab 124160 的 GEMV）** | 13 | **8035** | **15.1%** | **只能靠量化 head** |
+| cutlass f16 GEMM（含 lm_head 大 M 部分） | 55 | 3324 | 6.3% | 同上 |
+| 通信（TP allreduce） | 138 | 976 | 1.9% | 关闭（§6.7） |
+| GDN decode | 48 | 823 | 1.5% | 关闭（§6.7） |
+| 其余（norm/epilogue/sampling 等） | 600+ | ~2200 | 4% | 关闭 |
+
+**lm_head 的定量确认**：n=3 时 `gemvx` 8.0 ms/步 ≈ 4 遍（verify 1 + draft 3）→ 每遍约 2.0 ms，
+与"读 1.27 GB/卡 ÷ 583 GB/s ≈ 2.2 ms"一致；交叉验证：实测步耗时 n=3 ≈46 ms → n=5 = 58.5 ms，
+每多一个 draft 约 +6.25 ms，其中注意力 1.18 ms、其余 ~5 ms 都是这一步的 head + MTP 层。
+**折算到 n=5：lm_head ≈ 6 遍 ≈ 13 ms/步 ≈ 22%**，是除注意力外最大的单项，且只随 draft 数增长
+（这正是 n>6 回退的原因，见 §6.2）。
+
+**draft 注意力的 kernel 归属（Step 2 结论）**：step 内时序显示 3 次 draft 注意力分别在
++0.36/+6.00/+11.33 ms，每次 **1.18 ms —— 与 verify 的 16 层完全相同**，说明 q_len=1 的 draft
+**也走 flashinfer 的 prefill kernel**，且和 verify 一样是 KV 流量受限（独立 harness 里 q_len=1
+是 1.45 ms、q_len=6 是 1.46 ms，**几乎相同**）。本想把它们改走 decode 路径，但实测
+`BatchDecodeWithPagedKVCacheWrapper` 在本形状上**不可用**：page_size 1/8/16/32/64 × fp16/fp8
+全部在 `plan()` 抛 `KeyError`（编译好的 decode dispatch 里没有对应项）→ **SM75 + head_dim 256
+没有可用的 decode kernel，这条路由方向关闭**。
+
+**结论**：250K 单步的 58.5 ms 已完整归因（注意力 22.3 + 主干 GEMM 15.5 + lm_head 13 + 其它 ~7.7），
+其中除 **lm_head 量化（改 checkpoint，含精度/接受率风险，见下表）** 外，其余各项都已在带宽下限
+或已被实测关闭。decode 侧在本硬件 + 本精度方案下已基本挖尽。
+
 ---
 
 ## 7. 已知问题与注意事项
