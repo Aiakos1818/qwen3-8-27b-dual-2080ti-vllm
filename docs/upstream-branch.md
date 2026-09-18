@@ -573,6 +573,61 @@ GPU 时间构成：**注意力 ≈42%**（`BatchPrefillWithPagedKVCacheKernel` 3
 即 **fp8 的反量化开销可以忽略，KV 字节数也不是长上下文瓶颈**——注意力是算力/流水受限，
 要再快必须改 kernel（SM75 + 长 KV 的 tile 策略），换 dtype 拿不到。
 
+### 6.8 长上下文注意力的 kernel 天花板：4 warps/SM（2026-09-18 实测）
+
+把 §6.7 的"注意力 ≈24.5 ms"拆到 kernel 参数级别（独立 harness + profiler，绕开服务）：
+
+**实测基准**（kv_len 250,000、q_len 6、24 qo heads / 4 kv heads、head_dim 256、fp8_e4m3 KV、
+page 16；单卡）：**1.59 ms/次调用 → 161 GB/s ≈ 峰值 616 GB/s 的 26%**。一次 decode step 有
+22 次这样的调用（16 层 verify + 5 次 MTP draft + 1），合计 ≈25.7 ms/58.5 ms。
+
+**参数事实**（trace 里的模板参数）：
+
+```
+KernelTraits<MaskMode=causal, CTA_TILE_Q=64, NUM_MMA_Q=1, NUM_MMA_KV=2,
+             NUM_MMA_D_QK=16, NUM_MMA_D_VO=16, NUM_WARPS_Q=4, NUM_WARPS_KV=1,
+             DTypeKV=__nv_fp8_e4m3>
+grid=(68,1,2)  block=(32,4,1)=128 线程  smem=65536(=Turing 每 SM 上限)  regs=255
+```
+
+- **KV 已经切了 68 份**（`padded_batch_size` = SM 数 = 68，`gridDim.z` = 2 个 kv head）→
+  136 个 CTA，每个只走 ~3.7K 个 KV，并用 `PersistentVariableLengthMergeStatesKernel` 归约。
+  所以并行度（chunk 数）不是问题。
+- 真正的限制是**每 CTA 用满 64 KB 共享内存 → 每 SM 只能驻留 1 个 CTA**，而 flashinfer 这套
+  kernel 把 warp 数**硬编码成 4**（`get_num_warps_q(CTA_TILE_Q)=4`、
+  `get_num_warps_kv = 4/get_num_warps_q = 1`）→ 每 SM 只有 128 线程（12.5% 占用率），
+  不足以掩盖 DRAM 延迟。
+- 这套设计的目标是 Ampere：同样的 64 KB CTA 在 A100（164 KB smem/SM）能放 2–3 个 → 8–12
+  warps/SM；**Turing 只有 64 KB 可用，于是退化成 4 warps/SM**。
+- CTA_TILE_Q=64 是被 GQA 打包撑起来的：`packed_qo_len = qo_len × group_size = 6×6 = 36`，
+  Q tile 占 64×256×2 = 32 KB，正好一半 smem。
+
+**试过并且被堵死的路**（都是实测，不是推测）：
+
+| 尝试 | 结果 |
+|---|---|
+| page_size 16/32/64/128 | 16 最优（163–165 GB/s），其余 149–161 |
+| `use_fp16_qk_reduction=True` | SM75 上编译失败 |
+| workspace 调大（64 MB→2 GB） | plan 完全不变，无效果 |
+| 改头文件让 `NUM_WARPS_KV=2`（8 warps、CTA_TILE_KV 保持 32、smem 不变） | JIT 重编成功，但 `KTraits::IsInvalid()` 拒绝：fp8 分支要求 `NUM_MMA_KV*2 % NUM_WARPS_Q == 0`，即 fp8 下 `NUM_MMA_KV ≥ NUM_WARPS_Q/2`；要 8 warps 就得 CTA_TILE_KV=64 → smem ~82 KB > 64 KB 上限（改动已还原，基线复测 1.59 ms） |
+| 自写 Triton 分段 flash-decoding kernel | **Triton 在 SM75 上完全不支持 `fp8e4nv`**（无法读取 fp8 KV）；且打包 36 行的 M=64 tile 在 Triton 里最少要 72 KB smem，装不进 64 KB |
+
+**结论**：在"fp8 KV + Turing 64 KB smem + 36 行 GQA 打包"三者同时成立时，flashinfer 与 Triton
+都到顶了（≈160–220 GB/s）。要再往上必须**手写 CUDA/CUTLASS kernel**，条件：
+
+1. 用位运算做 fp8→fp16 转换（Turing 没有该转换指令，flashinfer 靠 CUTLASS 的软件转换）；
+2. 把 smem 压到 ≤32 KB：Q 按 head_dim 分块流式载入，或不把 6 个 GQA head 打包进 M 而改在 CTA
+   内循环（需要 ~6 个 [16,256] 的 fp32 累加器，靠 16 warps 摊到寄存器）；
+3. 每个 SM 至少 16 warps（多个小 CTA 或一个大 CTA）；
+4. KV 分段 + LSE 归约（分段本身已在做）。
+
+预期 **400–500 GB/s → 0.55–0.7 ms/调用 → 注意力 25.7 ms 降到 ~13 ms → 步耗时 58.5 → ~46 ms
+（250K 上 +25–30%，61.7 → ~78 tok/s）**。代价是天级的 kernel 开发 + 接入 vLLM 的 FULL
+cudagraph 路径（做成 flashinfer backend 里可捕获的自定义 op）。
+
+顺带确认的两个小杠杆（未做）：22 次调用里有 5–6 次是 q_len=1 的 MTP draft，理论上可走
+flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
+
 ---
 
 ## 7. 已知问题与注意事项
