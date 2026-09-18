@@ -104,7 +104,7 @@ def steady_window(samples, steady_from):
     }
 
 
-def request_once(base_url, model, prompt, max_tokens, api_key=None, timeout=900,
+def request_once(base_url, model, prompt, max_tokens, api_key=None, timeout=3600,
                  steady_from=128):
     payload = {
         "model": model,
@@ -247,8 +247,9 @@ def main():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=900,
-        help="per-request read timeout in seconds (default 900)",
+        default=3600,
+        help="per-request read timeout in seconds (default 3600; a 449K prefill "
+        "alone takes ~1080s and the full 500.8K ~1350s)",
     )
     parser.add_argument(
         "--steady-from",
