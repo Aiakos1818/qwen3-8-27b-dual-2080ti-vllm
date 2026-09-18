@@ -8,8 +8,8 @@
 
 目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
 
-适合：单机双卡、单请求优先、500K（三档：无 offload / RAM×2 / RAM×1+SSD×4）与 128K offload
-上下文、个人/小团队 API、长文档与代码任务。
+适合：单机双卡、单请求优先、256K（生产）/ 500K（三档：无 offload / RAM×2 / RAM×1+SSD×4）/
+128K（tiered offload 验证）上下文、个人/小团队 API、长文档与代码任务。
 
 不包含：模型权重、API Key、内网地址、个人目录、SSH 或隧道配置。
 
@@ -22,12 +22,14 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
   spec-decode 同步、FlashInfer 的 SM75 支持判定等），即
   `patches/vllm-v0.27.1-sm75-qwen3.8.patch` 对应的改动。
 - **MTP 下保住 FULL cudagraph**：让 SM75 的投机验证留在 FlashInfer native decode 路径
-  （`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1`，四个 profile 默认开启），单并发稳态解码
+  （`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1`，各 profile 默认开启），单并发稳态解码
   **54.1 → 37.5 ms/步**（见下节与 docs/upstream-branch.md §6）。
+- **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
+  （262,144）、无 offload，池 278,253 tokens（实测），显存 17.5 GB/卡。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
-- **128K 部署 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
-  上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环）。
+- **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
+  上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环），用于验证而非服务。
 - **编译环境修补**、上游 offload 在本机踩到的 `cudaHostRegister` 粘性错误，以及 128K
   驱逐/恢复实测，见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
@@ -58,14 +60,18 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 ## 这套配置的目标
 
 - TP=2：两张卡共同加载 Qwen3.8-27B。
-- **本分支默认 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh`）：AWQ-INT4 权重
+- **生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）：AWQ-INT4 权重
   （SM75 没有 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，INT4/INT8 才是快路径，见下节）
-  + fp8_e4m3 KV Cache；`max-model-len=500800`，启动日志可用 KV Cache **525,229 tokens**。
-- **其余三档**：500K 的 RAM×2 / RAM×1+SSD×4（上游 tiering offload）与 128K offload。
+  + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，无需外推），启动日志可用
+  KV Cache **278,253 tokens**，显存 17.5 GB/卡。
+- **长上下文档**：500K 三档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_RAMx2.sh`、
+  `..._500k_RAMx1_SSDx4.sh`。
+- **验证档**：`..._128k_RAMx1_SSDx4.sh` 验证上游 tiering offload（RAM staging + 磁盘环），
+  不作为服务 profile。
 - max-num-seqs=1：优先长上下文单请求，不按高并发路线配置。
 - Prefix Cache + Chunked Prefill：改善固定系统提示词和超长输入。
 - MTP=3 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在
-  decode 路径，MTP 下不再降级为 PIECEWISE（四个 profile 默认开启）。
+  decode 路径，MTP 下不再降级为 PIECEWISE（各 profile 默认开启）。
 - flashqla_legacy：为 SM70/SM75 的 Qwen GDN prefill 提供兼容加速路径。
 - Qwen3 thinking、XML tool calling、修复版 chat template：全部包含在启动配置中。
 - **基础路线**（vLLM `v0.27.1` + `patches/vllm-v0.27.1-sm75-qwen3.8.patch`）保留原 FP8 / 180K
@@ -77,7 +83,7 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 config/       环境变量样例（基础 + 500K 三档 / 128K offload，共 4 个）
 docs/         打补丁、加速组件与上游分支记录（docs/patches/ 存"已评估未采纳"的补丁）
 patches/      已验证工作树导出的 vLLM / FlashQLA patch（会被套用）
-scripts/      启动 profile（500K 三档 + 128K offload + 基础路线）与硬件检查
+scripts/      启动 profile（256K 生产 + 500K 三档 + 128K offload 验证 + 基础路线）与硬件检查
 scripts/setup/  硬件与依赖准备
 scripts/tools/  启动看护 / 精准停止、池容量测算、KV offload 信息面板（终端 + 浏览器）
 systemd/      常驻服务模板
@@ -121,7 +127,7 @@ cp config/vllm.env.example .env
 至少修改：
 
 ~~~bash
-MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 本分支默认 profile
+MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 本分支各 profile 共用
 # 基础路线（FP8 / 180K）用：MODEL_PATH=/你的/Qwen3.8-27B-FP8/模型目录
 VLLM_PYTHON=/你的/venv/bin/python
 FLASHQLA_PATH=/你的/FlashQLA-SM70-SM75
@@ -132,8 +138,9 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 ### 4. 启动
 
 ~~~bash
-bash scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh      # 本分支默认 profile（AWQ-INT4 / 500K）
-# 其它档：..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh、..._128k_RAMx1_SSDx4.sh
+bash scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh     # 生产 profile（AWQ-INT4 / 256K / 无 offload）
+# 长上下文：..._500k.sh、..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh
+# offload 验证：..._128k_RAMx1_SSDx4.sh
 # 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
@@ -260,10 +267,11 @@ rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/psm_*
 `torch.full` 报 `invalid argument`）。清理后**多等约 20 秒**让驱动/nvrm 收尾再启动，成功率
 明显更高；仍偶发失败时再重试即可。
 
-## 128K 部署：tiered offload 要点
+## 128K 验证档：tiered offload 要点
 
-`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` 在 128K 上下文上启用上游的 tiering
-offload（CPU staging 主层 + 磁盘 fs 二级层）。实测出的关键约束：
+`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` 是**验证档，不用于服务**：在 128K
+上下文上启用上游的 tiering offload（CPU staging 主层 + 磁盘 fs 二级层），在小尺度上把 offload
+的约束压出来。实测出的关键约束：
 
 **CPU staging 层必须装得下整条链。** 上游会把促销（promote）回来的 chunk 保留在 CPU 层，
 而不是只把它当流式 bounce buffer，所以容量不足时整次恢复作废
@@ -357,7 +365,7 @@ python benchmarks/run_context_ttft.py \
 定位过程（profiler + GPU 采样：CPU-launch-bound，非功耗/带宽受限）、n 扫描、已排除的杠杆，
 以及一项**已评估未采纳**的改动（融合多步草稿解码，实测仅 +6%）见
 [`docs/upstream-branch.md`](docs/upstream-branch.md) §6。开关 `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`
-（四个 profile 默认开启）置 0 即可回到原行为。
+（各 profile 默认开启）置 0 即可回到原行为。
 
 ## 2026-09 性能更新：W8A8 vs FP8（同硬件、同 180K 条件）
 
@@ -402,9 +410,9 @@ python benchmarks/run_context_ttft.py \
 
 ## 完整加载参数与用途
 
-下表是**本分支默认 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh`）的完整参数；
-500K 的 RAM×2 / RAM×1+SSD×4 与 128K offload 三档在此基础上叠加 tiering offload
-（见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
+下表是**生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）的完整参数；500K 三档只把
+`--max-model-len` / `--kv-cache-memory-bytes` 换成 500800 / 9.6e9，其中 RAM×2 与 RAM×1+SSD×4
+再叠加 tiering offload（见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
 
 | 参数 | 当前值 | 用途 |
 | --- | --- | --- |
@@ -413,9 +421,9 @@ python benchmarks/run_context_ttft.py \
 | --device-ids | 0,1 | 明确使用 GPU 0、1。 |
 | --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（`Qwen3.8-27B-AWQ-INT4-yarn512k`）。 |
 | --kv-cache-dtype | fp8_e4m3 | 用 FP8 E4M3 存 KV Cache，降低 KV 显存。 |
-| --max-model-len | 500800 | 单请求上下文上限（YARN 512K 模型）。 |
+| --max-model-len | 262144 | 单请求上下文上限（模型原生 `max_position_embeddings`；500K 档为 500800）。 |
 | --gpu-memory-utilization | 0.92 | vLLM 目标使用每卡 92% 显存。 |
-| --kv-cache-memory-bytes | 9600000000 | 显式限制 KV Cache 显存预算（实测池 525,229 tokens）。 |
+| --kv-cache-memory-bytes | 5300000000 | 显式限制 KV Cache 显存预算（实测池 278,253 tokens；500K 档为 9.6e9 / 525,229）。 |
 | --max-num-seqs | 1 | 单并发、长上下文优先。 |
 | --max-num-batched-tokens | 1024 | 限制单轮调度 token，平衡峰值显存与延迟。 |
 | --enable-prefix-caching | 开启 | 缓存重复系统提示词和前缀。 |
@@ -427,7 +435,7 @@ python benchmarks/run_context_ttft.py \
 | --tool-call-parser | qwen3_xml | Qwen3 XML tool calling 解析。 |
 | --default-chat-template-kwargs | enable_thinking=true | 默认开启 thinking。 |
 | --chat-template | qwen3.8-froggeric-v22.3.jinja | 使用本仓库修复模板。 |
-| --skip-mm-profiling | 开启 | 跳过多模态 profiling（本部署不走视觉路径）。 |
+| --skip-mm-profiling | 开启 | 跳过启动时对**多模态编码器激活与 embedding cache** 的显存 profiling（只 profile 语言主干），省启动时间。代价是峰值显存要自己兜住——本部署仍是多模态服务（`--limit-mm-per-prompt` 为 20 图 / 1 视频），靠该上限与显存余量保证不 OOM。 |
 
 两点与**基础路线**（`scripts/run_qwen3.8_27b_sm75.sh`，FP8 / 180K）不同：本分支不再传
 `--no-async-scheduling`（实测会改变输出且略慢），也不传 `--compilation-config`
@@ -442,7 +450,7 @@ python benchmarks/run_context_ttft.py \
 | VLLM_USE_FLASHINFER_SAMPLER | 0 | 关闭 FlashInfer top-k/top-p sampler。 |
 | VLLM_QWOPUS_MTP_BF16_DRAFT | 1 | Qwen3.5 MTP draft 层兼容设置。 |
 | VLLM_SM75_SPEC_SYNC_MODE | safe | SM75 speculative decoding 保守同步模式。 |
-| VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE | 1 | 让 SM75 的 spec 验证留在 native FlashInfer decode 路径，MTP 下保住 FULL cudagraph；置 0 即回到优化前行为（54.1 → 37.5 ms/步）。四个 profile 默认开启。 |
+| VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE | 1 | 让 SM75 的 spec 验证留在 native FlashInfer decode 路径，MTP 下保住 FULL cudagraph；置 0 即回到优化前行为（54.1 → 37.5 ms/步）。各 profile 默认开启。 |
 | VLLM_ALLOW_LONG_MAX_MODEL_LEN | 1 | 允许 `--max-model-len` 超过模型 config 的 262144（500K 档需要）。 |
 | VLLM_SSD_ROOT | 路径 | offload 档的磁盘二级层根目录（仅 500K RAM×1+SSD×4 与 128K 档）。 |
 | VLLM_USE_V2_MODEL_RUNNER | 1 | 使用 V2 model runner。 |
