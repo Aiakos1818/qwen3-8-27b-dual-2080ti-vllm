@@ -23,7 +23,7 @@
 # tier): A -> B -> A restored 94% in 3 s from the offload tier, and the disk
 # ring/byte budget behaves as documented in docs/upstream-branch.md 5.5.
 #
-# This profile targets the upstream-based branch (sm75-upstream) and uses only
+# This profile targets the upstream-based branch (2080ti_dual_qwen38-27B) and uses only
 # upstream knobs: prefix caching plus upstream's tiered offload.
 #
 # Hosts whose RLIMIT_MEMLOCK is below CPU_BYTES_TO_USE fail cudaHostRegister for

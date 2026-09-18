@@ -1,6 +1,6 @@
 # 运行环境锁定清单
 
-本分支（`sm75-upstream`：上游 vLLM `main` + SM75 移植）运行服务的关键 Python/CUDA 包版本
+本分支（`2080ti_dual_qwen38-27B`：上游 vLLM `main` + SM75 移植）运行服务的关键 Python/CUDA 包版本
 （Intel Xeon E5-2696 v3 / 15 GiB 机器）。优先保持这些版本不变，直到先跑通基准。
 
 ~~~text
@@ -8,7 +8,7 @@ Python                 3.12.3
 NVIDIA Driver          580.173.02
 Driver CUDA Runtime    13.0
 torch                  2.13.0+cu130
-vllm                   0.26.1rc1.dev2278+g49f68ba24（editable，分支 sm75-upstream）
+vllm                   0.26.1rc1.dev2278+g49f68ba24（editable，分支 2080ti_dual_qwen38-27B）
 transformers           5.16.1
 flashinfer-python      0.6.18.post1
 triton                 3.7.1

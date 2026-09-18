@@ -5,7 +5,7 @@
 两条路线：
 
 - **基础部署（本项目原始路线）**：上游 vLLM `v0.27.1` + `patches/vllm-v0.27.1-sm75-qwen3.8.patch`。
-- **本分支路线（`sm75-upstream`）**：上游 vLLM `main` + SM75/Qwen3.8 移植提交（9 文件）。
+- **本分支路线（`2080ti_dual_qwen38-27B`）**：上游 vLLM `main` + SM75/Qwen3.8 移植提交（9 文件）。
   开分支、移植范围、编译环境修补（CUDA 工具链、`.deps` 路径、cutlass）与部署记录见
   [upstream-branch.md](upstream-branch.md)。
 

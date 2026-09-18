@@ -20,7 +20,7 @@
 # tier): A -> B -> A restored 36,800/39,170 (94%) in 3 s with 1.44 GB of
 # CPU_to_GPU traffic and zero disk traffic.
 #
-# This profile targets the upstream-based branch (sm75-upstream) and uses only
+# This profile targets the upstream-based branch (2080ti_dual_qwen38-27B) and uses only
 # upstream knobs: prefix caching plus upstream's tiered offload with an empty
 # secondary tier list.
 #

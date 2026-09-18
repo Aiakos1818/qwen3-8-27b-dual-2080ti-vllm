@@ -1,4 +1,4 @@
-# 上游分支（`sm75-upstream`）：开分支 / 移植 / 部署记录
+# 上游分支（`2080ti_dual_qwen38-27B`）：开分支 / 移植 / 部署记录
 
 本文记录"在**上游 vLLM main** 上重建 SM75 部署"这条线的工作：分支怎么开的、
 移植了什么、编译环境怎么修的、怎么部署、128K 下 offload 实测结果。
@@ -10,7 +10,7 @@
 | 项 | 值 |
 |---|---|
 | 源码目录 | `/home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/src/vllm-0271` |
-| 新分支 | `sm75-upstream`（基于上游 `main`） |
+| 新分支 | `2080ti_dual_qwen38-27B`（基于上游 `main`） |
 
 提交序列：
 
@@ -472,7 +472,7 @@ TRT-LLM/XQA 路径开放它。放开后（`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE
 | 步耗时 | 57 ms | **37.6 ms** |
 | 单并发稳态 | ~45 tok/s | **~65–86 tok/s** |
 
-上游提交：`vllm@sm75-upstream` `059727bfa`；部署侧 `20dbbe5`（profile/env 示例默认开启）。
+上游提交：`vllm@2080ti_dual_qwen38-27B` `059727bfa`；部署侧 `20dbbe5`（profile/env 示例默认开启）。
 
 ### 6.5 已评估、未采纳：融合多步草稿解码
 

@@ -1,6 +1,6 @@
 # Qwen3.8-27B：双 RTX 2080 Ti 22GB + NVLink 的 vLLM 部署（上游分支）
 
-> **本分支 `sm75-upstream`**：把 SM75 部署改动重新落到**上游 vLLM main** 上。
+> **本分支 `2080ti_dual_qwen38-27B`**：把 SM75 部署改动重新落到**上游 vLLM main** 上。
 > 开分支 / 移植范围 / 编译环境修补 / 部署与 128K offload 实测记录见
 > [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
@@ -12,7 +12,7 @@
 | 单并发稳态解码（31.5K 上下文） | 每步耗时 | decode |
 | :-- | --: | --: |
 | zyYuc 的实现（vLLM 0.27.2.dev16） | 59.1 ms | 53.7 tok/s |
-| **本分支（`sm75-upstream`）** | **37.5 ms** | **81.2 tok/s** |
+| **本分支（`2080ti_dual_qwen38-27B`）** | **37.5 ms** | **81.2 tok/s** |
 | 提升 | **1.58×** | **+51%** |
 
 - **MTP 下保住 FULL cudagraph**（`059727bfa`）：SM75 的投机验证留在 FlashInfer native decode
@@ -38,7 +38,7 @@
 ## 本分支新增
 
 本分支从**上游**（[zyYuc](https://github.com/zyYuc)）切出，把 SM75 部署改动重新落在上游
-vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
+vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
 
 - **SM75 / Qwen3.8 移植**：9 个文件（FlashQLA legacy GDN prefill、Qwen3.5 MTP、SM75
   spec-decode 同步、FlashInfer 的 SM75 支持判定等），即
@@ -74,7 +74,7 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 | CUDA Runtime | 13.0 |
 | Python | 3.12.3 |
 | PyTorch | 2.13.0+cu130 |
-| vLLM | 0.26.1rc1.dev2278+g49f68ba24（上游 vLLM `main`；vLLM 侧分支 `sm75-upstream` @ `059727bfa`） |
+| vLLM | 0.26.1rc1.dev2278+g49f68ba24（上游 vLLM `main`；vLLM 侧分支 `2080ti_dual_qwen38-27B` @ `059727bfa`） |
 | Transformers / Triton | 5.16.1 / 3.7.1 |
 | FlashInfer | 0.6.18.post1 |
 | NCCL | 2.29.7 |
@@ -141,7 +141,7 @@ GPU1  NV2   X
 
 两条路线，按 docs/PATCHING.md 锁定 vLLM、FlashQLA、FlashInfer 版本：
 
-- **本分支路线（`sm75-upstream`）**：上游 vLLM `main` + SM75/Qwen3.8 移植提交（9 个文件），
+- **本分支路线（`2080ti_dual_qwen38-27B`）**：上游 vLLM `main` + SM75/Qwen3.8 移植提交（9 个文件），
   **不套用** `patches/`；移植范围与编译环境修补见 docs/upstream-branch.md §2/§3。
 - **基础路线**：上游 vLLM `v0.27.1` + `patches/vllm-v0.27.1-sm75-qwen3.8.patch`。
 
@@ -514,6 +514,6 @@ sudo systemctl status qwen3.8-27b-vllm --no-pager
 
 感谢并请引用：vLLM、PyTorch、Hugging Face Transformers、FlashInfer、FlashQLA-SM70-SM75、NCCL、Triton-Turing（SM75 fork，reports 战役引用）。详细链接、commit 和许可证在 docs/ACCELERATION_AND_ATTRIBUTION.md。
 
-本分支（`sm75-upstream`）把 SM75 部署改动重新落到上游 vLLM `main` 上，并新增 128K
+本分支（`2080ti_dual_qwen38-27B`）把 SM75 部署改动重新落到上游 vLLM `main` 上，并新增 128K
 offload profile，记录见 [`docs/upstream-branch.md`](docs/upstream-branch.md)，由
 [Aiakos1818](https://github.com/Aiakos1818) 贡献，按本仓库 MIT 许可发布。
