@@ -628,6 +628,145 @@ cudagraph 路径（做成 flashinfer backend 里可捕获的自定义 op）。
 顺带确认的两个小杠杆（未做）：22 次调用里有 5–6 次是 q_len=1 的 MTP draft，理论上可走
 flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 
+### 6.9 手写注意力 kernel 进展：内存模式已证明可行，卡在 codegen（2026-09-18）
+
+§6.8 的结论是"要更快只能手写 kernel"。这一节记录手写工作的进展、已修掉的坑、以及**一个
+还没解决但已精确定位的阻塞点**。工具在 `/tmp/opencode/kern/`（`mq_attn.cu` + `bwprobe.py`
+等，未入仓库）。
+
+**第一步：先证明这个访问模式能做到多少带宽。** 写了一个只做"读"的探针 kernel（原始 CUDA，
+非 flashinfer）：完全相同的分页 fp8 KV 布局、页 gather、软件 e4m3→fp16 转换、`uint4` 向量载入，
+256 MB（250K token 的 K+V）实测：
+
+| kernel | 时间 | 有效带宽 |
+|---|---|---|
+| flashinfer `BatchPrefillWithPagedKVCacheKernel`（§6.8） | 1.59 ms | 161 GB/s |
+| 探针，独立小 kernel | **0.425–0.48 ms** | **532–602 GB/s** |
+| 本机纯读上限（`torch.sum` 1 GiB） | — | 583 GB/s |
+
+即**同样的数据、同样的页布局，能跑到接近机器纯读上限**——§6.8 的 161 GB/s 是 kernel 的问题，
+不是内存模式或硬件的问题。这是整条路线可行的前提。
+
+**第二步：写真正的 kernel**（`mq_attn.cu`，sm_75 + wmma），结构：
+
+- 36 = q_len(6) × group(6) 个 (行, head) 对打包进 48 行 M（3 个 16 行 wmma tile）；
+- **双 pass**：pass A 只读 K 求每行 softmax 的 max/sum，pass B 重算 S 并用最终 max 做 P@V。
+  多读一遍 K（1.5× 流量）换来的好处是**完全不需要逐元素访问 wmma 累加器**——它的 per-lane
+  布局在 wmma API 里是"未定义"的，只能靠 `store/load_matrix_sync`，而在线 softmax 的
+  rescale 必须逐元素改累加器；
+- 每 tile 恰好一页（16 keys），页索引只需查一次，且所有行都页对齐；
+- K/V 以 fp16 落 smem（Turing 无 fp8 转换指令，转换是纯位运算），M 维 48 行（36 有效）；
+- KV 按 chunk 切分（68 chunk × 2 kv head = 136 CTA），分段结果用独立的 merge kernel 按 LSE
+  合并——**merge 已验证正确，0.016 ms**。
+
+**过程中修掉的三个真实的坑**（都不是算法问题）：
+
+1. `extern __shared__ Smem s;` 被 nvcc **当成静态共享内存**编译（ptxas 报 `45952 bytes smem`），
+   于是动态 smem 额度只剩 ~19 KB，`cudaFuncSetAttribute` 在 ≥32768 时直接返回
+   `cudaErrorInvalidValue`。改成 `extern __shared__ char raw[]; Smem& s = *reinterpret_cast<Smem*>(raw);`
+   后 kernel 的静态 smem 变 0，动态额度恢复。
+2. `memcpy(&u, p, 8)`（`p` 是 `uint8_t*`）无法保证位宽 → 显式 `reinterpret_cast<const uint2*>`。
+3. launcher 每次调用都做同步的 `cudaFuncSetAttribute`/`cudaDeviceGetAttribute`，被计进计时窗口
+   → 改成只配置一次。
+
+**第三步：定位性能差距——已排除的假设（都是实测，不是推测）：**
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 占用率 / smem carveout | 给探针加上 `__launch_bounds__(512,1)` + 45875 B 动态 smem（与真 kernel 完全同约束） | **518 GB/s，无变化** → 排除 |
+| 循环串行依赖（`acc += 载入结果`） | 手写寄存器双缓冲预取 | 3.396 vs 3.510 ms → 排除 |
+| 编译器没展开循环 | `#pragma unroll 4` | 3.506 ms → 排除 |
+| 固定开销（Q staging / 写回 / launch） | 空 kernel（mode 8） | **0.014 ms** → 排除 |
+| 访问模式本身 | 精简只读 kernel，逐字节相同的循环 | **0.425 ms / 602 GB/s** → 模式没问题 |
+
+**真实原因（已定位）**：那个循环**放进大 kernel 里就慢 8 倍**——同一份循环、同一进程、同一张量：
+
+| | 时间 |
+|---|---|
+| 精简 kernel 里的循环 | 0.425 ms（602 GB/s） |
+| 大 kernel 里的同一个循环（mode 6） | 3.359 ms（76 GB/s） |
+
+两者只差在**周围代码**：大 kernel 有 wmma、smem、Q staging，用 **78 个寄存器**（精简版约 30）。
+所以是 ptxas 在寄存器紧张的巨型函数里对这段内存循环做了很差的调度（SASS 里探针的循环被自动
+展开成 3 组 `LDG.E.128`，大 kernel 里则是大量 32 位 `LDG.E`）。**这是编译器层面的问题，不是
+算法或内存模式的问题**——算法侧的前提（602 GB/s）已经用探针证明了。
+
+**当前状态**：完整 kernel 5.3 ms/调用（比 flashinfer 的 1.59 ms 慢 3.3 倍），**还不能用**；
+另有 15% 的相对正确性误差（kv_len 512 对比 torch 参考）待查。
+
+**下一步**（按顺序）：① 压缩寄存器/简化巨型函数让 ptxas 能正常调度这段循环（或把 staging 与
+计算解耦）；② 修正确性误差；③ 达标后接入 vLLM 的 FULL cudagraph 路径并做 250K A/B。
+预期收益仍按 §6.8：注意力 25.7 → ~13 ms/步，250K 上 **+25–30%**。
+
+### 6.10 上述预期的修正：收益被高估，kernel 路线收益有限（2026-09-18 晚实测）
+
+§6.9 的期望建立在"探针能跑 602 GB/s"上。**但那个探针是误导**：它在读入后立刻在寄存器里累加，
+既没有 smem staging，也没有 wmma，转换还被 ptxas 折叠掉了一部分。按真实 kernel 需要的步骤逐段
+实测（都读 128 MB 的 K）：
+
+| 步骤 | 时间 | 有效带宽 |
+|---|---|---|
+| 读 K + e4m3→fp16 转换 + 累加到寄存器 | **0.274 ms** | 468 GB/s |
+| 读 K + 转换 + 写 smem（staging 的最小形态） | **0.763 ms** | 168 GB/s |
+
+即**转换本身不贵（468 GB/s 可达），真正贵的是 2 字节粒度的 smem 写入（bank conflict，2.8×）**，
+换 swizzle 布局可以改善，但那只是其中一项。
+
+把注意力拆成"两个小 kernel"（A: 只读 K 算 S 与行 max；B: 读 S+V 做 P@V）后的实测：
+
+| kernel | 时间 | 有效带宽 | 说明 |
+|---|---|---|---|
+| A `mq_scores_kernel` | 4.26 ms | ~30 GB/s | 读 K 128 MB + 写 S |
+| B `mq_pv_kernel` | 2.85 ms | ~62 GB/s | 读 V 128 MB + S 48 MB |
+| merge | 0.019 ms | — | 正确 |
+| 合计 | **6.8–7.1 ms** | 52 GB/s | **比 flashinfer 的 1.59 ms 慢 4 倍** |
+
+各段成本拆解：staging 0.76 ms、访存 0.23 ms、wmma ~0.5 ms、掩码/写 S ~0.1 ms ≈ 1.6 ms，**剩下
+约 2.5 ms 无法归因**（仍是 §6.9 那个 codegen 损耗）。以下假设均已实测排除：占用率、smem carveout、
+`#pragma unroll`、寄存器双缓冲预取、`__noinline__`、`-maxrregcount` 40/48/56/64/80、
+`__launch_bounds__(512,2)`、寄存器压力本身。
+
+**修正后的结论**：在 Turing + fp8 KV 上，这条路的**实际上限远低于 §6.9 的预期**。原因有三，
+且互相叠加：
+
+1. fp8→fp16 必须软件转换，且 wmma 要求操作数先进 smem → 每读一个元素"转换 + 2 字节 smem 写"是
+   固定开销，实测把有效带宽压到 ~168 GB/s（与 flashinfer 的 161 GB/s 同一量级，**不是巧合**）；
+2. 在这之上，复杂 kernel 里的循环还会被 ptxas 调度得更差（无法归因的 2.5 ms）；
+3. 于是"手写 kernel 大幅超过 flashinfer"没有依据——**flashinfer 的 161 GB/s 很可能已接近
+   Turing + fp8 + wmma 这条技术路线的实际上限**。
+
+因此本部署的建议：**停止 kernel 重写**。已落地的 n=5（250K 上 +37%）仍是长上下文解码最实际、
+最划算的收益；注意力再做深挖的性价比不足以支撑继续投入（除非换 fp16 KV 并把上下文降到 ~128K，
+那时 §6.9 的表可以复用，但代价是丢掉 256K）。
+
+### 6.11 补充实测：fp16 KV 确实更快；staging 的 2 字节写是真实缺陷
+
+**一、fp16 KV 在 Turing 上真的更快**（同 harness、250K、q_len=6、flashinfer）：
+
+| KV dtype | 注意力 kernel | 相对 |
+|---|---|---|
+| fp8_e4m3 | 1.456 ms | — |
+| float16 | **1.170 ms** | **−18%** |
+
+即**在 Turing 上 fp8 KV 对注意力速度是净负收益**：带宽省下的一半，被软件反量化开销吃掉还倒亏
+（与 §6.7 在 vLLM 128K 上量到的 −2.7% 步耗时一致，只是这里同 harness 更干净）。
+代价是 KV 占用翻倍：**256K 装不下（约能到 200K），128K 及以下完全装得下**。
+→ 若某天要压 128K 档的延迟，把它切到 fp16 KV 是一个免费（无需改 kernel）的 2–3% 步耗时收益。
+
+**二、staging 的 2 字节 smem 写是真实缺陷（已定位并修好）**：
+
+| staging 写法（读 128 MB 的 K，fp8） | 时间 | 说明 |
+|---|---|---|
+| 每线程 16 个 fp8 → 16 次 2 字节 smem 写（原写法） | 0.761 ms | 4-way bank conflict |
+| 每线程 8 个 fp8（8 B 载入）→ **一次 16 字节向量写** | **0.274 ms** | **2.8× 快，468 GB/s** |
+
+修好后 fp8 staging 已经比 fp16（0.444 ms，读 2 倍字节）更快，说明"fp8 读得少"的优势在写法正确
+时才兑现。把该修复应用到拆分版两个 kernel 后：6.79 → **5.92 ms**（省下的正是这段 staging）。
+但相对 flashinfer 的 1.46 ms 仍慢 4 倍 —— §6.10 里那个**无法归因的约 2.5 ms/ kernel 的损耗
+依旧存在**（已排除占用率、寄存器数、unroll、预取、noinline、smem carveout、转换指令数），
+所以"停止 kernel 重写"的结论不变；但"2 字节粒度 smem 写 + 软件 fp8 反量化在 Turing 上很贵"
+这两条教训是通用且可迁移的，已记录在此。
+
 ---
 
 ## 7. 已知问题与注意事项
