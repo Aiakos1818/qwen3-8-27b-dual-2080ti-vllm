@@ -53,7 +53,7 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
-  （262,144）、无 offload，池 267,842 tokens（n=5 实测；n=3 时 278,253），显存 17.5 GB/卡；另有
+  （262,144）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
   `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
   需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
@@ -473,7 +473,7 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 | --enable-prefix-caching | 开启 | 缓存重复系统提示词和前缀。 |
 | --enable-chunked-prefill | 开启 | 长输入分块 prefill。 |
 | --enable-prompt-tokens-details | 开启 | 响应里返回 prompt token 明细。 |
-| --speculative-config | mtp / 5（500K 四档为 6） | 每步最多预测的 token 数；n 越大每 token 成本越低（见 docs/upstream-branch.md §6.2 与 §6.14）。 |
+| --speculative-config | mtp / 6 | 每步最多预测的 token 数；n 越大每 token 成本越低（见 docs/upstream-branch.md §6.2 与 §6.14）。 |
 | --additional-config | flashqla_legacy | SM75 GDN prefill 后端。 |
 | --reasoning-parser | qwen3 | Qwen3 thinking 输出解析。 |
 | --tool-call-parser | qwen3_xml | Qwen3 XML tool calling 解析。 |

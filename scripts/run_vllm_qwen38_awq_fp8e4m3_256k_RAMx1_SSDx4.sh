@@ -70,7 +70,7 @@ CHUNK_BYTES=55800000
 # 5.3e9 pool -> 278,253 tokens (measured / logs), i.e. ~1.06x of one 262,144
 # request.
 : "${MAX_MODEL_LEN:=262144}"
-: "${KV_CACHE_MEMORY_BYTES:=5300000000}"
+: "${KV_CACHE_MEMORY_BYTES:=5600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
 # Staging: exactly one full-length context (164 chunks). It only has to hold the
 # chain being promoted, so no headroom is needed; every stored context also lives
@@ -78,12 +78,15 @@ CHUNK_BYTES=55800000
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
-# Speculative depth: 5 beats 3 on decode throughput at every context measured
-# (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
-# sub-linearly with n because only the verify runs all 64 layers, while the
-# acceptance does drop (40% vs 59%). n >= 7 fails to start (verify batch out
-# of the captured shapes); n=6 measured ~5% faster again.
-: "${SPEC_NUM_TOKENS:=5}"
+# Speculative depth: 6 beats 5 (and 5 beats 3) at every context measured:
+# 31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%, 449K +5.4%.  The
+# per-round cost grows sub-linearly with n because only the verify runs all 64
+# layers while the draft head runs one, so the extra draft is largely amortised.
+# n=6 needs ~1% more KV than n=5 (extra speculative slots); the 256K/128K
+# geometry carries a little more budget for that.  n=7 does start -- the earlier
+# "fails to start" was a KV pool 0.09 GiB short -- but it is ~60% worse per
+# token, so n stays at 6.
+: "${SPEC_NUM_TOKENS:=6}"
 # Disk tier: 4 full-length contexts (4 x 9.15 GB = 36.6 GB).
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
 : "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"

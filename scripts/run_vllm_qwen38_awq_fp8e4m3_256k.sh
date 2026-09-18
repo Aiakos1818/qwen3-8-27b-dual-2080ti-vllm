@@ -33,14 +33,17 @@ fi
 # Calibrate to the "GPU KV cache size" line after a launch;
 # scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
 : "${MAX_MODEL_LEN:=262144}"
-: "${KV_CACHE_MEMORY_BYTES:=5300000000}"
+: "${KV_CACHE_MEMORY_BYTES:=5600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Speculative depth: 5 beats 3 on decode throughput at every context measured
-# (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
-# sub-linearly with n because only the verify runs all 64 layers, while the
-# acceptance does drop (40% vs 59%). n >= 7 fails to start (verify batch out
-# of the captured shapes); n=6 measured ~5% faster again.
-: "${SPEC_NUM_TOKENS:=5}"
+# Speculative depth: 6 beats 5 (and 5 beats 3) at every context measured:
+# 31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%, 449K +5.4%.  The
+# per-round cost grows sub-linearly with n because only the verify runs all 64
+# layers while the draft head runs one, so the extra draft is largely amortised.
+# n=6 needs ~1% more KV than n=5 (extra speculative slots); the 256K/128K
+# geometry carries a little more budget for that.  n=7 does start -- the earlier
+# "fails to start" was a KV pool 0.09 GiB short -- but it is ~60% worse per
+# token, so n stays at 6.
+: "${SPEC_NUM_TOKENS:=6}"
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
