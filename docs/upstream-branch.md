@@ -90,11 +90,13 @@ tilelang 降级回去。
 
 | 脚本 | 用途 |
 |---|---|
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 基础 profile：500.8K 上下文，无 offload，9.6e9 池 |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` | 生产档：256K（模型原生上限），无 offload，5.3e9 池 |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 长上下文基础档：500.8K 上下文，无 offload，9.6e9 池 |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 4 条链的环），**本文主要验证对象** |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` | 256K + 同样两层 offload（staging 9.15 GB，需 ~32 GB 主机） |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | 500K + 纯 RAM offload（CPU 层即 store，2 条链） |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 500K + RAM staging（1 条链）+ 磁盘 4 条链的环 |
-| `config/vllm-128k-RAMx1-SSDx4.env.example` | 128K profile 的配置模板 |
+| `config/vllm*.env.example` | 各档配置模板（无 offload 的 256K/500K 档用 `vllm.env.example`） |
 
 profile 命名规律：`<模型>_<量化>_<上下文>[_RAMx<N>[_SSDx<M>]]` —— 后缀即容量
 （`<N>` 个满长上下文常驻 RAM / `<M>` 个在磁盘上成环）；文件名与容量一一对应，
@@ -317,6 +319,18 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
 要等内存到位**（见 §8）。
 
+### 5.6b 256K offload 档（同一套两层 offload，链更短）
+
+`run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` 把同一套两层 offload 用在 256K：
+`MAX_MODEL_LEN=262144`、池 5.3e9 → 278,253 tokens（≈1.06× 一个满请求），链 =
+`ceil(262144/1600)` = **164 chunks = 9.15 GB**，磁盘是 4 条链的 **36.6 GB** LRU 环。
+
+staging 是启动前预 fault 的 `/dev/shm` 硬预留，所以这档要 **~10 GB tmpfs（约 32 GB 主机）**：
+本机 15 GiB 上 `CHECK_ONLY=1` 直接拒绝——`/dev/shm` 只有 7.7 GiB free 而 staging 要 8.5 GiB，
+`MemAvailable` 也低于 staging+4 GiB 的余量要求。128K 档（4.58 GB staging）在本机可跑，两者
+就是按这个分工选的。用途与 128K 档相同（长 prompt 的 KV 跨重启可恢复，省掉每次 ~400 s 的
+重算），只是上下文翻倍；256K 档的**真实恢复同样待内存到位**。
+
 ### 5.7 信息面板 `scripts/tools/monitor_kv_offload.py`
 
 本分支不改 vLLM 的 offload / tiering 层，也没有额外的私有端点，所以面板完全建立在**这类服务
@@ -503,6 +517,42 @@ kernel 与相应的捕获安全面。此处仅作记录，便于将来需要时�
    同时压到 prefill 的 FULL 图；
 3. 把开关置 0 跑一次回归，确认完全回到原行为（cudagraph 降级告警、融合回退日志、输出 hash
    均复原）。
+
+### 6.7 长上下文（250K）的归因：瓶颈性质和 31.5K 完全不同
+
+在 256K 档上对 **~250K token 上下文**做解码 profiler（rank0，20.09 s 窗口，1043 token 生成，
+tools 见 `/tmp` 同款 `trace_*.py`）：
+
+| 指标 | 250K | 31.5K（§6.1） |
+|---|---|---|
+| GPU 忙碌（1 ms 桶 kernel 并集） | **99.6%**（无 ≥5 ms 空闲段） | 58% / 83%（GPU0/1） |
+| allreduce 占比 | **1.9%** | 占 GPU1 kernel 时间 **57%**（自旋等 GPU0） |
+| GDN decode kernel 占比 | **1.5%** | `qwen_gdn_attention_core` 那类 **24.9%** |
+
+GPU 时间构成：**注意力 ≈42%**（`BatchPrefillWithPagedKVCacheKernel` 37.2% + 4.5%）、
+**GEMM/GEMV ≈49%**（`marlin::Marlin` 27.9%、维 vocab 248K 的 `gemvx` 15.1%、cutlass f16 6.2%）、
+其余 ≈9%（profiler 自身有约 1.38× 放大：窗口内 80.7 ms/步 vs 平时 58.5 ms/步，看比例即可）。
+
+按未开 profiler 的 58.5 ms/步折算：注意力 ≈24.5 ms、GEMM ≈28.7 ms；而一阶带宽下限约为
+权重读取 17 ms + KV 6.6 ms ≈ **24 ms/步**（19.57 GiB checkpoint / 2 卡，KV 按 fp8 250K 计）。
+
+两点结论：
+
+1. **31.5K 的解在 250K 上无效**：那里是 launch/latency 受限（allreduce 自旋 57%、GDN 24.9%），
+   所以融合 GDN / 降启动开销有意义；250K 是 GPU 满载，GDN 只剩 1.5%，做融合 kernel 最多省
+   1.5%。
+2. 250K 只能靠**减少 GPU 工作量**：GEMM 已贴近带宽下限，唯一有余量的是注意力（≈24.5 ms vs
+   其 KV 带宽下限 ≈6.6 ms）。
+
+**KV dtype 对照**（128K 上下文、同一 prompt、两次运行、接受率归一后的稳态步耗时）：
+
+| KV dtype | 每步 | 相对 |
+|---|---|---|
+| `fp8_e4m3`（默认） | 47.4 ms | — |
+| `float16`（池加倍到 5e9；max-model-len 需降到 126000 才装下） | 46.2 ms | **−2.7%** |
+
+即 **fp8 的反量化开销可以忽略，KV 字节数也不是长上下文瓶颈**——注意力是算力/流水受限，
+要再快必须改 kernel（SM75 + 长 KV 的 tile 策略），换 dtype 拿不到。
 
 ---
 

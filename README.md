@@ -53,7 +53,9 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
-  （262,144）、无 offload，池 278,253 tokens（实测），显存 17.5 GB/卡。
+  （262,144）、无 offload，池 278,253 tokens（实测），显存 17.5 GB/卡；另有
+  `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
+  需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
@@ -167,7 +169,7 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 ~~~bash
 bash scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh     # 生产 profile（AWQ-INT4 / 256K / 无 offload）
 # 长上下文：..._500k.sh、..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh
-# offload 验证：..._128k_RAMx1_SSDx4.sh
+# offload（KV 跨重启可恢复）：..._256k_RAMx1_SSDx4.sh（需 ~10 GB shm）、..._128k_RAMx1_SSDx4.sh
 # 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
@@ -336,6 +338,8 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
   三档共用同一套 KV/池参数、尺寸由 `MAX_MODEL_LEN` 推导、自带装机自检
   （`/dev/shm` 总量与**剩余**空间、可用内存；不足即拒绝启动，`CHECK_ONLY=1` 只检查）。
   见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
+- **256K offload 档**：`..._256k_RAMx1_SSDx4.sh` —— 同两层结构，链 9.15 GB / 磁盘环 36.6 GB，
+  需 ~10 GB `/dev/shm`（约 32 GB 主机）；本机 15 GiB 上用 `CHECK_ONLY=1` 会直接拒绝。
 
 > 排查提示：单请求下 A→B→A 的第三次可能被 **GPU 前缀缓存**冒领（实测出现过
 > 118,400/120,000、3 s 的"假恢复"）；判断命中来源要看 `tiering_*` 指标，不能只看
