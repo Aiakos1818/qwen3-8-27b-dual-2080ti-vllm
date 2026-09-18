@@ -357,9 +357,13 @@ python benchmarks/run_context_ttft.py \
   --model qwen-local \
   --word-counts 2700 5400 8100 19000 57000 \
   --runs 3 \
-  --max-tokens 128 \
+  --max-tokens 512 --steady-from 128 \
   --output my-benchmark-result.json
 ~~~
+
+`--max-tokens` 默认 512、`--steady-from` 默认 128：脚本除整窗平均 `decode_tok_s` 外，还会用引擎的
+`vllm:generation_tokens_total` 计数器给出**尾部稳态** `decode_steady_tok_s` 与同窗口的 MTP 接受率。
+短窗口（旧的 128-token 口径）只覆盖接受率最高的那一段，会明显偏高。
 
 测试方法、真实流式原始结果和验收范围都在 benchmarks/README.md。下面是 2026-08-25 在当前线上服务重新跑出的上下文梯度结果；旧的 20K 合成压测表已移除，不再作为首页代表速度。
 
