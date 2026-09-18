@@ -33,9 +33,13 @@ fi
 # Speculative depth: 5 beats 3 on decode throughput at every context measured
 # (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
 # sub-linearly with n because only the verify runs all 64 layers, while the
-# acceptance does drop (40% vs 59%). n >= 7 fails to start (verify batch out
-# of the captured shapes); n=6 measured ~5% faster again.
-: "${SPEC_NUM_TOKENS:=5}"
+# acceptance does drop (40% vs 59%). n=6 is faster again at every context
+# measured (31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%,
+# 449K +5.4%), so the 500K rungs default to it: the 9.6e9 pool still covers a
+# full 500,800 request (509,877 tokens measured at n=6).
+# n=7 does start -- the earlier "fails to start" was a KV pool 0.09 GiB short --
+# but it is ~60% worse per token, so n stays at 5-6.
+: "${SPEC_NUM_TOKENS:=6}"
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
