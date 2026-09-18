@@ -806,8 +806,11 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 > 参数后，**非 tensor-core 的 decode 路径在 SM75 上可以 plan、可以 run**（KV=1024 出结果正确），
 > 只是**首次调用耗时约 500 s** —— 几乎可以肯定是 flashinfer 的一次性 JIT 编译（本机编译较慢，
 > prefill 模块当时约 65 s，decode 的 dispatch 更大）。
-> 因此"把 draft 改走 decode kernel"**并未关闭**，而是待测：需要等一次性编译完成后测
-> q_len=1 @ 250K 的真实耗时（对照 prefill 的 1.45 ms）。若更快，就是 n=5 下约 **+5%** 的收益。
+> 但进一步实测表明这条路**实际上不可用**：不是编译、也不是缺 kernel，而是**该非 TC decode
+> kernel 在 SM75 + 本形状（page 16、head_dim 256、fp8 KV）上运行病态** —— KV 仅 1024 token 时
+> 首次调用就耗 **500 s**（正常应 ~10 μs），换成 250K 后在 GPU 上跑满 100%、超过 6 分钟不返回
+> （手动 kill，进程清掉后 GPU 立即恢复空闲，生产实例未受影响）。所以它是**坏的**，不是"能用但慢"。
+> 因此 draft 改走 decode 路径**关闭**，但原因与先前记的"没有 kernel"不同。
 > 另：`decode.cuh` 里只有 SM90+ 的 arch 条件（FA3 路径），**非 TC decode kernel 本身没有
 > SM75 门槛**；真正需要 SM80+ 的是 FA2/tensor-core decode 与 split-KV。
 
