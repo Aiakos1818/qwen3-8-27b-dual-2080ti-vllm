@@ -796,13 +796,20 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 **折算到 n=5：lm_head ≈ 6 遍 ≈ 13 ms/步 ≈ 22%**，是除注意力外最大的单项，且只随 draft 数增长
 （这正是 n>6 回退的原因，见 §6.2）。
 
-**draft 注意力的 kernel 归属（Step 2 结论）**：step 内时序显示 3 次 draft 注意力分别在
+**draft 注意力的 kernel 归属（Step 2）**：step 内时序显示 3 次 draft 注意力分别在
 +0.36/+6.00/+11.33 ms，每次 **1.18 ms —— 与 verify 的 16 层完全相同**，说明 q_len=1 的 draft
 **也走 flashinfer 的 prefill kernel**，且和 verify 一样是 KV 流量受限（独立 harness 里 q_len=1
-是 1.45 ms、q_len=6 是 1.46 ms，**几乎相同**）。本想把它们改走 decode 路径，但实测
-`BatchDecodeWithPagedKVCacheWrapper` 在本形状上**不可用**：page_size 1/8/16/32/64 × fp16/fp8
-全部在 `plan()` 抛 `KeyError`（编译好的 decode dispatch 里没有对应项）→ **SM75 + head_dim 256
-没有可用的 decode kernel，这条路由方向关闭**。
+是 1.45 ms、q_len=6 是 1.46 ms，**几乎相同**）。
+> **2026-09-19 更正**：先前记的"SM75 上没有可用的 decode kernel"是**错的**，那是把
+> `BatchDecodeWithPagedKVCacheWrapper.plan()` 的实参名写错（该接口的参数名是
+> `indptr/indices/last_page_len/...`，与 prefill 的不同）导致的 `KeyError`。用正确的关键字
+> 参数后，**非 tensor-core 的 decode 路径在 SM75 上可以 plan、可以 run**（KV=1024 出结果正确），
+> 只是**首次调用耗时约 500 s** —— 几乎可以肯定是 flashinfer 的一次性 JIT 编译（本机编译较慢，
+> prefill 模块当时约 65 s，decode 的 dispatch 更大）。
+> 因此"把 draft 改走 decode kernel"**并未关闭**，而是待测：需要等一次性编译完成后测
+> q_len=1 @ 250K 的真实耗时（对照 prefill 的 1.45 ms）。若更快，就是 n=5 下约 **+5%** 的收益。
+> 另：`decode.cuh` 里只有 SM90+ 的 arch 条件（FA3 路径），**非 TC decode kernel 本身没有
+> SM75 门槛**；真正需要 SM80+ 的是 FA2/tensor-core decode 与 split-KV。
 
 **结论**：250K 单步的 58.5 ms 已完整归因（注意力 22.3 + 主干 GEMM 15.5 + lm_head 13 + 其它 ~7.7），
 其中除 **lm_head 量化（改 checkpoint，含精度/接受率风险，见下表）** 外，其余各项都已在带宽下限
