@@ -885,7 +885,78 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
    **零代价**：同样的 KV 预算（不用加内存、不用降上下文）、接受率不变（说明输出质量路径没动）。
    n=6 至此在 31.5K / 215K / 250K / 449K 四处实测都比 n=5 快（+4.7% ~ +13%）。
 
----
+  ### 6.15 lm_head 量化（改 checkpoint）：每步省 10 ms，但 MTP 接受率下降（2026-09-19）
+
+  §6.12 的成本账把 lm_head 列为除注意力外最大的单项（n=5 时 ~13 ms/步 ≈ 22%），并注明
+  "只能靠量化 head，改 checkpoint，含精度/接受率风险"。本节是这条路的实测。
+
+  **做法**：`scripts/tools/quantize_lm_head.py` 把 checkpoint 里的 `lm_head.weight`
+  （bf16 [248320, 5120]，2.37 GiB）量化成与主干**完全相同的 compressed-tensors
+  pack-quantized 方案**（4-bit int、group 32、非对称、mse observer），产出变体目录
+  `models/Qwen3.8-27B-AWQ-INT4-yarn512k-head4bit/`（新 file1 0.68 GiB + 其余符号链接 +
+  新 index + 新 config）。工具用 compressed-tensors 自己的
+  `pack_to_int32`/`unpack_from_int32` 打包，并做**打包往返断言**（pack→unpack 必须等于
+  量化值）与逐块反量化误差统计，保证 on-disk 布局就是 loader 会解出来的布局。
+
+  **两个必须同时改 config 的地方（否则静默不生效）**：
+
+  1. `config_groups.group_0.targets` 必须**加上 head 的真实 vLLM 前缀
+     `language_model.lm_head`**（不是 `lm_head`）。本模型跑的是
+     `Qwen3_5ForConditionalGeneration`，语言模型挂在 `language_model` 下，实测
+     `get_quant_method` 收到的 prefix 就是 `language_model.lm_head`。而
+     `find_matched_target` 是先按 layer_name 精确匹配、再按类名匹配，`_match_class`
+     只对 `LinearBase` 特判 `"Linear"`，**`ParallelLMHead` 的 MRO 里没有
+     `LinearBase`** —— 所以 `targets: ["Linear"]` 永远匹配不到 head。工具同时写
+     `lm_head` 与 `language_model.lm_head` 两个目标（纯文本顶层模型用前者）。
+  2. 从 `ignore` 里删掉 `"lm_head"`。实测这条其实是**冗余**的
+     （`should_ignore_layer("language_model.lm_head", ["lm_head"]) == False`）：
+     head 未量化原本只是因为不匹配 `Linear` 目标，与 ignore 无关；删掉只为清楚。
+
+  改完后 vLLM 走 `CompressedTensorsLinearMethod`，与主干同一套 `MarlinLinearKernel`
+  （SM75 上已验证的路径），启动日志会出现第二条
+  `Using MarlinLinearKernel for CompressedTensorsWNA16`，加载零错误。
+
+  **实测**（同一 profile：500K 档、fp8 KV、n=6；两次都冷启到干净状态，各 3 次 run）：
+
+  | 指标 | 基线（原 checkpoint） | 变体（head int4） | 差 |
+  |---|---|---|---|
+  | head 体积 | 2.37 GiB (bf16) | **0.68 GiB** | 3.46× |
+  | 每卡显存 | 21.6 GB | **20.85 GB** | −1.15 GB |
+  | KV 池 / n | 509,877 / 6 | 509,877 / 6 | 不变 |
+  | **每步耗时 @31.5K** | 52.1 ms（52.2/51.4/52.8） | **42.4 ms**（42.2/42.1/42.8） | **−9.7 ms（−18.6%）** |
+  | **每步耗时 @215K** | 71.0 ms（71.1/70.5/71.4） | **61.0 ms**（61.7/61.0/60.4） | **−10.0 ms（−14.1%）** |
+  | MTP 接受率 @31.5K | 36.3% | 28.4% | −7.9 点 |
+  | MTP 接受率 @215K | 29.3% | 26.7% | −2.6 点 |
+  | 净吞吐 @31.5K | 58.8 tok/s | 63.8 tok/s | +8.5% |
+  | 净吞吐 @215K | 38.8 tok/s | 42.6 tok/s | +9.8% |
+  | greedy 输出 | `79c93904b4648be3`（542 字符） | `19258efd04a014be`（557 字符） | 第 223 字符起改写 |
+
+  **结论与判断**：
+
+  - **纯速度效果确凿**：每步省 **9.7~10.0 ms**，两种上下文几乎一致（head 成本与上下文
+    长度无关，正合预期）；同配置内 σ≈0.5 ms。**评估这个改动要看每步耗时，不要看
+    tok/s** —— tok/s 会被接受率波动污染（同配置 3 次 run 的接受率能差 15 点）。
+  - **代价是接受率**：head 同时是 MTP draft 的输出层（`mtp` 模块没有自己的 head，
+    15 个键里没有任何 head，draft 复用主 `lm_head`），量化后 draft 的 logits 变糙 →
+    接受率下降 2.6~7.9 点。greedy 输出从第 223 字符起改写（"for the following
+    reasons" → "because"，语义等价），说明 head 量化**确实改变了输出分布**，不是无损。
+  - **净吞吐只 +8~10%**，因为接受率的损失吃掉了大半步耗时收益。
+  - 量化误差：mean|dW| = 0.00091、相对 8.42%、RMSE 0.00110（int4 group-32 的正常量级）。
+
+  **未采用**：默认 profile 仍指向原 checkpoint（head 为 bf16）。变体目录、工具、以及
+  临时 launcher（`~/Temp/opencode/run_500k_head4bit.sh`，sed 注入 MODEL_PATH）都留着，
+  切换只需把 `MODEL_PATH` 指到变体目录。
+
+  **下一步候选**：
+
+  1. **int8 head**：只省 ~5 ms/步，但精度损失应小得多 → 接受率几乎不掉，很可能是比
+     int4 更优的折中。工具已支持 `--bits 8`（需给 head 单开一个 num_bits=8 的
+     config group，并把它的名字从 group_0 的 targets 里去掉）。
+  2. int4 的**更细 MSE 搜索**或 GPTQ 式误差补偿，把 8.42% 的相对误差压下去。
+  3. head 量化后每卡空出 1.15 GB → KV 预算可再加 ~0.9e9（约 +9.5 万 token 池），
+     与量化收益叠加。
+
+  ---
 
 ## 7. 已知问题与注意事项
 

@@ -449,6 +449,12 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
   仍装得下 500,800；256K 档 KV 预算相应提到 5.6e9 → 池 279,147）。n=7 能启动（早先"启动即失败"
   是 KV 池差 0.09 GiB），但每 token 慢约 60%，所以停在 6。旧结论"MTP3 是甜点位"是按每步耗时
   （而非每 token 吞吐）判的。
+- **lm_head 量化（改 checkpoint）每步省 10 ms，但接受率下降**（2026-09-19 实测）：head 从
+  bf16 2.37 GiB 量化到 int4 0.68 GiB（与主干同方案，走 Marlin，每卡省 1.15 GB），每步耗时
+  31.5K 52.1→42.4 ms、215K 71.0→61.0 ms（−14~19%，两种上下文都省约 10 ms），但 MTP 接受率
+  降 2.6~7.9 点、greedy 输出改变（语义等价的改写），净吞吐 +8~10%。工具
+  `scripts/tools/quantize_lm_head.py`，变体 `models/…-yarn512k-head4bit/`，默认未采用，
+  详见 docs/upstream-branch.md §6.15。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**
