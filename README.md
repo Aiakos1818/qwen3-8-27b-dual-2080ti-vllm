@@ -8,7 +8,8 @@
 
 目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
 
-适合：单机双卡、单请求优先、180K / 435K 上下文、个人/小团队 API、长文档与代码任务。
+适合：单机双卡、单请求优先、500K（三档：无 offload / RAM×2 / RAM×1+SSD×4）与 128K offload
+上下文、个人/小团队 API、长文档与代码任务。
 
 不包含：模型权重、API Key、内网地址、个人目录、SSH 或隧道配置。
 
@@ -20,6 +21,11 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 - **SM75 / Qwen3.8 移植**：9 个文件（FlashQLA legacy GDN prefill、Qwen3.5 MTP、SM75
   spec-decode 同步、FlashInfer 的 SM75 支持判定等），即
   `patches/vllm-v0.27.1-sm75-qwen3.8.patch` 对应的改动。
+- **MTP 下保住 FULL cudagraph**：让 SM75 的投机验证留在 FlashInfer native decode 路径
+  （`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1`，四个 profile 默认开启），单并发稳态解码
+  **54.1 → 37.5 ms/步**（见下节与 docs/upstream-branch.md §6）。
+- **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
+  `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 部署 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
   上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环）。
 - **编译环境修补**、上游 offload 在本机踩到的 `cudaHostRegister` 粘性错误，以及 128K
@@ -33,39 +39,50 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 | GPU 架构 | Turing / SM75 / Compute Capability 7.5 |
 | GPU 互联 | NV2：每张卡 2 条 NVLink；单条实测约 25.781 GB/s |
 | CPU | Intel Xeon E5-2696 v3，18 核 36 线程 @2.30GHz |
-| 内存 | 15 GiB（swap 64 GiB） |
+| 内存 | 15 GiB（swap 19 GiB） |
 | OS / Kernel | Ubuntu 24.04.4 LTS / Linux 7.0.0-31-generic |
 | NVIDIA Driver | 580.173.02 |
 | CUDA Runtime | 13.0 |
 | Python | 3.12.3 |
 | PyTorch | 2.13.0+cu130 |
-| vLLM | 0.27.2.dev0+g6e448d0ea（上游 commit 6e448d0ea9bf3d88d898b65449ca6dc2aec170ac，即 v0.27.1 + 本仓库 patch） |
+| vLLM | 0.26.1rc1.dev2278+g49f68ba24（上游 vLLM `main`；vLLM 侧分支 `sm75-upstream` @ `059727bfa`） |
 | Transformers / Triton | 5.16.1 / 3.7.1 |
-| FlashInfer | 0.6.16.post3 |
+| FlashInfer | 0.6.18.post1 |
 | NCCL | 2.29.7 |
+
+上表是**本分支路线**（上游 `main` + 移植提交）的实测环境，锁定清单见
+[docs/environment-lock.md](docs/environment-lock.md)；**基础路线**（vLLM `v0.27.1` +
+`patches/vllm-v0.27.1-sm75-qwen3.8.patch`，FlashInfer 0.6.16.post3）的版本锁定见
+[docs/PATCHING.md](docs/PATCHING.md) 与 [docs/ACCELERATION_AND_ATTRIBUTION.md](docs/ACCELERATION_AND_ATTRIBUTION.md)。
 
 ## 这套配置的目标
 
 - TP=2：两张卡共同加载 Qwen3.8-27B。
-- FP8 权重 + fp8_e4m3 KV Cache：把更多显存留给上下文。
-- max-model-len=180000：服务最大上下文 180K；启动日志可用 KV Cache 约 195K tokens。
+- **本分支默认 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh`）：AWQ-INT4 权重
+  （SM75 没有 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，INT4/INT8 才是快路径，见下节）
+  + fp8_e4m3 KV Cache；`max-model-len=500800`，启动日志可用 KV Cache **525,229 tokens**。
+- **其余三档**：500K 的 RAM×2 / RAM×1+SSD×4（上游 tiering offload）与 128K offload。
 - max-num-seqs=1：优先长上下文单请求，不按高并发路线配置。
 - Prefix Cache + Chunked Prefill：改善固定系统提示词和超长输入。
-- MTP=3 + PIECEWISE CUDA Graph：降低部分解码与固定形状调度开销。
+- MTP=3 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在
+  decode 路径，MTP 下不再降级为 PIECEWISE（四个 profile 默认开启）。
 - flashqla_legacy：为 SM70/SM75 的 Qwen GDN prefill 提供兼容加速路径。
 - Qwen3 thinking、XML tool calling、修复版 chat template：全部包含在启动配置中。
+- **基础路线**（vLLM `v0.27.1` + `patches/vllm-v0.27.1-sm75-qwen3.8.patch`）保留原 FP8 / 180K
+  启动器 `scripts/run_qwen3.8_27b_sm75.sh`，见 [docs/PATCHING.md](docs/PATCHING.md)。
 
 ## 目录
 
 ~~~text
-config/       环境变量样例（含 128K offload profile）
-docs/         打补丁、加速组件与上游分支记录
-patches/      已验证工作树导出的 vLLM / FlashQLA patch
-scripts/      启动 profile 与硬件检查
+config/       环境变量样例（基础 + 500K 三档 / 128K offload，共 4 个）
+docs/         打补丁、加速组件与上游分支记录（docs/patches/ 存"已评估未采纳"的补丁）
+patches/      已验证工作树导出的 vLLM / FlashQLA patch（会被套用）
+scripts/      启动 profile（500K 三档 + 128K offload + 基础路线）与硬件检查
 scripts/setup/  硬件与依赖准备
 scripts/tools/  启动看护 / 精准停止、池容量测算、KV offload 信息面板（终端 + 浏览器）
 systemd/      常驻服务模板
 templates/    qwen3.8-froggeric-v22.3 Jinja 模板源文件
+benchmarks/   上下文梯度 TTFT / decode 基准与原始结果
 reports/      2026-09 优化战役报告（整体报告 + 6 条支线，含原始 JSON）
 ~~~
 
@@ -87,9 +104,13 @@ GPU1  NV2   X
 
 没有 NV2 也可能运行，但双卡 TP 的通信条件与本配置不同。
 
-### 2. 获取上游源码并套用补丁
+### 2. 获取源码
 
-按 docs/PATCHING.md 锁定 vLLM、FlashQLA 和 FlashInfer 版本，并应用本仓库 patch。
+两条路线，按 docs/PATCHING.md 锁定 vLLM、FlashQLA、FlashInfer 版本：
+
+- **本分支路线（`sm75-upstream`）**：上游 vLLM `main` + SM75/Qwen3.8 移植提交（9 个文件），
+  **不套用** `patches/`；移植范围与编译环境修补见 docs/upstream-branch.md §2/§3。
+- **基础路线**：上游 vLLM `v0.27.1` + `patches/vllm-v0.27.1-sm75-qwen3.8.patch`。
 
 ### 3. 填写你的路径
 
@@ -100,7 +121,8 @@ cp config/vllm.env.example .env
 至少修改：
 
 ~~~bash
-MODEL_PATH=/你的/Qwen3.8-27B-FP8/模型目录
+MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 本分支默认 profile
+# 基础路线（FP8 / 180K）用：MODEL_PATH=/你的/Qwen3.8-27B-FP8/模型目录
 VLLM_PYTHON=/你的/venv/bin/python
 FLASHQLA_PATH=/你的/FlashQLA-SM70-SM75
 ~~~
@@ -110,7 +132,9 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 ### 4. 启动
 
 ~~~bash
-bash scripts/run_qwen3.8_27b_sm75.sh
+bash scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh      # 本分支默认 profile（AWQ-INT4 / 500K）
+# 其它档：..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh、..._128k_RAMx1_SSDx4.sh
+# 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
 引擎要加载权重并编译数分钟，而且**失败也正是发生在这段时间内**（见下一节）。别用固定
@@ -318,14 +342,16 @@ python benchmarks/run_context_ttft.py \
 
 ### 本分支实测：单并发稳态解码（2026-09-18）
 
-口径与上表不同——这里是**长生成**的稳态（接受率 45–65%），不是前 128 token：
+口径与上表不同——这里是**长生成**的稳态（接受率 55–90%），不是前 128 token。同一台机器、
+同一次会话、同一测量方法（30,300 词 prompt → 31,479 token，生成 384，seed 96001），每步耗时
+按接受率归一（`step = 1000 × (1 + 3 × acc) / tok/s`）以消除采样随机性：
 
-| 配置 | 步耗时 | 单并发稳态 decode |
-| :-- | --: | --: |
-| 原始（MTP 下 cudagraph 被降级为 PIECEWISE） | 57 ms | ~45 tok/s |
-| 让 spec 验证留在 decode 路径、恢复 FULL cudagraph 后 | 37.6 ms | ~65–86 tok/s |
+| 配置 | cudagraph | 每步耗时 | 单并发稳态 decode |
+| :-- | :-- | --: | --: |
+| `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=0`（= 优化前行为） | 只有 PIECEWISE | 54.1 ms | 58.6 tok/s |
+| `=1`（本分支默认） | FULL + PIECEWISE | **37.5 ms** | 81.2 tok/s |
 
-`tok/s = 步频 × (1 + n × MTP 接受率)`，所以上表的 84–101 与这里的 ~45 并不矛盾：接受率 ~90%
+`tok/s = 步频 × (1 + n × MTP 接受率)`，所以上表的 84–101 与这里的 ~50–80 并不矛盾：接受率 ~90%
 时每个 4-token 步能出 3–4 个 token，接受率 ~50% 时只出 ~2.5 个。
 
 定位过程（profiler + GPU 采样：CPU-launch-bound，非功耗/带宽受限）、n 扫描、已排除的杠杆，
@@ -376,28 +402,36 @@ python benchmarks/run_context_ttft.py \
 
 ## 完整加载参数与用途
 
+下表是**本分支默认 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh`）的完整参数；
+500K 的 RAM×2 / RAM×1+SSD×4 与 128K offload 三档在此基础上叠加 tiering offload
+（见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
+
 | 参数 | 当前值 | 用途 |
 | --- | --- | --- |
 | --dtype | half | 运行时 FP16 计算 dtype。 |
 | --tensor-parallel-size | 2 | 两张 GPU 做 Tensor Parallel。 |
 | --device-ids | 0,1 | 明确使用 GPU 0、1。 |
-| --quantization | fp8 | FP8 权重加载。 |
+| --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（`Qwen3.8-27B-AWQ-INT4-yarn512k`）。 |
 | --kv-cache-dtype | fp8_e4m3 | 用 FP8 E4M3 存 KV Cache，降低 KV 显存。 |
-| --max-model-len | 180000 | 单请求上下文上限。 |
-| --gpu-memory-utilization | 0.93 | vLLM 目标使用每卡 93% 显存。 |
-| --kv-cache-memory-bytes | 4G | 显式限制 KV Cache 显存预算。 |
+| --max-model-len | 500800 | 单请求上下文上限（YARN 512K 模型）。 |
+| --gpu-memory-utilization | 0.92 | vLLM 目标使用每卡 92% 显存。 |
+| --kv-cache-memory-bytes | 9600000000 | 显式限制 KV Cache 显存预算（实测池 525,229 tokens）。 |
 | --max-num-seqs | 1 | 单并发、长上下文优先。 |
-| --max-num-batched-tokens | 4096 | 限制单轮调度 token，平衡峰值显存与延迟。 |
+| --max-num-batched-tokens | 1024 | 限制单轮调度 token，平衡峰值显存与延迟。 |
 | --enable-prefix-caching | 开启 | 缓存重复系统提示词和前缀。 |
 | --enable-chunked-prefill | 开启 | 长输入分块 prefill。 |
-| --no-async-scheduling | 开启 | 关闭异步调度，保持这套兼容路径。 |
+| --enable-prompt-tokens-details | 开启 | 响应里返回 prompt token 明细。 |
 | --speculative-config | mtp / 3 | 每步最多预测 3 个 token。 |
-| --compilation-config | PIECEWISE / [4] | 只捕获 size=4 CUDA Graph。 |
 | --additional-config | flashqla_legacy | SM75 GDN prefill 后端。 |
 | --reasoning-parser | qwen3 | Qwen3 thinking 输出解析。 |
 | --tool-call-parser | qwen3_xml | Qwen3 XML tool calling 解析。 |
+| --default-chat-template-kwargs | enable_thinking=true | 默认开启 thinking。 |
 | --chat-template | qwen3.8-froggeric-v22.3.jinja | 使用本仓库修复模板。 |
-| --override-generation-config | T=0.6，top_p=0.95，top_k=20，repetition=1.06 | 默认采样参数。 |
+| --skip-mm-profiling | 开启 | 跳过多模态 profiling（本部署不走视觉路径）。 |
+
+两点与**基础路线**（`scripts/run_qwen3.8_27b_sm75.sh`，FP8 / 180K）不同：本分支不再传
+`--no-async-scheduling`（实测会改变输出且略慢），也不传 `--compilation-config`
+（图模式由 §6 的改动自动选择，MTP 下会捕获 FULL + PIECEWISE）。
 
 ## 环境变量与加速路径
 
@@ -408,6 +442,9 @@ python benchmarks/run_context_ttft.py \
 | VLLM_USE_FLASHINFER_SAMPLER | 0 | 关闭 FlashInfer top-k/top-p sampler。 |
 | VLLM_QWOPUS_MTP_BF16_DRAFT | 1 | Qwen3.5 MTP draft 层兼容设置。 |
 | VLLM_SM75_SPEC_SYNC_MODE | safe | SM75 speculative decoding 保守同步模式。 |
+| VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE | 1 | 让 SM75 的 spec 验证留在 native FlashInfer decode 路径，MTP 下保住 FULL cudagraph；置 0 即回到优化前行为（54.1 → 37.5 ms/步）。四个 profile 默认开启。 |
+| VLLM_ALLOW_LONG_MAX_MODEL_LEN | 1 | 允许 `--max-model-len` 超过模型 config 的 262144（500K 档需要）。 |
+| VLLM_SSD_ROOT | 路径 | offload 档的磁盘二级层根目录（仅 500K RAM×1+SSD×4 与 128K 档）。 |
 | VLLM_USE_V2_MODEL_RUNNER | 1 | 使用 V2 model runner。 |
 | PYTHONPATH | FLASHQLA_PATH | 让 vLLM 能导入 FlashQLA SM75 GDN backend。 |
 
