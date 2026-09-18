@@ -4,6 +4,28 @@
 > 开分支 / 移植范围 / 编译环境修补 / 部署与 128K offload 实测记录见
 > [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
+## 本分支做了什么
+
+先把 9 个文件的 SM75 / Qwen3.8 移植落到上游 vLLM `main`（`49f68ba24`），再在其上做三处改动，
+单并发解码因此明显快于 zyYuc 的实现（同一台机器、同一套参数与测量方法，见下文性能验收）：
+
+| 单并发稳态解码（31.5K 上下文） | 每步耗时 | decode |
+| :-- | --: | --: |
+| zyYuc 的实现（vLLM 0.27.2.dev16） | 59.1 ms | 53.7 tok/s |
+| **本分支（`sm75-upstream`）** | **37.5 ms** | **81.2 tok/s** |
+| 提升 | **1.58×** | **+51%** |
+
+- **MTP 下保住 FULL cudagraph**（`059727bfa`）：SM75 的投机验证留在 FlashInfer native decode
+  路径，不再被降级成 PIECEWISE —— 上表提升的主要来源（本分支自身的开关对照：54.1 → 37.5 ms/步）。
+- **上游 fs 层 KV 字节预算 + LRU 淘汰**（`56c60a25f`）：上游默认不回收，磁盘占用随 spill 单调
+  增长；本分支让 tier 自管预算，超了淘汰最旧。
+- **`cudaHostRegister` 粘性错误清理**（`737fea73b`/`bf78fc276`）：低 memlock 主机（本机 8 MB
+  硬顶）上 staging 注册失败不再毒化 CUDA context，offload 档能稳定启动。
+
+定位过程（profiler + GPU 采样：CPU-launch-bound，非功耗/带宽受限）与逐档数据见下文
+[跑通后的性能验收](#跑通后的性能验收)；完整记录见
+[docs/upstream-branch.md](docs/upstream-branch.md) §6。
+
 这是一个独立的开源部署项目，面向 2 张魔改 RTX 2080 Ti 22GB、并且两卡之间已连接双 NVLink 的用户。
 
 目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
@@ -24,14 +46,19 @@ vLLM `main` 上（vLLM 侧对应分支 `sm75-upstream`）：
 - **MTP 下保住 FULL cudagraph**：让 SM75 的投机验证留在 FlashInfer native decode 路径
   （`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1`，各 profile 默认开启），单并发稳态解码
   **54.1 → 37.5 ms/步**（见下节与 docs/upstream-branch.md §6）。
+- **上游 fs 层 KV 字节预算 + LRU 淘汰**（vLLM `56c60a25f`，5 文件）：上游 fs 层默认不回收，
+  占用随累计 spill 单调增长（约 4.5 GB / 条 120K 链）；本分支让 tier 自管预算
+  （`VLLM_SSD_MAX_BYTES`），超了按 LRU 淘汰最旧的整块文件。
+- **`cudaHostRegister` 粘性错误清理**（vLLM `737fea73b`/`bf78fc276`）：staging 注册失败会毒化
+  CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
+  （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
   （262,144）、无 offload，池 278,253 tokens（实测），显存 17.5 GB/卡。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
   上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环），用于验证而非服务。
-- **编译环境修补**、上游 offload 在本机踩到的 `cudaHostRegister` 粘性错误，以及 128K
-  驱逐/恢复实测，见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
+- **编译环境修补**与 128K 驱逐/恢复实测见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 ## 已验证环境
 
@@ -356,11 +383,15 @@ python benchmarks/run_context_ttft.py \
 
 | 配置 | cudagraph | 每步耗时 | 单并发稳态 decode |
 | :-- | :-- | --: | --: |
-| `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=0`（= 优化前行为） | 只有 PIECEWISE | 54.1 ms | 58.6 tok/s |
-| `=1`（本分支默认） | FULL + PIECEWISE | **37.5 ms** | 81.2 tok/s |
+| zyYuc 的实现（vLLM 0.27.2.dev16） | 只有 PIECEWISE | 59.1 ms | 53.7 tok/s |
+| 本分支，`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=0`（= 优化前行为） | 只有 PIECEWISE | 54.1 ms | 58.6 tok/s |
+| 本分支，`=1`（默认） | FULL + PIECEWISE | **37.5 ms** | 81.2 tok/s |
 
-`tok/s = 步频 × (1 + n × MTP 接受率)`，所以上表的 84–101 与这里的 ~50–80 并不矛盾：接受率 ~90%
-时每个 4-token 步能出 3–4 个 token，接受率 ~50% 时只出 ~2.5 个。
+读法：**本分支自身的开关对照是 54.1 → 37.5 ms/步（1.44×）**，这是图模式改动本身的收益；
+zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27.2.dev16，本分支基于上游 main）。
+
+`tok/s = 步频 × (1 + n × MTP 接受率)`，所以前面 84–101 的 128-token 口径与这里的 ~50–80 稳态
+并不矛盾：接受率 ~90% 时每个 4-token 步能出 3–4 个 token，接受率 ~50% 时只出 ~2.5 个。
 
 定位过程（profiler + GPU 采样：CPU-launch-bound，非功耗/带宽受限）、n 扫描、已排除的杠杆，
 以及一项**已评估未采纳**的改动（融合多步草稿解码，实测仅 +6%）见
