@@ -159,7 +159,11 @@ ARGS=(
   --limit-mm-per-prompt '{"image":20,"video":1}'
   --mm-processor-kwargs '{"min_pixels":100352,"max_pixels":501760}'
   --reasoning-parser qwen3
-  --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
+  # Thinking budget: force </think> after 8000 reasoning tokens. Clients that send
+  # no thinking_token_budget (opencode does not) would otherwise spend the whole
+  # max_tokens on reasoning and get cut off before the tool call. Reasoning is
+  # counted from the prompt too, so a turn left unterminated recovers immediately.
+  --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>","default_thinking_token_budget":8000}'
   --default-chat-template-kwargs '{"enable_thinking":true}'
   --enable-auto-tool-choice --tool-call-parser qwen3_xml
   --additional-config '{"gdn_prefill_backend":"flashqla_legacy"}'
