@@ -1180,6 +1180,60 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   **附带发现**：Humming 的 int8 head 在 prefill 里只占 0.5%（它只在 decode 每步被调 7 次），
   与 §6.15 的结论一致 —— head 量化是纯 decode 优化。
 
+  ### 6.17 上游 fork 的 DFlash2 评估：机制可移植、收益不可迁移（2026-09-19）
+
+  **上游变动**：`weicj/vLLM-2080Ti-Definitive` 的 0.1.x 线已弃用，新线 v0.2.1-RC 把基座从
+  vLLM 0.21.0 升到 **0.29.1rc0**（CUDA 13 / torch 2.13），主打 **DFlash2**（draft 模型投机
+  解码），README 宣称双 2080Ti 上 decode **222 tok/s**（NVFP4 + K=7）。
+
+  **机制**：DFlash2 是 block-diffusion drafter —— 一次并行预测整块 8 个 token、保留每个位置
+  的 top 候选，再用 selector 串出一条连贯路径，backbone 的两抽头动态卷积防止块尾衰减；
+  对应上游 PR #52816。draft 是公开 checkpoint `incoai/Qwen3.8-27B-DFlash2`（3.85 GB bf16，
+  sha256 与 HF 一致；`target_layer_ids=[5,19,33,47,61]` 正好对 64 层 target 设计）。
+  **关键是这套机制我们本来就有**：`vllm/v1/spec_decode/dflash.py`、
+  `vllm/v1/worker/gpu/spec_decode/{dflash,dflash2}/`、注册表里的 `DFlash2DraftModel` 都在
+  我们的 0.26.1 树里，只是一直没启用。SM75 上需要他们把 BF16 checkpoint 搬进 FP16 worker
+  的数值 codec（激活边界取整 + MLP payload 行缩放 + FP32 residual），这部分是 fork 独有。
+
+  **实测 A/B**（256K profile + head8bit 目标 + 同 prompt，各 3 次取中位数）：
+
+  | 上下文 | DFlash2 K=7 | MTP n=6 | 比值 |
+  |---:|---:|---:|---:|
+  | 31.2K | 24.5 tok/s（接受率 9.6%） | 65.5 tok/s（33.8%） | 0.38× |
+  | 218K | 24.5 tok/s（9.1%） | 42.0 tok/s（29.2%） | 0.58× |
+  | prefill | 1284 / 691 tok/s | 1289 / 669 tok/s | ≈1.0× |
+
+  **移植中发现并修掉的真 bug（值得记住）**：codec 把残差流抬到 ×256 传输，要求每个子层的
+  输出先除以该 gain 再汇入 —— 而 `qwen3_dflash.py` 缺 `output_input_scale` 契约，赋值静默
+  失效，attention 以原尺度混进 ×256 残差流，draft 输入全程错乱。补上后**接受率 9.6% → 25.6%、
+  decode 24.6 → 43.5 tok/s**；即便如此仍低于 MTP。
+
+  **为什么收益不可迁移**：
+
+  1. 222 tok/s 是 **synthetic 最佳口径**：README 自己注明 "high-speculative-acceptance,
+     text-only synthetic inputs"，而同一 model card 在 H200 上、双方同为 K=7 的控制对比只有
+     **1.1~1.4×**（接受长度 4.10~5.46 vs MTP 3.74~5.02）。那 3× 是拿 K=7 对比他们自己的
+     MTP/**3** 得来的。
+  2. **口径差异是"他们 MTP 快 40%"这一误判的根源**：他们的 `4K/128` 是整段平均（含起步高
+     接受率段），我们的 `decode_steady_tok_s` 跳过前 128 token。同口径下我们 MTP n=6 在
+     32K/512 上是 **76.1 tok/s**，与他们 **MTP/3（NVFP4，同为 4-bit）的 74~76 持平**；
+     他们 MTP/5 的 97~102 来自 FP8 目标更准 → MTP 接受率更高，是精度换来的，不是代码快。
+  3. 三件 SM75 补丁里的 **FA2 planning-buffer 稳定性对我们同样是死代码**：按他们的配方
+     （`FULL_AND_PIECEWISE` + `cudagraph_capture_sizes=[7]` + `max_cudagraph_capture_size=7`）
+     确实能命中 gate（日志出现 `flashinfer.py:1107 SM75 speculative FA2 prefill uses stable
+     metadata buffers for FULL CUDA Graph replay.`，decode 确实跑了 FULL 图），但实测
+     62.9 vs 基线 65.5（−4%，在噪声内）。我们自己的 `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`
+     已覆盖同一问题。
+  4. DFlash2 在我们栈上还差 ~35% 接受率，缺口在 **target 侧 hidden-state 捕获路径**
+     （本基座 0.26.1 vs 参考 fork 的 0.29.1rc0），不在这三个文件里；且 draft 额外占
+     3.85 GB（500K 档装不下，只能退到 256K）。
+
+  **处置**：移植代码归档在 vLLM 仓库 **`wip/sm75-dflash2`** 分支（`54a3ac94d`），等基座
+  升级后再评估；FA2 补丁已回退，主干工作区干净。draft checkpoint 留在
+  `models/Qwen3.8-27B-DFlash2/`（3.85 GB，ModelScope 下载、sha256 与 HF 一致）；
+  数据在 `/tmp/opencode/{ab_dflash,ab_mtp,fix1_30k,fix2_mtp_30k,fullcg_30k}.json`，
+  临时 launcher 在 `~/Temp/opencode/run_256k_*.sh`。
+
   ---
 
 ## 7. 已知问题与注意事项
