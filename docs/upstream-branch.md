@@ -1002,6 +1002,64 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
      保住 10 ms 的收益（理论收益上限最高，但要校准 Hessian）。
   3. head 量化后每卡空出的显存（int8 ~0.4 GB、int4 ~1.15 GB）可以再换成 KV 预算。
 
+  ### 6.16 prefill 的瓶颈实测：长上下文 3/4 是 attention（2026-09-19）
+
+  起因：汇总报告 §0 第 5 条写着"FlashInfer 被确认为 SM75 d256 prefill 当前最优可用实现
+  （8K~59K 全程稳定 16.5~16.9 TFLOPS）"，而双 2080 Ti 的 FP16 张量核峰值（FP32 累加）
+  约 108 TFLOPS —— 也就是 attention 只跑到峰值的 ~1/3，看着有很大空间。本节把它量化。
+
+  **测法**：用 `--profiler-config '{"profiler":"torch","torch_profiler_dir":…,
+  "delay_iterations":240,"active_iterations":5}'` 起服务（本构建没有环境变量入口，也没有
+  `/start_profile` 之外的开关），发一个 24 万词的 prompt，让 profiler 对准 prefill 末段
+  （kv≈240K）的 5 个 step 采样，再用 `~ /Temp/opencode/salvage.py` 解析（trace 因为
+  `/stop_profile` 刷盘超过客户端超时被截断，事件是流式写的，前面的都能抢救出来）。
+
+  **结果（rank0，5 个 step，GPU busy 126.4 s，13.5 万个 kernel）**：
+
+  | 类别 | 占比 | kernel |
+  |---|---|---|
+  | **attention** | **75.6%** | `flashinfer::BatchPrefillWithPagedKVCacheKernel` ×1207 |
+  | GEMM（INT4） | 16.7% | `marlin::Marlin` ×25500 |
+  | GDN | 2.4% | `gdn_forward_kernel<128,4,16>`（FlashQLA） |
+  | 通信 | 2.3% | `ncclDevKernel_AllReduce_Sum_f16_RING_LL` + `cross_device_reduce_1stage` |
+  | lm_head | 0.5% | `humming<…Shape<0,124160,5120>…>`（§6.15 的 int8 head） |
+  | norm/silu | ~0.5% | triton 融合 kernel |
+  | cuBLAS/cutlass | 0.3% | `turing_fp16_s1688gemm_fp16_*` |
+  | 其余 | ~1% | elementwise/copy 等 |
+
+  **attention 的实际效率**：按 240K 上下文的实测 prefill 速率（~640 tok/s）反推，attention
+  拿到约 **40 TFLOPS（双卡合计）= 峰值的 ~37%**，与报告里 16.5~16.9 TFLOPS/卡（合计 ~33）
+  一致。
+
+  **上下文相关性**（用 31.2K/215K/449K 三处实测速率拟合，每 token 时间 = 常数项 + 正比项）：
+
+  - 每 token 的"固定"部分（GEMM/GDN/通信）≈ **0.663 ms**
+  - 每 token 的 attention 部分 ≈ **3.87e-6 × n ms**（attention 总量 O(n²) → 摊到每 token 是 O(n)）
+  - 交叉点 n ≈ **171K**：比它短，prefill 由 GEMM 主导；比它长，attention 主导
+  - 449K 时 attention 占 ~72%，与 240K 实测的 75.6% 同向（trace 采的是末段、更偏 attention）
+  - 模型外推校验：59.24K 预测 52.8 s，B0 实测 52.98 s ✓
+
+  **结论**：
+
+  1. **prefill 的"巨大空间"是真的，但全部集中在 attention kernel**：长上下文 3/4 的时间
+     在它身上，而它只跑到峰值的 ~1/3（理论上限 ~2.5×）。GEMM 侧只有 16.7% 且已在峰值的
+     ~76%，GDN 2.4%、通信 2.3% —— 都没有空间。
+  2. **没有任何配置旋钮能吃下这块空间**：`--max-num-batched-tokens` 调大只改 GEMM 的 M，
+     对 attention 的 tile 效率无帮助；`--kv-cache-dtype` 换成 fp16 能让 attention 快 ~18%
+     （§6.11 实测），但要 2× KV 显存，500K 档根本装不下（fp8 的 9.6e9 已占 21 GB/卡）。
+  3. **真正要动的是 kernel，而它被四堵墙挡着**：Turing 每 SM 64 KB smem → 该 kernel
+     smem=65536 → 1 CTA/SM → 占用率 12.5%（§6.8）；flashinfer 的 warp 数硬编码，改成 8
+     warps 需要 CTA_TILE_KV=64 → smem ~82 KB 超限（§6.8）；FA2 在 d256 上需要 69,632 B >
+     64 KB（汇总报告 §0 第 3 条）；我们自己的手写 kernel 尝试卡在 codegen 崩坏
+     （§6.9–6.11，同一循环独立 kernel 602 GB/s、放进大 kernel 只剩 76 GB/s）。
+     → 这是一条**研究性**路线，不是调参路线，收益上限 ~1.5~1.8× prefill，风险与工作量都很高。
+  4. **W8A8 的 +24~54% 与这里不冲突**：那是 2.8K~59K 档测的，那些档位 GEMM 主导（本模型
+     交叉点在 171K），所以 W8A8 用 INT8 张量核换来了 GEMM 加速；但它的权重显存翻倍，500K 档
+     装不下，且 decode 慢 11~30%（§W8A8 报告）。**对 500K 档 prefill 没有可用收益。**
+
+  **附带发现**：Humming 的 int8 head 在 prefill 里只占 0.5%（它只在 decode 每步被调 7 次），
+  与 §6.15 的结论一致 —— head 量化是纯 decode 优化。
+
   ---
 
 ## 7. 已知问题与注意事项
