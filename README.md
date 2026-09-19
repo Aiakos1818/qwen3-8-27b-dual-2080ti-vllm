@@ -17,6 +17,8 @@
 
 - **MTP 下保住 FULL cudagraph**（`059727bfa`）：SM75 的投机验证留在 FlashInfer native decode
   路径，不再被降级成 PIECEWISE —— 上表提升的主要来源（本分支自身的开关对照：54.1 → 37.5 ms/步）。
+  2026-09-19 独立复核（同 profile 30K）：`=1` 时 decode/prefill 各有 PIECEWISE + FULL
+  两种捕获，`=0` 只剩 PIECEWISE；实测 46.2 vs 67.9 ms/步，比值同样是 **1.44×**。
 - **上游 DFlash2 路线已评估（不可迁移）**：机制我们本来就有（上游 PR #52816，`dflash`/`dflash2` 都在树里），但同 profile A/B 只有 MTP n=6 的 0.38×/0.58×，缺口在基座差异（详见 §6.17，含"他们 MTP 快 40%"实为口径差异的更正）。
 - **上游 fs 层 KV 字节预算 + LRU 淘汰**（`56c60a25f`）：上游默认不回收，磁盘占用随 spill 单调
   增长；本分支让 tier 自管预算，超了淘汰最旧。
