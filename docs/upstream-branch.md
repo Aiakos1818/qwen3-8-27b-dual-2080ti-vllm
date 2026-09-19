@@ -1418,8 +1418,16 @@ git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <
 
 **验证**（256K profile + MTP n=6 + `--head8bit` + fp8 KV）：
 
-- import 冒烟通过；上游新增扩展 `vllm._deepselect_C` 未编译 → **仅 WARNING 并降级**，本配置不用它；
-  163 笔里的 C++ 改动只涉及 CPU 算子与 `libtorch_stable`/sm100，**现有 5 个 `.so` 未出现 ABI 断**。
+- import 冒烟通过；163 笔里的 C++ 改动只涉及 CPU 算子与 `libtorch_stable`/sm100，**现有 5 个 `.so`
+  未出现 ABI 断**。日志里的 `Failed to import the DeepSelect extension (vllm._deepselect_C)` **与本次
+  同步无关**：该扩展来自独立仓库 `vllm-project/DeepSelect`（CMake FetchContent 钉在 `d96d33af`），
+  `setup.py` 里登记为 `optional=True`，且只在 **CUDA ≥ 12.9 / SM100~SM103（`10.0f`）** 上构建 ——
+  SM75 上 `cuda_archs_loose_intersection` 落到空集，所以永不存在，仅由
+  `layers/indexer_topk.py:24-31` 的 import-time try/except 打 3 行 WARNING（18:24 起的每个日志都有）。
+  它服务的是 **DSA/MLA 稀疏索引器**的 top-k（`layers/{indexer_topk,sparse_mqa_indexer}.py`、
+  `kernels/attention/dsa/sparse_mqa_logits.py`、`v1/attention/backends/mla/sparse_indexer.py`），
+  缺失时这些路径在 SM100 类模型上会直接 raise；**本模型（Qwen3.5/3.8 混合 GDN + full attention）
+  不经过这些路径**，故无影响。
 - 启动：V2 runner、`flashqla_legacy` GDN、**KV 池 279,147 tokens（与变基前完全相同）**、FULL 图照常捕获；
   六个移植标记（`VLLM_SM75_SPEC_SYNC_MODE`、`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`、
   `VLLM_QWOPUS_MTP_BF16_DRAFT`、`default_thinking_token_budget`、`flashqla_legacy`、fs quota）全部在位。
