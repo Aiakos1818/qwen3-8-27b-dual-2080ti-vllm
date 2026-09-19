@@ -1239,6 +1239,60 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   数据在 `/tmp/opencode/{ab_dflash,ab_mtp,fix1_30k,fix2_mtp_30k,fullcg_30k}.json`，
   临时 launcher 在 `~/Temp/opencode/run_256k_*.sh`。
 
+  ### 6.18 model runner V1 vs V2：只影响 decode，V2 每步快 18~24%，prefill 无关（2026-09-19）
+
+  **问题**：`runner v1` / `v2` 会不会影响 decode / prefill 速度。
+
+  **先厘清事实**：我们基座上两套 runner 是**并行实现**，不是新旧皮。选择开关是
+  `VLLM_USE_V2_MODEL_RUNNER`（`vllm/config/vllm.py:694` 的 `use_v2_model_runner`），日志打在
+  `gpu_worker.py:441`（`Using V2 Model Runner`，V1 不打）。**本机是 V2，而且是我们自己钉的**
+  —— `.env` 第 14 行 `VLLM_USE_V2_MODEL_RUNNER=1`，launcher 里还有 `${...:-1}`。所以 §6.1~6.17
+  的全部吞吐数字都是 V2 的。
+
+  | | V1 | V2（现用） |
+  |---|---|---|
+  | runner | `v1/worker/gpu_model_runner.py`（342 KB） | `v1/worker/gpu/model_runner.py`（102 KB）+ `v1/worker/gpu/{input_batch,cudagraph_utils,pool,sample,kv_connector}.py` |
+  | 投机栈 | `v1/spec_decode/`（MTP 走 `llm_base_proposer.py:1006`） | `v1/worker/gpu/spec_decode/{mtp,dflash,dflash2,dspark,eagle,multi_module_mtp}/` |
+  | cudagraph 捕获/尺寸 | 自己一套 | `cudagraph_utils.py` 另管一套（`config/compilation.py:1497`） |
+  | 回退规则 | V1 不支持：prefill context parallel、DSpark 等 | V2 不支持：stock torch.compile、SP、external_launcher PP、`ngram/draft_model/suffix/medusa/mlp_speculator/custom_class`、EAGLE parallel drafting、自定义 logits processor、`mamba_cache_mode="all"`、ubatching/DBO、elastic EP |
+
+  注意我们 9 文件移植里**只有 1 个是 V1 专属**：`gpu_model_runner.py` 那 20 行
+  `VLLM_SM75_SPEC_SYNC_MODE`；其余 8 个（gdn、flashinfer、qwen3_5_mtp、采样、
+  input_processor…）两个 runner 共用。
+
+  **方法**：同一 profile（256K + MTP n=6 + `--head8bit` + fp8 KV）、同一 batch 长度
+  （31.2K，`--word-counts 30000 --max-tokens 256 --runs 3`）。bench 的 prompt **seed 是确定的**
+  （`seed = word_count*100 + run`），所以 V1/V2 是**逐条同 prompt**；V2 基线直接取 §6.15 同口径
+  的既有数据。V1 跑两组以隔离我们自己的补丁：`VLLM_SM75_SPEC_SYNC_MODE=safe`（生产值，V1 下每
+  步 `stream.synchronize()`）与 `=auto`（非 TurboQuant KV 等于关闭）。
+
+  | | prefill tok/s | 整段 256 tok/s | 稳态 tok/s | 接受率 | **ms / verify 步** |
+  |---|---:|---:|---:|---:|---:|
+  | V2（现用） | 1289 | 86.3 | 65.5 | 33.8% | **20.4**（逐轮 20.4 / 17.5 / 22.7） |
+  | V1 + `SPEC_SYNC=safe` | 1267 | 78.1 | 55.1 | 32.9% | **24.0**（23.7 / 24.1 / 24.0） |
+  | V1 + `SPEC_SYNC=auto` | 1267 | 75.2 | 51.1 | 28.9% | **25.2**（25.2 / 23.6 / 27.0） |
+  | **V1 / V2** | **0.983** | 0.90 / 0.87 | 0.84 / 0.78 | ≈相同 | **1.18 / 1.24** |
+
+  **结论**：
+
+  1. **prefill 基本无关**（0.983）：符合 §6.16 —— 窗口里 attention 占 75.9%，runner 的 Python
+     路径不在关键路径上。
+  2. **decode 慢 18~24%**（按"每次 verify 轮次成本"= `(1+接受率)/稳态 tok/s`，已对接受率归一）：
+     这才是 V2 存在的理由。逐轮 ms 也最稳：V1 三次 23.7/24.1/24.0（±1%），V2 20.4/17.5/22.7
+     （更快但抖动大）。
+  3. **不是我们补丁的代价**：safe 与 auto 差 24.0 vs 25.2 ms（在逐轮散布内），即那 20 行 V1 专属
+     补丁在这长度上无可测开销。
+  4. **不是 FULL 图有无**：两组 V1 日志都出现 `Capturing CUDA graphs (decode, FULL)`，V2 也是。
+  5. **接受率两边一致**（≈33%）：拒采/验证的数学是共享的，差异只在每步开销。
+
+  **口径提醒**：服务端默认温度 1.0，同 prompt 每次生成流不同，所以 acceptance 逐次 26~46%、
+  稳态 tok/s 随之波动 ±25%，**不要直接比稳态两三位数，要看 ms/verify 步或同接受率**。
+
+  **复现**：`~/Temp/opencode/run_256k_mtp6_{v2,v1,v1auto}.sh`（只差
+  `VLLM_USE_V2_MODEL_RUNNER` 与 `VLLM_SM75_SPEC_SYNC_MODE` 两行）、驱动
+  `ab_v1_driver.sh` / `ab_v1auto_driver.sh`（内含 `scripts/tools/wait_server.sh` 就绪等待与
+  `stop_server.sh` 精确停止）、数据 `/tmp/opencode/ab_runner_{v1,v1auto}.json`。
+
   ---
 
 ## 7. 已知问题与注意事项
