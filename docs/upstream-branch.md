@@ -1324,3 +1324,74 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
    尚未验证。
 3. **500K 三档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
    （冷启 → 重发 → 跨会话换出/恢复），并把 `RAMx2` 的 `/dev/shm` remount 纳入装机清单。
+
+---
+
+## 9. 上游同步日志
+
+### 9.1 策略：单生产线 + rebase + force-with-lease + 备份 tag
+
+本线只有 3 笔自有提交（14 个文件），本质上就是挂在上游某笔提交上的一小摞补丁，所以**只维护一条生产线分支**，
+每次同步上游就把它 rebase 过去，不新建分支名：
+
+```
+# 1) 先给旧头打不可变回滚点（tag 只增不改，不污染分支列表）
+git tag -a pre-upstream-sync-<date> <旧头> -m "pre-sync head, rebased onto <上游目标>"
+git push aiakos refs/tags/pre-upstream-sync-<date>
+
+# 2) 在临时 worktree 里 rebase（不动主树）：解冲突 → 启动验证 → 跑配对 benchmark
+git worktree add /tmp/opencode/rebase-wt -b tmp-sync <生产线分支>
+git -C /tmp/opencode/rebase-wt rebase --onto <上游目标> <旧基座> tmp-sync
+
+# 3) 验证通过后落定（只有这一条分支用 force-with-lease；--force-with-lease 会在远端被别人动过时拒绝）
+git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <生产线分支>
+```
+
+**回滚**：`git reset --hard pre-upstream-sync-<date>` + 一次 force-with-lease 推送。
+**为什么不用 merge**：只有需要保留别人基于旧提交的引用时才需要 merge；本线没有这种需求，rebase 让
+`git log <上游>..<分支>` 永远只显示我们自己的补丁，测量数据也都能对应到一个明确的上游基座。
+**每次同步都要记一行下表**，并写清被上游取代而丢弃的提交（这比补丁本身更容易被遗忘）。
+
+### 9.2 同步记录
+
+| 日期 | 上游目标 | 我们保留 | 丢弃 / 新增 | 验证 | 回滚点 |
+|---|---|---|---|---|---|
+| 2026-09-16 | 上游 main `fbf2c5e8b`（v0.29.1rc0 之后 244 笔） | 5 笔：SM75 移植 / cudaHostRegister 粘性错误 ×2 / fs 字节预算+LRU / native spec-as-decode | — | §6.1~6.18 全部数据在此基座上测得 | — |
+| 2026-09-19 | 上游 main `751f6807d9`（距 `fbf2c5e8b` **163 笔**） | **3 笔**：SM75 移植（重解）/ fs 字节预算+LRU（并集）/ native spec-as-decode | **丢弃 2 笔** cudaHostRegister 粘性错误修复；上游 `40b40d1d39`（#51081）已改为分块注册并用同一 `CudaRTLibrary` 句柄 drain 错误，语义覆盖。新增：上游 `23e26e0588`（#50045）back-pressure 检测与恢复（§8 头号待办） | 见 9.3 | tag `pre-upstream-sync-20260919` = `059727bfaa` |
+
+### 9.3 2026-09-19 同步的冲突与验证
+
+**冲突 3 处，全部按并集解决**：
+
+| 文件 | 上游改动 | 我们的改动 | 解决 |
+|---|---|---|---|
+| `v1/sample/ops/topk_topp_sampler.py` | 新增 FlashInfer JIT 可用性探测（#48956） | SM75 放行 | 保留上游探测；SM75 仍走我们的逃逸口（同时跳过该探测） |
+| `v1/kv_offload/tiering/fs/manager.py` | `backpressure_detector` + `_job_block_counts`（#50045） | `max_bytes`/`evict_retries` + `_store_batch`/quota | 并集：#50045 进来，字节预算+LRU 保留 |
+| `v1/kv_offload/cpu/gpu_worker.py`（两笔各一次） | 上游已重写 | 粘性错误修复 | 丢弃我们的两笔（被取代） |
+
+**验证**（256K profile + MTP n=6 + `--head8bit` + fp8 KV）：
+
+- import 冒烟通过；上游新增扩展 `vllm._deepselect_C` 未编译 → **仅 WARNING 并降级**，本配置不用它；
+  163 笔里的 C++ 改动只涉及 CPU 算子与 `libtorch_stable`/sm100，**现有 5 个 `.so` 未出现 ABI 断**。
+- 启动：V2 runner、`flashqla_legacy` GDN、**KV 池 279,147 tokens（与变基前完全相同）**、FULL 图照常捕获；
+  六个移植标记（`VLLM_SM75_SPEC_SYNC_MODE`、`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`、
+  `VLLM_QWOPUS_MTP_BF16_DRAFT`、`default_thinking_token_budget`、`flashqla_legacy`、fs quota）全部在位。
+- **配对 benchmark（同 prompt/seed，同会话背靠背各 6 次）**：
+
+| run | prefill 比 | ms/verify 步比 | 整段比 | 接受率 前→后 |
+|---:|---:|---:|---:|---|
+| 1 | 1.000 | 0.999 | 1.002 | 37.3 → 36.3 |
+| 2 | 1.000 | 1.108 | 0.920 | 38.0 → 30.3 |
+| 3 | 1.004 | 0.964 | 1.022 | 25.8 → 31.7 |
+| 4 | 0.999 | 0.817 | 1.185 | 23.7 → 36.3 |
+| 5 | 1.000 | 1.131 | 0.889 | 36.8 → 27.8 |
+| 6 | 1.000 | 0.997 | 1.076 | 25.9 → 27.8 |
+| **中位数** | **1.000** | **0.998** | **1.012** | 31.3% → 31.0% |
+
+  结论：**性能中性**（prefill 逐条 1.000、ms/步中位数 0.998、接受率同水平）。注意 pm 步逐对散布 ±13~18%
+  是温度 1.0 采样的噪声，**必须同会话配对**：本次同会话两侧 prefill 都是 1269 tok/s，而 §6.18 记录的
+  1289 是 2.5 小时前的跨时段值（约 1.6% 会话级漂移），只看中位数会误判成 −14%。
+
+- 数据：`/tmp/opencode/ab_{old,new}6.json`（配对）、`ab_rebased.json`、`bench_{old,new}6.out`。
+- 尚未覆盖：settle 后还没跑**全量档位验证**（各 profile 的 KV 池核对、offload 套件、长稳），
+  以及 500K 三档端到端（仍受 64 GB 内存阻塞，§8）。
