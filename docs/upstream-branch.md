@@ -598,6 +598,47 @@ KernelTraits<MaskMode=causal, CTA_TILE_Q=64, NUM_MMA_Q=1, NUM_MMA_KV=2,
 grid=(68,1,2)  block=(32,4,1)=128 线程  smem=65536(=Turing 每 SM 上限)  regs=255
 ```
 
+**背景：smem（共享内存）是什么，为什么是 64 KB**（2026-09-19 补充）
+
+smem 是 SM 内部的**片上 SRAM**，既不是显存也不是 L2（本卡 L2 只有 5.5 MB）。它按 thread
+block（CTA）分配、块内线程共享、由程序员显式管理，作用是"把反复用到的数据从显存搬到片上，
+用空间换带宽" —— attention 这类 tile 算法全靠它把 Q/K/V 分片喂给张量核。**一个 SM 上能同时
+驻留几个 CTA，直接由 smem 决定**（各 CTA 的 smem 需求之和不能超过每 SM 的额度）。
+
+本机权威值（`torch.cuda.get_device_properties`）：
+
+| 项 | 值 |
+|---|---|
+| 每 SM 共享内存 | **65,536 B = 64 KB（硬上限）** |
+| 每 block 共享内存 | 49,152 B = 48 KB 默认；超过需 `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in |
+| 每 SM 寄存器 | 65,536（× 4 B = 256 KB） |
+| 每 SM 最大线程 | 1024 |
+| L2 | 5.5 MB |
+
+代际对比（CUDA 编程指南 per-CC 表）—— **Turing 是异类**：
+
+| 架构 | CC | 每 SM 共享内存 |
+|---|---|---|
+| Pascal（1080 Ti） | 6.1 | 96 KB |
+| Volta（V100） | 7.0 | 96 KB |
+| **Turing（2080 Ti）** | **7.5** | **64 KB** |
+| Ampere（A100） | 8.0 | 164 KB |
+| Ampere（3090） | 8.6 | 100 KB |
+| Hopper（H100） | 9.0 | 228 KB |
+
+比 Pascal/Volta 还小，只有 A100 的 39%。而 flashinfer 这版 kernel 的 tile 预算正好等于这
+64 KB：Q 分片 64×256×2 B = 32 KB，加 K/V 分片各 32×256×1 B（fp8、双缓冲）≈ 32 KB，合计
+**65,536 B**。所以不是"碰巧占满"，而是**它的设计预算就是 64 KB** —— 在 Ampere 上是"半个
+SM"，在 Turing 上是"整个 SM"。
+
+因果链：**smem 占满 → 1 CTA/SM → 该 CTA 只有 128 线程 → SM 的 1024 线程只用了 12.5% →
+掩盖不住张量核流水线与显存→smem 的延迟 → SM 大半时间在等 → 效率只有峰值的 ~1/3**。
+§6.9 的探针是这条链的直接证据：同一个循环，45,875 B smem（能放 2 个 CTA）跑 518 GB/s，
+65,536 B（1 个 CTA）只剩约 1/3。
+
+也正因为它是硬件上限，**carveout（L1/共享内存的配比）动不了它**：能调的只是"64 KB 共享 +
+32 KB L1"之类的比例，64 KB 这个上限本身抬不高（实测无效）。
+
 - **KV 已经切了 68 份**（`padded_batch_size` = SM 数 = 68，`gridDim.z` = 2 个 kv head）→
   136 个 CTA，每个只走 ~3.7K 个 KV，并用 `PersistentVariableLengthMergeStatesKernel` 归约。
   所以并行度（chunk 数）不是问题。
@@ -1056,7 +1097,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
      对 attention 的 tile 效率无帮助；`--kv-cache-dtype` 换成 fp16 能让 attention 快 ~18%
      （§6.11 实测），但要 2× KV 显存，500K 档根本装不下（fp8 的 9.6e9 已占 21 GB/卡）。
   3. **真正要动的是 kernel，而它被四堵墙挡着**：Turing 每 SM 64 KB smem → 该 kernel
-     smem=65536 → 1 CTA/SM → 占用率 12.5%（§6.8）；flashinfer 的 warp 数硬编码，改成 8
+     smem=65536 → 1 CTA/SM → 占用率 12.5%（smem 是什么、为什么是 64 KB 见 §6.8 的背景说明）；flashinfer 的 warp 数硬编码，改成 8
      warps 需要 CTA_TILE_KV=64 → smem ~82 KB 超限（§6.8）；FA2 在 d256 上需要 69,632 B >
      64 KB（汇总报告 §0 第 3 条）；我们自己的手写 kernel 尝试卡在 codegen 崩坏
      （§6.9–6.11，同一循环独立 kernel 602 GB/s、放进大 kernel 只剩 76 GB/s）。
