@@ -9,7 +9,7 @@
 
 | 项 | 值 |
 |---|---|
-| 源码目录 | `/home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/src/vllm-0271` |
+| 源码目录 | `<工作区>/zyYuc-sandbox/src/vllm-0271` |
 | 新分支 | `2080ti_dual_qwen38-27B`（基于上游 `main`） |
 
 提交序列：
@@ -53,7 +53,7 @@ fbf2c5e8b  [Frontend] Add per-request metrics to Responses API (#55084)   ← �
 
 | 项 | 值 |
 |---|---|
-| venv | `/home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox/venv` |
+| venv | `<工作区>/zyYuc-sandbox/venv` |
 | 安装版本 | `vllm 0.26.1rc1.dev2278+g49f68ba24`（editable） |
 | torch / transformers | `2.13.0+cu130` / `5.16.1` |
 | FlashInfer | `0.6.18.post1`（原 `0.6.16.post3`） |
@@ -65,7 +65,7 @@ fbf2c5e8b  [Frontend] Add per-request metrics to Responses API (#55084)   ← �
 1. **CUDA 工具链降级**：`nvidia-cu13` 的 nvcc/nvvm/crt 从 13.3 降到 **13.0.88**（13.3 的头文件与 torch cu130 不匹配）。
 2. **补 20 个无版本号 `.so` 链接**于 `.../nvidia/cu13/lib`（`libcudart.so` → `libcudart.so.13` 之类），否则链接期找不到。
 3. `.../nvidia/cu13/lib64` → `lib` 符号链接。
-4. **`.deps` 路径重写**：160 个文件里残留的 `/home/aiakos/zyYuc-sandbox` 改为 `/home/aiakos/Qwen3.8-27B-Deploy/zyYuc-sandbox`。
+4. **`.deps` 路径重写**：160 个文件里残留的旧前缀 `~/zyYuc-sandbox` 改为 `<工作区>/zyYuc-sandbox`。
 5. **手动 clone cutlass 源码**到 `.deps/cutlass-src`（`v4.7.1`，HEAD `cb4247394`），配合 `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` 规避离线构建时的下载。
 
 构建参数：`TORCH_CUDA_ARCH_LIST=7.5`、`MAX_JOBS=6`、`CUDA_HOME` 指向 pip 的 cu13，耗时约 **52 分钟**。
@@ -177,7 +177,7 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 |---|---|
 | `.env` 的 `MODEL_PATH`；7 个 `run_vllm_qwen38_awq_*.sh` 默认 | ② yarn512k |
 | 上述任一 profile 加 `--head8bit` | ③ head8bit |
-| `~/Temp/opencode/run_500k_head4bit.sh`（临时 launcher） | ③ head4bit |
+| `experiments/run_500k_head4bit.sh`（head4bit launcher） | ③ head4bit |
 | 遗留 `run_qwen3.8_27b_sm75.sh`（基础路线） | ④ FP8（需手动指 `MODEL_PATH`） |
 | `quantize_lm_head.py --src/--dst` | ② → ③（也可拿 ⑤ 当 src，保证从 pristine 源出发） |
 
@@ -203,7 +203,7 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 
 ## 5. 128K 上游 offload 实测
 
-配置：池 3.0e9（144,584 tokens）、CPU staging 见下、fs 磁盘层 `/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv`。
+配置：池 3.0e9（144,584 tokens）、CPU staging 见下、fs 磁盘层 `$VLLM_SSD_ROOT`。
 测试方式：发 A 建立会话 → 发 B（不同内容）把 A 挤出 GPU → 重发 A，看 `cached_tokens`。
 
 ### 5.1 关键前提：`cudaHostRegister` 与粘性错误
@@ -751,8 +751,8 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 ### 6.9 手写注意力 kernel 进展：内存模式已证明可行，卡在 codegen（2026-09-18）
 
 §6.8 的结论是"要更快只能手写 kernel"。这一节记录手写工作的进展、已修掉的坑、以及**一个
-还没解决但已精确定位的阻塞点**。工具在 `/tmp/opencode/kern/`（`mq_attn.cu` + `bwprobe.py`
-等，未入仓库）。
+还没解决但已精确定位的阻塞点**。工具归档在 `experiments/kern/`（`mq_attn.cu` + `bwprobe.py`
+等）。
 
 **第一步：先证明这个访问模式能做到多少带宽。** 写了一个只做"读"的探针 kernel（原始 CUDA，
 非 flashinfer）：完全相同的分页 fp8 KV 布局、页 gather、软件 e4m3→fp16 转换、`uint4` 向量载入，
@@ -1101,7 +1101,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
 
   **默认（不带开关）仍是原 checkpoint（head 为 bf16）**，`--head8bit` 才启用 int8。
   两个变体目录和工具都留着；int4 变体没有开关，只能用临时 launcher
-  `~/Temp/opencode/run_500k_head4bit.sh` 跑。
+  `experiments/run_500k_head4bit.sh` 跑。
 
   **下一步候选**：
 
@@ -1123,7 +1123,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   **测法**：用 `--profiler-config '{"profiler":"torch","torch_profiler_dir":…,
   "delay_iterations":240,"active_iterations":5}'` 起服务（本构建没有环境变量入口，也没有
   `/start_profile` 之外的开关），发一个 24 万词的 prompt，让 profiler 对准 prefill 末段
-  （kv≈240K）的 5 个 step 采样，再用 `~ /Temp/opencode/salvage.py` 解析（trace 因为
+  （kv≈240K）的 5 个 step 采样，再用 `experiments/salvage.py` 解析（trace 因为
   `/stop_profile` 刷盘超过客户端超时被截断，事件是流式写的，前面的都能抢救出来）。
 
   **结果（rank0，5 个 step，GPU busy 126.4 s，13.5 万个 kernel）**：
@@ -1236,8 +1236,8 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   **处置**：移植代码归档在 vLLM 仓库 **`wip/sm75-dflash2`** 分支（`54a3ac94d`），等基座
   升级后再评估；FA2 补丁已回退，主干工作区干净。draft checkpoint 留在
   `models/Qwen3.8-27B-DFlash2/`（3.85 GB，ModelScope 下载、sha256 与 HF 一致）；
-  数据在 `/tmp/opencode/{ab_dflash,ab_mtp,fix1_30k,fix2_mtp_30k,fullcg_30k}.json`，
-  临时 launcher 在 `~/Temp/opencode/run_256k_*.sh`。
+  数据在 `experiments/{ab_dflash,ab_mtp,fix1_30k,fix2_mtp_30k,fullcg_30k}.json`，
+  launcher 在 `experiments/run_256k_*.sh`。
 
   ### 6.18 model runner V1 vs V2：只影响 decode，V2 每步快 18~24%，prefill 无关（2026-09-19）
 
@@ -1288,10 +1288,11 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   **口径提醒**：服务端默认温度 1.0，同 prompt 每次生成流不同，所以 acceptance 逐次 26~46%、
   稳态 tok/s 随之波动 ±25%，**不要直接比稳态两三位数，要看 ms/verify 步或同接受率**。
 
-  **复现**：`~/Temp/opencode/run_256k_mtp6_{v2,v1,v1auto}.sh`（只差
+  **复现**：`experiments/run_256k_mtp6_{v2,v1,v1auto}.sh`（只差
   `VLLM_USE_V2_MODEL_RUNNER` 与 `VLLM_SM75_SPEC_SYNC_MODE` 两行）、驱动
-  `ab_v1_driver.sh` / `ab_v1auto_driver.sh`（内含 `scripts/tools/wait_server.sh` 就绪等待与
-  `stop_server.sh` 精确停止）、数据 `/tmp/opencode/ab_runner_{v1,v1auto}.json`。
+  `experiments/ab_v1_driver.sh` / `experiments/ab_v1auto_driver.sh`（内含
+  `scripts/tools/wait_server.sh` 就绪等待与 `stop_server.sh` 精确停止）、数据
+  `experiments/ab_runner_{v1,v1auto}.json`。
 
   ### 6.19 thinking_token_budget：思考预算与 max_tokens 解耦（2026-09-19）
 
@@ -1337,8 +1338,8 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   2. 响应里思考文本的字段名是 **`reasoning`**（`reasoning_content` 已 deprecated，只在**请求**侧被
      改名兼容：`protocol.py:554-556`）→ 网关/客户端若只认 `reasoning_content` 会读不到思考文本。
 
-  **复现**：`/tmp/opencode/test_thinking_budget.py`（A/B/C）与 `test_tool_after_budget.py`（D/E）、
-  输出 `ab_budget_driver{,2}.log`、临时 launcher `~/Temp/opencode/run_256k_mtp6_budget.sh`（512）。
+  **复现**：`experiments/test_thinking_budget.py`（A/B/C）与 `experiments/test_tool_after_budget.py`（D/E）、
+  输出 `ab_budget_driver{,2}.log`（日志不入库）、launcher `experiments/run_256k_mtp6_budget.sh`（512）。
 
   ---
 
@@ -1387,8 +1388,8 @@ git tag -a pre-upstream-sync-<date> <旧头> -m "pre-sync head, rebased onto <�
 git push aiakos refs/tags/pre-upstream-sync-<date>
 
 # 2) 在临时 worktree 里 rebase（不动主树）：解冲突 → 启动验证 → 跑配对 benchmark
-git worktree add /tmp/opencode/rebase-wt -b tmp-sync <生产线分支>
-git -C /tmp/opencode/rebase-wt rebase --onto <上游目标> <旧基座> tmp-sync
+git worktree add <临时目录>/rebase-wt -b tmp-sync <生产线分支>
+git -C <临时目录>/rebase-wt rebase --onto <上游目标> <旧基座> tmp-sync
 
 # 3) 验证通过后落定（只有这一条分支用 force-with-lease；--force-with-lease 会在远端被别人动过时拒绝）
 git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <生产线分支>
@@ -1447,6 +1448,6 @@ git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <
   是温度 1.0 采样的噪声，**必须同会话配对**：本次同会话两侧 prefill 都是 1269 tok/s，而 §6.18 记录的
   1289 是 2.5 小时前的跨时段值（约 1.6% 会话级漂移），只看中位数会误判成 −14%。
 
-- 数据：`/tmp/opencode/ab_{old,new}6.json`（配对）、`ab_rebased.json`、`bench_{old,new}6.out`。
+- 数据：`experiments/ab_{old,new}6.json`（配对）、`ab_rebased.json`、`bench_{old,new}6.out`。
 - 尚未覆盖：settle 后还没跑**全量档位验证**（各 profile 的 KV 池核对、offload 套件、长稳），
   以及 500K 三档端到端（仍受 64 GB 内存阻塞，§8）。
