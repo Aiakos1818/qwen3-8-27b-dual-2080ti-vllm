@@ -123,10 +123,81 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 
 ### 4.3 池容量（实测，用于核对 `kv-cache-memory-bytes`）
 
-| `max-model-len` | 池 | 实测 `GPU KV cache size` | 并发 |
-|---|---|---|---|
-| 500,800 | 9.6e9 | 525,229 tokens | 1.05× |
-| 131,072 | 3.0e9 | 144,584 tokens | 1.10× |
+| `max-model-len` | 池 | MTP n | 实测 `GPU KV cache size` | 并发 |
+|---|---|---|---|---|
+| 500,800 | 9.6e9 | 5 | 525,229 tokens | 1.05× |
+| 500,800 | 9.6e9 | **6（现默认）** | **509,877 tokens** | 1.02× |
+| 262,144 | 5.6e9 | 6（现默认） | 279,147 tokens | 1.06× |
+| 131,072 | 3.0e9 | 5 | 144,584 tokens | 1.10× |
+
+（n=6 的三行是 2026-09-19 实测：500K 档仍装得下一个满长度请求，256K 档为 n=6 额外加的
+0.3e9 预算见 §6.14。）
+
+### 4.4 目录布局：`models/` 与备份（谁是真数据、谁是链接）
+
+```
+① 实体权重    models/Qwen3.8-27B-AWQ-INT4/                        20G   19 真文件, 0 链接
+                  compressed-tensors · W4A16 · group32（忽略 linear_attn 与 mtp）
+                  ★ 磁盘上唯一一份真实权重
+
+② 配置覆盖层  models/Qwen3.8-27B-AWQ-INT4-yarn512k/               96K   1 真 + 17 链接
+                  真文件只有 config.json；其余 17 个 = 符号链接 → ①
+                  与①唯一差别：rope_type default → yarn, factor 4.0, original_max=262144
+                  ← .env 的 MODEL_PATH；7 个 run_vllm_qwen38_awq_*.sh 默认读它
+
+③ head 变体（由 scripts/tools/quantize_lm_head.py 从 ② 生成）
+   models/…-yarn512k-head8bit/   1.3G   3 真 + 15 链接 → ①      【已采用】
+        真：config.json（新增 head group, num_bits=8）、index、file1（lm_head 变 int8 packed）
+        ← 启动加 --head8bit ⇒ MODEL_PATH 换成 ${MODEL_PATH}-head8bit
+   models/…-yarn512k-head4bit/   702M   3 真 + 15 链接 → ①      【未采用】
+        真：同上，但 head 并入 group_0（num_bits=4）；只能用临时 launcher 跑
+
+④ 上游 FP8（另一套量化格式，当前部署不用）
+   models/Qwen3.8-27B-FP8/       29G    82 真文件, 0 链接   quant_method=fp8
+        ← 遗留 profile run_qwen3.8_27b_sm75.sh（"基础路线 FP8/180K"，需手动指 MODEL_PATH）
+        ⚠ 无副本，不可再下载
+
+⑤ 备份（部署根目录，在 models/ 之外）
+   model-backup-awq-int4/        真实 22.2MB
+        ├ Qwen3.8-27B-AWQ-INT4/  5 个 safetensors = ① 的【硬链接】(同 inode, 0 额外磁盘)
+        │                        + 14 个小文件的真实副本
+        └ Qwen3.8-27B-AWQ-INT4-yarn512k/  ② 的副本（链接改成相对路径，自成一体）
+```
+
+**两种"链接"语义不同**：
+
+| 类型 | 出现在 | 含义 |
+|---|---|---|
+| **符号链接** symlink | ②③ 里的 15~17 个文件 | 只是路径转发。指到哪读哪，目标坏了它就断 |
+| **硬链接** hardlink | ⑤ 里的 5 个 safetensors | **同一个 inode、同一份数据**，两个并列的名字；删掉任一个数据都还在（所以能防误删） |
+
+**谁读谁**：
+
+| 使用者 | 读的目录 |
+|---|---|
+| `.env` 的 `MODEL_PATH`；7 个 `run_vllm_qwen38_awq_*.sh` 默认 | ② yarn512k |
+| 上述任一 profile 加 `--head8bit` | ③ head8bit |
+| `~/Temp/opencode/run_500k_head4bit.sh`（临时 launcher） | ③ head4bit |
+| 遗留 `run_qwen3.8_27b_sm75.sh`（基础路线） | ④ FP8（需手动指 `MODEL_PATH`） |
+| `quantize_lm_head.py --src/--dst` | ② → ③（也可拿 ⑤ 当 src，保证从 pristine 源出发） |
+
+**磁盘账**：
+
+| 目录 | `du` 显示 | 真实数据 |
+|---|---|---|
+| ① AWQ-INT4 | 20G | 20G |
+| ② yarn512k | 96K | 96K |
+| ③ head8bit / head4bit | 1.3G / 702M | 1.3G / 702M |
+| ④ FP8 | 29G | 29G |
+| ⑤ backup | 20G（**假象**） | **22.2MB**（权重是硬链接） |
+| 合计 | 51G | **部署真正需要的只有 ①+② = 20G**；开 `--head8bit` 再 +1.3G |
+
+**三条容易踩的**：
+
+1. **变体目录名不能改**：`--head8bit` 是 `${MODEL_PATH}-head8bit` 推导出来的，改名即弄坏开关。
+2. `du -sh model-backup-awq-int4` 显示 20G 是硬链接未跨目录去重的假象，真实只有 22.2MB。
+3. 备份**不被 head8bit 使用**（变体的符号链接指向活的 ①），它只是"改动前的退路"；而
+   `models/Qwen3.8-27B-FP8` 目前**没有副本**。
 
 ---
 
