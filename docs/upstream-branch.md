@@ -1027,9 +1027,17 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   | cuBLAS/cutlass | 0.3% | `turing_fp16_s1688gemm_fp16_*` |
   | 其余 | ~1% | elementwise/copy 等 |
 
-  **attention 的实际效率**：按 240K 上下文的实测 prefill 速率（~640 tok/s）反推，attention
-  拿到约 **40 TFLOPS（双卡合计）= 峰值的 ~37%**，与报告里 16.5~16.9 TFLOPS/卡（合计 ~33）
+  **attention 的实际效率**：按该窗口附近的实测 prefill 速率反推，attention 拿到约
+  **37~40 TFLOPS（双卡合计）= 峰值的 ~35~37%**，与报告里 16.5~16.9 TFLOPS/卡（合计 ~33）
   一致。
+
+  **测量边界（诚实说明）**：窗口具体落在 prefill 的哪一段没能直接读到 —— 开了
+  `torch_profiler_record_shapes` 也拿不到 attention 算子的输入形状，因为 prefill 走的是
+  FULL cudagraph（算子级事件被图回放隐藏，cpu_op 里只有 `aten::*` 和 `_C::marlin_gemm`）。
+  能间接定界的是：kernel 计数给出窗口约 98 个 chunk × 16 层；而按 §6.16 下面的速率模型，
+  "末段瞬时占比"在 249K 处是 74.4%，与实测的 75.9% 吻合 —— 说明窗口确实在 prefill 末段
+  （kv 接近满长度）。因此 **75.9% 这个比例是稳的**（末段瞬时值与全程均值都在 72~76%），
+  而换算出的绝对 TFLOPS 有 ±50% 的不确定度。
 
   **上下文相关性**（用 31.2K/215K/449K 三处实测速率拟合，每 token 时间 = 常数项 + 正比项）：
 
