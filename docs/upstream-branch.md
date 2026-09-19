@@ -1293,6 +1293,53 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   `ab_v1_driver.sh` / `ab_v1auto_driver.sh`（内含 `scripts/tools/wait_server.sh` 就绪等待与
   `stop_server.sh` 精确停止）、数据 `/tmp/opencode/ab_runner_{v1,v1auto}.json`。
 
+  ### 6.19 thinking_token_budget：思考预算与 max_tokens 解耦（2026-09-19）
+
+  **问题**：opencode 对话卡住——最后一轮模型的思考（reasoning）被 32000 token 上限截断，
+  于是它在真正调用 `write` 之前就"没额度了"，opencode 随即结束本轮循环。
+
+  **机制（上游早就有，不需要写补丁）**：
+
+  - **请求级字段**：OpenAI 兼容入口直接收 `thinking_token_budget`（`chat_completion/protocol.py:258`，
+    `completion/protocol.py:244` 同理）→ `SamplingParams.thinking_token_budget`；引入提交 `72c0d67657`。
+  - **服务端默认**：`ReasoningConfig.default_thinking_token_budget`（`config/reasoning.py:29`，本线
+    `49f68ba24` 补的 4 行）+ `input_processor.py:126-136` 接线——请求没带该字段时套用服务端值。
+  - **执行**：MRV2 采样器 `v1/worker/gpu/sample/thinking_budget.py`（Triton `_thinking_budget_kernel`
+    + UVA 张量）与状态机 `v1/sample/thinking_budget_state.py`；预算耗尽时**强制写
+    `reasoning_end_str`**（我们配 `</think>`），随后正常续写，答案 / tool_call 用剩下的 `max_tokens`。
+    状态机还把 **prompt 里已有的思考**计入预算，所以上一轮被截断留下的未闭合 `<think>` 会在下一轮
+    **立即**结束——正好自愈这种卡死。
+  - 前置条件：`--reasoning-parser` / `--reasoning-config` 必须启用（否则请求带该字段直接
+    `VLLMValidationError`）。
+
+  **实测**（256K profile + MTP n=6 + `--head8bit`，V2；`reasoning_tokens` 取自服务端 usage）：
+
+  | 探针 | budget | max_tokens | reasoning tokens | content | finish_reason |
+  |---|---:|---:|---:|---:|---|
+  | A 不带字段 | 服务端默认 512 | 2000 | **511** | 1488 tok | length（答案自己写太长） |
+  | B 显式 128 | 128 | 2000 | **127** | 1872 tok | length |
+  | C budget > max_tokens | 4000 | 600 | **600**（思考吃光） | **0** | length ← 复现故障 |
+  | D 带 tools | 默认 512 | 3000 | 511 | — | **tool_calls → `write(...)`** |
+  | E 带 tools | 128 | 3000 | 127 | — | **tool_calls → `write(...)`** |
+
+  A/B 证明默认值与逐请求覆盖都生效；C 精确复现被 `max_tokens` 截断的故障；D/E 是闭环——
+  **思考被强制结束后 tool_call 照常发出**。
+
+  **启用**：全部 profile 已加 `"default_thinking_token_budget":8000`（脚本内带注释）。取 8000 是给
+  opencode 的 32000 上限留出答案与 tool_call 的空间；`0` 表示完全禁止思考。注意它必须**明显小于**
+  客户端 max_tokens，否则等于没设。
+
+  **两个附带发现**：
+
+  1. **首次带 budget 的请求会 JIT 编译**该 kernel：`jit_monitor.py:140 WARNING ... Triton kernel JIT
+     compilation during inference: _thinking_budget_kernel ... latency spike`。warmup 阶段不会预编译
+     （启动时没有带 budget 的请求）→ 可以在就绪探针里先发一次带 budget 的短请求预热，或接受一次性尖峰。
+  2. 响应里思考文本的字段名是 **`reasoning`**（`reasoning_content` 已 deprecated，只在**请求**侧被
+     改名兼容：`protocol.py:554-556`）→ 网关/客户端若只认 `reasoning_content` 会读不到思考文本。
+
+  **复现**：`/tmp/opencode/test_thinking_budget.py`（A/B/C）与 `test_tool_after_budget.py`（D/E）、
+  输出 `ab_budget_driver{,2}.log`、临时 launcher `~/Temp/opencode/run_256k_mtp6_budget.sh`（512）。
+
   ---
 
 ## 7. 已知问题与注意事项
