@@ -1224,9 +1224,14 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
      metadata buffers for FULL CUDA Graph replay.`，decode 确实跑了 FULL 图），但实测
      62.9 vs 基线 65.5（−4%，在噪声内）。我们自己的 `VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE`
      已覆盖同一问题。
-  4. DFlash2 在我们栈上还差 ~35% 接受率，缺口在 **target 侧 hidden-state 捕获路径**
-     （本基座 0.26.1 vs 参考 fork 的 0.29.1rc0），不在这三个文件里；且 draft 额外占
-     3.85 GB（500K 档装不下，只能退到 256K）。
+  4. DFlash2 在我们栈上还差 ~35% 接受率，但缺口**不在基座版本**：本基座是上游 main 的
+     `fbf2c5e8b`（2026-09-16），比 v0.29.1rc0 还**新 244 个提交**、比参考 fork 的基座
+     （`b23433088b` = v0.29.1rc0-33）**新 211 个提交** —— 我们比它新，不是缺它的基座能力。
+     剩余差距原因未定（候选：draft 是按 BF16 target 的 hidden states 训练的，我们 AWQ-INT4
+     target 的偏差更大；或它的 synthetic prompt 对 block-diffusion 更友好）。这三个文件之外
+     也可以排除 speculator：`vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py` 我们与
+     上游 main 逐行相同，与参考 fork 只差 6 行。另外 draft 额外占 3.85 GB（500K 档装不下，
+     只能退到 256K）。
 
   **处置**：移植代码归档在 vLLM 仓库 **`wip/sm75-dflash2`** 分支（`54a3ac94d`），等基座
   升级后再评估；FA2 补丁已回退，主干工作区干净。draft checkpoint 留在
