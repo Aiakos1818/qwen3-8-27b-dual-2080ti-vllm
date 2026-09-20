@@ -1392,6 +1392,11 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   同 prompt 下 FP8 不开 MTP 只有 **21.3 tok/s**，即 MTP6 对 FP8 是 **+63%**。prefill 基本无差
   （反量化不拖慢算力受限段），慢在带宽受限的 decode + 接受率低 6.3 pt。
 
+  口径：两次除模型外，**`--max-model-len`/池不同**（204800 / 4.4e9 vs 262144 / 5.6e9，因为
+  FP8 装不下 256K + MTP6）；其余参数（KV dtype、TP、`max-num-seqs`、batched tokens、mm、
+  parsers、模板、MTP n=6、`additional-config`）完全一致。max-model-len 不改变同长度下的
+  decode 计算，故该对比可用；但未做"两者同为 204800"的完全对齐复核。
+
   **由此产生的配置修正：≤262,144 不再启用 YaRN。** 此前所有 256K 及以下 profile 都跑
   `-yarn512k` checkpoint，但 256K = 模型原生上限，**根本不需要外推**；而 YaRN 的 `mscale` 是每个
   位置都生效的常数注意力缩放（≈1.14×），在原生窗口内是纯精度损失。因此本分支把 ≤256K 的 profile
