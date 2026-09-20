@@ -65,11 +65,13 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   profile 都跑 `Qwen3.8-27B-AWQ-INT4`（非 yarn，权重与 yarn 目录相同、只差 config 的 rope），
   **只有 >262,144 的 500K 三档才用 `-yarn512k`**。`--head8bit` 在非 yarn 下对应
   `models/Qwen3.8-27B-AWQ-INT4-head8bit`（已建）。
-- **FP8 权重 256K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（+ `..._RAMx1_SSDx4.sh`）
-  —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit），池 286,249 tokens（4.9e9，实测
-  1.09x 满长并发，20.7 GB/卡）。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，**慢于 AWQ**，
-  价值在保真度。FP8 权重下 MTP6 会 OOM，故该档默认关 MTP。该 checkpoint **未做 head8bit**
-  处理（`lm_head` 仍是 bf16），`--head8bit` 只在 AWQ 档可用。
+- **FP8 权重 200K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_200k.sh`（+ `..._200k_RAMx1_SSDx4.sh`）
+  —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit）。**200K 而非 262,144**：FP8 权重比
+  AWQ 多吃 ~4.4 GB/卡，正好是 MTP6 需要的余量——实测 262,144 + MTP6 能启动但长请求 OOM
+  （峰值 21.44 GiB）。池 4.4e9 → 210,261 tokens（1.03x，21.0 GB/卡）。MTP n=6。
+  同 prompt（199,429 token）实测：**prefill 607 tok/s（与 AWQ 持平）、稳态 decode 34.8 tok/s
+  （AWQ 46.9，慢 26%）**；不开 MTP 只有 21.3 tok/s。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，
+  价值在保真度。该 checkpoint **未做 head8bit**（`lm_head` 仍是 bf16），`--head8bit` 只在 AWQ 档可用。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
@@ -186,7 +188,7 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 
 ~~~bash
 bash scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh     # 生产 profile（AWQ-INT4 / 256K / 无 offload）
-# 高精度对照：..._fp8_fp8e4m3_256k.sh（FP8 权重 / 256K / 无 MTP，慢但保真）
+# 高精度对照：..._fp8_fp8e4m3_200k.sh（FP8 权重 / 200K / MTP6，慢但保真）
 # 长上下文：..._500k.sh、..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh
 # offload（KV 跨重启可恢复）：..._256k_RAMx1_SSDx4.sh（需 ~10 GB shm）、..._128k_RAMx1_SSDx4.sh
 # 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh

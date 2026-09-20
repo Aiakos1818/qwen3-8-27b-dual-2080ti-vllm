@@ -1371,8 +1371,26 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   fp8_e4m3 KV ≈16.8 KB/token/卡。实测 262144 ✅（286,249 tokens，1.09x）、327680 ✅（336,824）、
   393216 ✅（397,806，21.9/22.5 GiB）→ **上限约 ~400K**；超过 262144 必须 YaRN。FP16 KV 上限减半（~200K）。
 
-  **新增 profile**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（FP8 权重 + fp8_e4m3 KV，默认关 MTP：
-  FP8 权重下 MTP6 实测 OOM）与 `..._fp8_fp8e4m3_256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload）。
+  **新增 profile**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_200k.sh`（FP8 权重 + fp8_e4m3 KV，MTP n=6）
+  与 `..._fp8_fp8e4m3_200k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload）。
+
+  **FP8 档为什么是 200K 而不是 262,144**：FP8 权重（含视觉塔）比 AWQ 多吃 ~4.4 GiB/卡，正好是
+  MTP6 需要的余量。实测 262,144 + MTP6 用池 5,342,000,000 **能启动**（KV 266,394 tokens，21.95 GiB/卡），
+  但**第一个长请求就 CUDA OOM**（峰值 21.44 GiB，仅剩 23.75 MiB）。MTP6 的 KV 几何是 ~20.4 KB/token/卡
+  （block 1632、mamba_blocks 24，比无 MTP 的 18.4 KB 多 ~10%），204,800 需 ≥ 4,346,707,968，
+  取池 4.4e9 → 210,261 tokens、21.0 GiB/卡（余量 ~1.5 GiB）。
+
+  **FP8 vs AWQ 的 decode 实测**（同 prompt 199,429 token、同 MTP n=6、同机同会话）：
+
+  | | FP8 200K | AWQ 256K | 差 |
+  |---|---|---:|---:|
+  | prefill | 607.0 tok/s | 599.8 tok/s | +1.2% |
+  | TTFT | 328.5 s | 332.5 s | −1.2% |
+  | **稳态 decode** | **34.8 tok/s** | **46.9 tok/s** | **−26%** |
+  | MTP 接受率 | 31.0% | 37.3% | −6.3 pt |
+
+  同 prompt 下 FP8 不开 MTP 只有 **21.3 tok/s**，即 MTP6 对 FP8 是 **+63%**。prefill 基本无差
+  （反量化不拖慢算力受限段），慢在带宽受限的 decode + 接受率低 6.3 pt。
 
   **由此产生的配置修正：≤262,144 不再启用 YaRN。** 此前所有 256K 及以下 profile 都跑
   `-yarn512k` checkpoint，但 256K = 模型原生上限，**根本不需要外推**；而 YaRN 的 `mscale` 是每个
