@@ -57,6 +57,16 @@ fi
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${OMP_NUM_THREADS:=8}"
 
+# --- model -----------------------------------------------------------------
+# Context here is <= the model's native 262,144, so no YaRN is needed: run the
+# released default-rope checkpoint. The -yarn512k directory differs only in
+# config.json's rope_parameters (weights are the same symlinked shards), and
+# YaRN's mscale is a constant attention scale applied at every position, so
+# within the native window it is pure precision cost with no benefit (see
+# reports/2026-09-sm75-optimization/accuracy-regression/). Override with
+# NATIVE_MODEL_PATH.
+NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH:-$(dirname "$MODEL_PATH")/Qwen3.8-27B-AWQ-INT4}"
+
 # --- geometry (measured, one chunk per block) ------------------------------
 # 1600 tokens and ~55.8 MB per chunk (both ranks' shards); the engine derives the
 # real kv_bytes_per_chunk from the canonical layout, which lands slightly under
@@ -134,9 +144,9 @@ EXTRA_LD_LIBRARY_PATH=""
 for _arg in "$@"; do
   case "$_arg" in
     --head8bit)
-      case "$MODEL_PATH" in
+      case "$NATIVE_MODEL_PATH" in
         *-head8bit) ;;
-        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
+        *) NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH}-head8bit" ;;
       esac
       EXTRA_LD_LIBRARY_PATH=$(
         ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
@@ -178,7 +188,7 @@ KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"eng
 
 ARGS=(
   --host "$HOST" --port "$PORT"
-  --model "$MODEL_PATH"
+  --model "$NATIVE_MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
   --dtype half --tensor-parallel-size 2 --device-ids 0,1
   --kv-cache-dtype fp8_e4m3

@@ -1374,6 +1374,16 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   **新增 profile**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（FP8 权重 + fp8_e4m3 KV，默认关 MTP：
   FP8 权重下 MTP6 实测 OOM）与 `..._fp8_fp8e4m3_256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload）。
 
+  **由此产生的配置修正：≤262,144 不再启用 YaRN。** 此前所有 256K 及以下 profile 都跑
+  `-yarn512k` checkpoint，但 256K = 模型原生上限，**根本不需要外推**；而 YaRN 的 `mscale` 是每个
+  位置都生效的常数注意力缩放（≈1.14×），在原生窗口内是纯精度损失。因此本分支把 ≤256K 的 profile
+  （256K 生产 / 256K offload / 128K offload / 225K fp16 / 基础路线）改为跑同目录的
+  `Qwen3.8-27B-AWQ-INT4`（default rope；两个目录权重相同，只差 config 的 `rope_parameters`），
+  **只有 >262,144 的 500K 三档保留 `-yarn512k`**。基础路线同时改为推导 `Qwen3.8-27B-FP8`
+  （它本就传 `--quantization fp8`，与 .env 的 AWQ 路径不一致）。非 YaRN 的 head8bit 变体
+  `models/Qwen3.8-27B-AWQ-INT4-head8bit` 已按同一软链方式补齐（config 取 default rope、
+  其余与 `-yarn512k-head8bit` 同源）。
+
   **复现**：`experiments/accuracy-regression/`（launcher / 采集 / 对比脚本；`corpus/`、`raw/` 体积大不入库），
   报告 [`reports/2026-09-sm75-optimization/accuracy-regression/README.md`](../reports/2026-09-sm75-optimization/accuracy-regression/README.md)。
 

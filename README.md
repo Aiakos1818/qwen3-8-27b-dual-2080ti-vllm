@@ -56,9 +56,15 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
-  （262,144）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
+  （262,144）、**非 YaRN**（default rope，见下）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；
+  n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
    `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
    需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
+  **≤262,144 一律用 default rope，不用 YaRN**：YaRN 的 `mscale` 在每个位置都生效，在原生窗口内是
+  纯精度损失、零收益（实测短上下文损失 1.9%–3.6% 的 top-1 一致率，长上下文更大）。因此 ≤256K 的
+  profile 都跑 `Qwen3.8-27B-AWQ-INT4`（非 yarn，权重与 yarn 目录相同、只差 config 的 rope），
+  **只有 >262,144 的 500K 三档才用 `-yarn512k`**。`--head8bit` 在非 yarn 下对应
+  `models/Qwen3.8-27B-AWQ-INT4-head8bit`（已建）。
 - **FP8 权重 256K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（+ `..._RAMx1_SSDx4.sh`）
   —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit），池 286,249 tokens（4.9e9，实测
   1.09x 满长并发，20.7 GB/卡）。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，**慢于 AWQ**，
@@ -102,8 +108,8 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
 - TP=2：两张卡共同加载 Qwen3.8-27B。
 - **生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）：AWQ-INT4 权重
   （SM75 没有 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，INT4/INT8 才是快路径，见下节）
-  + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，无需外推），启动日志可用
-  KV Cache **278,253 tokens**，显存 17.5 GB/卡。
+  + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，**用 default rope，不启用 YaRN**），
+  启动日志可用 KV Cache **278,253 tokens**，显存 17.5 GB/卡。
 - **长上下文档**：500K 三档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_RAMx2.sh`、
   `..._500k_RAMx1_SSDx4.sh`。
 - **验证档**：`..._128k_RAMx1_SSDx4.sh` 验证上游 tiering offload（RAM staging + 磁盘环），
@@ -167,7 +173,7 @@ cp config/vllm.env.example .env
 至少修改：
 
 ~~~bash
-MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 本分支各 profile 共用
+MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 500K 档用；≤256K 档会推导同目录的非 yarn 版
 # 基础路线（FP8 / 180K）用：MODEL_PATH=/你的/Qwen3.8-27B-FP8/模型目录
 VLLM_PYTHON=/你的/venv/bin/python
 FLASHQLA_PATH=/你的/FlashQLA-SM70-SM75
@@ -485,7 +491,7 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 | --dtype | half | 运行时 FP16 计算 dtype。 |
 | --tensor-parallel-size | 2 | 两张 GPU 做 Tensor Parallel。 |
 | --device-ids | 0,1 | 明确使用 GPU 0、1。 |
-| --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（`Qwen3.8-27B-AWQ-INT4-yarn512k`）。 |
+| --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（256K 档为 `Qwen3.8-27B-AWQ-INT4`，500K 档为 `-yarn512k`）。 |
 | --kv-cache-dtype | fp8_e4m3 | 用 FP8 E4M3 存 KV Cache，降低 KV 显存。 |
 | --max-model-len | 262144 | 单请求上下文上限（模型原生 `max_position_embeddings`；500K 档为 500800）。 |
 | --gpu-memory-utilization | 0.92 | vLLM 目标使用每卡 92% 显存。 |
