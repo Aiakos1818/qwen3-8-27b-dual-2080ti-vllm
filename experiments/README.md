@@ -81,6 +81,18 @@
 未纳入的中间物（反汇编 `mq.sass`、`.cu.b1/.b2` 备份、FlashInfer 头文件副本
 `prefill.cuh.orig`、`*.txt`/`*.log`/`__pycache__`）不属于源码，未归档。
 
+### §6.20 量化精度损失（logit 级单变量归因）
+| 文件 | 说明 |
+|---|---|
+| `accuracy-regression/launch.sh` | 5 配置统一 launcher（`LOGIT_EVAL=1/2`、`KV_OVERRIDE`、`POOL`） |
+| `accuracy-regression/tokenize_corpus.py` | 三域语料切 8K 段 + 长上下文探针（用生产 venv 的 tokenizer） |
+| `accuracy-regression/run_logit_eval.py` | 采集 `prompt_logprobs` / 生成侧 `logprobs`（top-100） |
+| `accuracy-regression/compare.py` | top-1/top-5 一致率、KL（交集重归一化）、覆盖率 |
+
+报告：[`../reports/2026-09-sm75-optimization/accuracy-regression/README.md`](../reports/2026-09-sm75-optimization/accuracy-regression/README.md)。
+语料 `corpus/` 与原始 npz `raw/` **不入库**（体积大，见 `.gitignore`），可由 `tokenize_corpus.py`
+与 `run_logit_eval.py` 重建。
+
 ## 数据文件
 
 `*.json` / `*.out` 是各实验的原始测量输出，供 `docs/upstream-branch.md` 引用核对。

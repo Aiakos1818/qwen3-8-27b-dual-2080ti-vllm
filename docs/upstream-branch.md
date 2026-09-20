@@ -1343,6 +1343,42 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
 
   ---
 
+  ### 6.20 量化精度损失：logit 级单变量归因（2026-09-20）
+
+  **动机**：此前各 profile 的权重量化（AWQ INT4、head int8）、KV 量化（fp8_e4m3）与 YaRN 都只做了
+  性能测量，没有精度回归——§6.7/§6.11 只回答"快不快"。
+
+  **方法**：不测任务型基准，改测**逐位置分布**。三域语料（英文 wikitext-2 / 中文 wikipedia / 代码 vLLM 源码）
+  切 8192-token 段，`prompt_logprobs=100` 取每位置 top-100 分布（72 段 × 8192 ≈ 590K 位置）；另加
+  32K/128K/256K 长上下文探针各 6 条（生成 1 token 取 `logprobs=100`）。指标：top-1/top-5 一致率、
+  KL（top-100 交集重归一化）、覆盖率、真实 next-token `|Δlogprob|`。T=0、`max-num-seqs=1`、`--language-model-only`。
+
+  **单变量链**：B0（FP8 权重 / default rope / fp8 KV）→ W4（AWQ-INT4）→ W4y（+YaRN）→ H8（+head int8）；
+  H8f 与 H8 只差 KV dtype。每步只动一个变量。
+
+  **结论**（dense KL 中位 0.001–0.014 nats，量级与文献中 W4 一致）：
+  - **短上下文**：INT4 权重主导（argmax 改变 4.3%–7.6%，KL 0.023–0.050），YaRN 次之（1.9%–3.6%）。
+  - **长上下文（256K）**：**YaRN 反超**（KL 0.0287，约为权重 0.0143 的 2 倍）；256K 那 1/6 的 argmax
+    翻转归因于 YaRN。**YaRN 不是量化**，是上下文外推，且可配置。
+  - **FP8 KV 几乎无损**：18/18 长上下文探针 argmax 全一致，KL 0.0004–0.0019。
+  - **head int8 很小**：argmax 改变 0.4%–0.8%，KL ≤0.002。
+  - 域差异：代码最钝（top-1 一致 95.4%、覆盖率 99.3%），中文最敏感（91.7%、93.2%）。
+
+  **口径限制**：基线 B0 是 **FP8 而非 BF16**（BF16 约 54 GB，双卡 44 GB 装不下）；KL 为 top-100 截断；
+  长上下文每档仅 6 个探针；T=0 贪心（生产温度 1.0）。未测任务型基准，**不能据此断言 agent 任务无损**。
+
+  **顺带实测（本机 FP8 权重能开多大）**：`--language-model-only` 下 FP8 权重加载后每卡空闲 **6.40 GiB**，
+  fp8_e4m3 KV ≈16.8 KB/token/卡。实测 262144 ✅（286,249 tokens，1.09x）、327680 ✅（336,824）、
+  393216 ✅（397,806，21.9/22.5 GiB）→ **上限约 ~400K**；超过 262144 必须 YaRN。FP16 KV 上限减半（~200K）。
+
+  **新增 profile**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（FP8 权重 + fp8_e4m3 KV，默认关 MTP：
+  FP8 权重下 MTP6 实测 OOM）与 `..._fp8_fp8e4m3_256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload）。
+
+  **复现**：`experiments/accuracy-regression/`（launcher / 采集 / 对比脚本；`corpus/`、`raw/` 体积大不入库），
+  报告 [`reports/2026-09-sm75-optimization/accuracy-regression/README.md`](../reports/2026-09-sm75-optimization/accuracy-regression/README.md)。
+
+  ---
+
 ## 7. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |

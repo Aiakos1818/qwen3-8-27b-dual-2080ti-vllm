@@ -57,12 +57,20 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
   （262,144）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
-  `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
-  需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
+   `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
+   需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
+- **FP8 权重 256K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（+ `..._RAMx1_SSDx4.sh`）
+  —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit），池 286,249 tokens（4.9e9，实测
+  1.09x 满长并发，20.7 GB/卡）。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，**慢于 AWQ**，
+  价值在保真度。FP8 权重下 MTP6 会 OOM，故该档默认关 MTP。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
   上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环），用于验证而非服务。
+- **量化精度损失评测（logit 级单变量归因）**：
+  [`reports/2026-09-sm75-optimization/accuracy-regression/`](reports/2026-09-sm75-optimization/accuracy-regression/README.md)
+  —— 对 B0（FP8 基线）/ W4 / W4y / H8f / H8 做 top-1 一致率与 KL 分解：**短上下文由 INT4 权重主导，
+  长上下文由 YaRN 反超，FP8 KV 几乎无损**。脚本与原始数据在 `experiments/accuracy-regression/`。
 - **编译环境修补**与 128K 驱逐/恢复实测见 [`docs/upstream-branch.md`](docs/upstream-branch.md)。
 
 ## 已验证环境
@@ -171,6 +179,7 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 
 ~~~bash
 bash scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh     # 生产 profile（AWQ-INT4 / 256K / 无 offload）
+# 高精度对照：..._fp8_fp8e4m3_256k.sh（FP8 权重 / 256K / 无 MTP，慢但保真）
 # 长上下文：..._500k.sh、..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh
 # offload（KV 跨重启可恢复）：..._256k_RAMx1_SSDx4.sh（需 ~10 GB shm）、..._128k_RAMx1_SSDx4.sh
 # 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh

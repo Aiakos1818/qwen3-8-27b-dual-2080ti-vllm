@@ -5,3 +5,7 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# accuracy-regression: large run artifacts (rebuild with the scripts there)
+experiments/accuracy-regression/corpus/
+experiments/accuracy-regression/raw/
+
