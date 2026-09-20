@@ -13,7 +13,17 @@ Usage:
   monitor_kv_offload_web.py --port 9000 -d 2
   monitor_kv_offload_web.py --vllm-port 8001
   monitor_kv_offload_web.py --host 0.0.0.0         # LAN, no authentication
+  monitor_kv_offload_web.py --start                # background; --stop to end it
+  monitor_kv_offload_web.py --status               # pid / liveness / /healthz
+  monitor_kv_offload_web.py --stop                 # SIGTERM the panel on --port
   curl -s localhost:8199/api/snapshot | python3 -m json.tool
+
+--start forks into the background (``setsid`` plus stdout/stderr redirection),
+writes ``~/.cache/kv-offload-panel/panel-<port>.pid`` and appends stdout/stderr
+to ``panel-<port>.log`` in the same directory; --status and --stop read that
+pidfile, so stopping never has to pattern-match command lines. Without --start
+it runs in the foreground and Ctrl-C ends it -- the pidfile is still written so
+--stop works either way.
 
 Endpoints:
   GET /               the panel (inline CSS/JS, no external resources)
@@ -21,9 +31,9 @@ Endpoints:
   GET /api/snapshot   raw sample, same shape as the terminal --json output
   GET /healthz        liveness
 
-Read-only and dependency-free (stdlib only): it only issues HTTP GETs to the
-vLLM server, reads /proc, /dev/shm, /proc/meminfo, ``nvidia-smi`` and the disk
-tier's files, and never writes anything. It binds to localhost by default
+Dependency-free (stdlib only) and read-only apart from its own pidfile/log: it
+only issues HTTP GETs to the vLLM server, reads /proc, /dev/shm, /proc/meminfo,
+``nvidia-smi`` and the disk tier's files. It binds to localhost by default
 because the payload contains local paths; ``--host 0.0.0.0`` is opt-in and
 unauthenticated, so an SSH tunnel is the better way to reach it remotely.
 """
@@ -33,9 +43,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -58,6 +70,159 @@ from monitor_kv_offload import (  # noqa: E402
     shm_stats,
     throughput,
 )
+
+# --------------------------------------------------------------------------
+# process state: pidfile/log per serving port, so --stop never guesses
+# --------------------------------------------------------------------------
+
+# The panel serves one port per instance, so state is keyed by that port: two
+# panels (8199, 9000) coexist and --stop targets exactly one. Kept outside the
+# repository so the daemon leaves no tracked files behind.
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "kv-offload-panel")
+
+
+def _state_paths(port: int) -> tuple[str, str]:
+    """Return (pidfile, logfile) for a serving port."""
+    return (
+        os.path.join(STATE_DIR, f"panel-{port}.pid"),
+        os.path.join(STATE_DIR, f"panel-{port}.log"),
+    )
+
+
+def _read_pid(pidfile: str) -> int | None:
+    try:
+        with open(pidfile) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists but not ours; harmless for liveness
+        return True
+    return True
+
+
+def _pid_is_ours(pid: int, port: int) -> bool:
+    """Refuse a stale pidfile: the pid must be this script serving this port.
+
+    A pidfile can outlive its process (crash, reboot, manual rm of the log) and
+    a recycled pid would then be somebody else's process. /proc is the only
+    authority on what a pid currently is, so the command line is checked.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return False
+    argv = raw.replace(b"\0", b" ").decode("utf-8", "replace").split()
+    if not argv or "python" not in os.path.basename(argv[0]):
+        return False
+    me = os.path.basename(os.path.abspath(__file__))
+    if not any(os.path.basename(tok) == me for tok in argv[1:]):
+        return False
+    return any(
+        tok == "--port" and argv[i + 1] == str(port)
+        for i, tok in enumerate(argv)
+        if i + 1 < len(argv)
+    )
+
+
+def stop_panel(port: int) -> int:
+    """SIGTERM the panel started with --start on this port.
+
+    Exit codes follow stop_server.sh: 0 stopped, 1 found but trouble, 2 nothing
+    to stop -- so a wrapper can tell "was not running" from "failed to stop".
+    """
+    pidfile, logfile = _state_paths(port)
+    pid = _read_pid(pidfile)
+    if not pid:
+        print(f"[panel] nothing to stop: no pidfile at {pidfile}")
+        return 2
+    if not _pid_alive(pid):
+        print(f"[panel] pid {pid} not alive; removing stale pidfile")
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+        return 2
+    if not _pid_is_ours(pid, port):
+        print(f"[panel] refusing: pid {pid} is not this panel on port {port}")
+        return 1
+    print(f"[panel] stopping pid {pid} (port {port})")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for _ in range(50):
+        if not _pid_alive(pid):
+            try:
+                os.remove(pidfile)
+            except OSError:
+                pass
+            print(f"[panel] stopped pid {pid}")
+            return 0
+        time.sleep(0.2)
+    print(f"[panel] pid {pid} still alive after 10s; check {logfile}")
+    return 1
+
+
+def status_panel(port: int, host: str) -> int:
+    """Report the pid, whether it is alive, and whether /healthz answers."""
+    pidfile, logfile = _state_paths(port)
+    pid = _read_pid(pidfile)
+    if pid and _pid_alive(pid):
+        print(f"[panel] running: pid {pid}  port {port}  log {logfile}")
+    elif pid:
+        print(f"[panel] stale pidfile: pid {pid} not alive ({pidfile})")
+    else:
+        print(f"[panel] not running (no pidfile at {pidfile})")
+    probe = "127.0.0.1" if host in ("", "0.0.0.0") else host
+    url = f"http://{probe}:{port}/healthz"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            print(f"[panel] {url} -> HTTP {resp.status}")
+    except Exception as exc:  # noqa: BLE001 (any failure means "not answering")
+        print(f"[panel] {url} unreachable: {exc}")
+        return 1
+    return 0
+
+
+def _daemonize(port: int) -> None:
+    """Detach into the background for --start.
+
+    In the parent this never returns (it exits after the child has published its
+    pid); in the child it returns so main() carries on. Called *before* any
+    thread exists, so the fork cannot strand a lock in a half-cloned state.
+    """
+    if not hasattr(os, "fork"):
+        print("[panel] --start needs POSIX fork; running in the foreground")
+        return
+    pidfile, logfile = _state_paths(port)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.fork() > 0:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            child = _read_pid(pidfile)
+            if child and _pid_alive(child):
+                print(f"[panel] started (pid {child})  log {logfile}")
+                raise SystemExit(0)
+            time.sleep(0.1)
+        print(f"[panel] failed to start; check {logfile}", file=sys.stderr)
+        raise SystemExit(1)
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    handle = open(logfile, "ab", buffering=0)
+    os.dup2(handle.fileno(), 1)
+    os.dup2(handle.fileno(), 2)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+
 
 # --------------------------------------------------------------------------
 # view: the same numbers the terminal panel shows, as data
@@ -735,6 +900,9 @@ def self_test() -> int:
         ("degraded_note", bool(empty["note"]) and empty["tables"] == []),
         ("page_self_contained", "http://" not in PAGE and "https://" not in PAGE
          and 'fetch("/api/view"' in PAGE),
+        ("state_paths", _state_paths(8199)[0].endswith("panel-8199.pid")
+         and _state_paths(8199)[1].endswith("panel-8199.log")),
+        ("pidfile_missing", _read_pid(os.path.join(STATE_DIR, "does-not-exist.pid")) is None),
     ]
     ok = True
     for name, good in checks:
@@ -791,7 +959,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Read-only browser panel for KV offload / tiering state.",
+        description="Browser panel for KV offload / tiering state (read-only).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -805,32 +973,72 @@ def main() -> int:
     ap.add_argument("--ssd-root", default=None, help="disk tier root (default: from config)")
     ap.add_argument("--log", default=None, help="server log path/glob for an error count")
     ap.add_argument("--verbose", action="store_true", help="log every HTTP request")
+    ap.add_argument("--start", action="store_true",
+                    help="run in the background (pidfile/log under ~/.cache/kv-offload-panel)")
+    ap.add_argument("--stop", action="store_true",
+                    help="stop the --start daemon serving --port")
+    ap.add_argument("--status", action="store_true",
+                    help="show the --start daemon's pid and /healthz")
     ap.add_argument("--self-test", action="store_true", help="check the view builder")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.stop:
+        return stop_panel(args.port)
+    if args.status:
+        return status_panel(args.port, args.host)
 
+    # Detach *before* the sampler thread or the HTTP server exist, so the fork
+    # cannot clone a half-initialised lock. The parent exits inside here.
+    if args.start:
+        _daemonize(args.port)
+
+    pidfile, _ = _state_paths(args.port)
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    # Bind before publishing the pid: a port clash must not overwrite the
+    # pidfile of the instance that already owns the port.
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        print(f"[panel] bind {args.host}:{args.port} failed: {exc}", file=sys.stderr)
+        return 1
     sampler = Sampler(args)
-    sampler.start()
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     httpd.sampler = sampler  # type: ignore[attr-defined]
     httpd.verbose = args.verbose  # type: ignore[attr-defined]
 
+    with open(pidfile, "w") as handle:
+        handle.write(str(os.getpid()))
+
+    def _shutdown(signum, frame) -> None:
+        # shutdown() waits for serve_forever to return, and a signal handler runs
+        # *on* the thread that is inside serve_forever -- so ask another thread.
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
     shown = "127.0.0.1" if args.host in ("", "0.0.0.0") else args.host
     print(f"[panel] http://{shown}:{args.port}/  observing {sampler.url}"
-          f" every {args.interval:g}s (Ctrl-C to stop)")
+          f" every {args.interval:g}s (pid {os.getpid()}; --stop or Ctrl-C)")
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print("[panel] WARNING: bound beyond localhost; the page has no"
               " authentication and exposes local paths. Prefer an SSH tunnel.")
     try:
-        httpd.serve_forever()
+        sampler.start()
+        httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print()
     finally:
-        httpd.shutdown()
+        # shutdown() is deliberately *not* called here: it blocks until
+        # serve_forever returns, which would hang if we never got that far.
         sampler.stop()
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
     return 0
 
 
