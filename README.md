@@ -113,7 +113,9 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   （SM75 没有 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，INT4/INT8 才是快路径，见下节）
   + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，**用 default rope，不启用 YaRN**），
   启动日志可用 KV Cache **278,253 tokens**，显存 17.5 GB/卡。
-- **长上下文档**：500K 两档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_SSDx4.sh`。
+- **长上下文档**：500K 两档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_SSDx4.sh`
+  （offload，池 509,877；480K prompt 恢复 99.5% / 19.7 s，见
+  [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
 - **128K 档**：`..._128k.sh`（无 offload）与 `..._128k_SSDx4.sh`；后者验证上游 tiering offload
   （RAM staging + 磁盘环），不作为服务 profile。已在 64 GB 主机实测：池满恢复
   97.6% / 7.0 s、5 轮长稳、并发恢复需池与 staging 各 ≥ N 条链（见
@@ -360,7 +362,8 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
   `..._500k_SSDx4.sh`（RAM 只当 staging 16.3 GiB + 磁盘 4 条链的 LRU 环）。
   两档共用同一套 KV/池参数、尺寸由 `MAX_MODEL_LEN` 推导、自带装机自检
   （`/dev/shm` 总量与**剩余**空间、可用内存；不足即拒绝启动，`CHECK_ONLY=1` 只检查）。
-  见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
+  已在 64 GB 主机端到端实测 `SSDx4` 档：池 509,877 tokens、480K prompt 恢复
+  99.5% / 19.7 s（见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
 - **256K offload 档**：`..._256k_SSDx4.sh` —— 同两层结构，链 9.15 GB / 磁盘环 36.6 GB，
   需 ~10 GB `/dev/shm`（约 32 GB 主机）；本机 15 GiB 上用 `CHECK_ONLY=1` 会直接拒绝。
 

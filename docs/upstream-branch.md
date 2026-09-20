@@ -384,8 +384,20 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 > （而磁盘兜住多会话）的原因。
 
 本机（16 GB / 7.8 GiB shm）实测：两档都按预期拒绝启动并打印精确的 `mount -o remount` 命令；
-参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。内存升级到 62 GiB
-后本档未再实测——本次 offload 验证走的是 128K 档（§5.6c）；500K 端到端仍待做（§8）。
+参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。
+
+内存升级到 62 GiB 后 `..._500k_SSDx4.sh` 端到端实测（2026-09-21，480,611-token prompt，
+`GPU KV cache size 509,877`，staging 16.3 GiB，MTP n=6、fp8_e4m3 KV）：
+
+| 步骤 | cached | 用时 | tiering 命中 |
+|---|---|---|---|
+| A（冷启） | 0 / 480,611 | 1209.7 s | — |
+| B（挤出 A） | 0 / 480,611 | 1213.6 s | — |
+| A 重发 | **478,176（99.5%）** | **19.7 s** | `1:fs` 297 chunks + `0:primary` 10 chunks（读回 16.88 GB） |
+
+`509,877 ≥ 500,800`（1.02x），无 `cudaHostRegister failed`（pinned，与 §5.6c 结论一致）；
+命中来源看 `tiering_chunk_hits_total`，是磁盘+CPU 层真恢复，非 GPU 前缀缓存冒领。无 offload
+档的 449K 实测见 §6.13。
 
 ### 5.6b 256K offload 档（同一套两层 offload，链更短）
 
@@ -1501,8 +1513,8 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
    磁盘层写满的行为已在 §5.4 实测，字节上限 + LRU 淘汰已在 §5.5 实现并实测。
 2. 磁盘层预算的**长稳**：多天运行下 mtime 作为 recency 的退化（例如备份/rsync 改写 mtime）
    尚未验证。
-3. **500K 两档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
-   （冷启 → 重发 → 跨会话换出/恢复）。**仍未做**（本次 offload 验证走的是 128K 档，§5.6c）。
+3. ~~**500K 两档的端到端**~~：`..._500k_SSDx4.sh` 已在 62 GiB 主机端到端实测
+   （§5.6：480K prompt 恢复 99.5% / 19.7 s）；无 offload 档的 449K 实测见 §6.13。
 
 ---
 
