@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 128K context, tiered KV offload:
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 128K context, tiered KV offload:
 # RAM holds ONE full context (promotion staging), the disk holds FOUR.
 #
 # Purpose: validate upstream's tiered offload on SM75 at a realistic context.

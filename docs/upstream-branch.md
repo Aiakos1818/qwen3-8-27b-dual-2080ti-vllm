@@ -963,6 +963,9 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
 新建 `scripts/run_vllm_qwen38_awq_fp16_225k.sh`（自 `500k.sh` 复制，只改三处：`--kv-cache-dtype
 float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9），在本机实测：
 
+> 注：该档现已随 §6.20 改为 default rope（非 YaRN）。rope 配置不改变权重与算子形状，
+> 因此下面这组 2026-09-19 的实测数据仍然适用。
+
 - 容量：池 **252,223 token**（fp16 是 fp8 的 ~2× 每 token 体量：38.06 KB/token），≥ 225,280 且
   余量 12%；每卡显存 21.7 GB（与 500K/fp8 档相同，实测可跑）；
 - 本机可跑的**最大上下文**由此确定：`max_model_len` 最高 ≈ **248K**，取 225,280（220K）留裕度。

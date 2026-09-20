@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 256K context (262,144 = the model's
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 256K context (262,144 = the model's
 # max_position_embeddings), no KV offload.
 #
 # The production profile: 256K sits at the model's native maximum, so no context

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp16 KV, 225,280 context (220K), no KV offload.
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp16 KV, 225,280 context (220K), no KV offload.
 #
 # Same KV budget as the 500.8K profile (9.6e9) but with fp16 KV, which halves
 # the per-token KV (measured ~18.6 KB fp8 -> ~37.2 KB fp16 at n=5) so the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 256K context (262,144), tiered KV
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 256K context (262,144), tiered KV
 # offload: RAM holds ONE full-length context (promotion staging), the disk holds
 # FOUR.
 #
