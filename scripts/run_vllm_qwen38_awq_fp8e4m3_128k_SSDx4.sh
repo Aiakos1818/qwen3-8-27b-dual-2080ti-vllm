@@ -56,12 +56,19 @@ CHUNK_TOKENS=1600
 CHUNK_BYTES=55800000
 
 # --- profile knobs ---------------------------------------------------------
-# 3.0e9 pool ≈ 164K tokens ≈ 1.25x of one full 128K request at fp8_e4m3
-# (~17.8 KiB/token). Calibrate against the "GPU KV cache size" line after a
-# launch; scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
+# 3.5e9 pool: measured "GPU KV cache size" 153,541 tokens at MTP n=6 (1.17x of
+# one full 128K request). The old 3.0e9 default came up 0.01 GiB short and
+# refused to start once n=6 added its extra draft slots (2.78 GiB needed vs
+# 2.77 GiB available, 2026-09-21). Calibrate against the "GPU KV cache size"
+# line after a launch; scripts/tools/kv_pool_sizing.py reports the pool a
+# profile needs.
 : "${MAX_MODEL_LEN:=131072}"
-: "${KV_CACHE_MEMORY_BYTES:=3000000000}"
+: "${KV_CACHE_MEMORY_BYTES:=3500000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
+# Concurrency: the profile targets single long requests (1). Raise it together
+# with KV_CACHE_MEMORY_BYTES to exercise the offload path under >1 in-flight
+# request; the pool must hold the concurrent chains or they evict each other.
+: "${MAX_NUM_SEQS:=1}"
 # Promoted chunks are retained in the CPU tier, so it has to hold a whole
 # chain: ceil(MAX_MODEL_LEN / 1600) chunks at ~55.8 MB each (measured, one
 # chunk per block). 128K -> 82 chunks -> 4.58e9: exactly one context, which is
@@ -167,7 +174,7 @@ ARGS=(
   --max-model-len "$MAX_MODEL_LEN"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"
-  --enable-prefix-caching --max-num-seqs 1
+  --enable-prefix-caching --max-num-seqs "$MAX_NUM_SEQS"
   --enable-prompt-tokens-details
   --max-num-batched-tokens 1024 --enable-chunked-prefill
   --skip-mm-profiling

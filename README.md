@@ -115,7 +115,9 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   启动日志可用 KV Cache **278,253 tokens**，显存 17.5 GB/卡。
 - **长上下文档**：500K 两档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_SSDx4.sh`。
 - **128K 档**：`..._128k.sh`（无 offload）与 `..._128k_SSDx4.sh`；后者验证上游 tiering offload
-  （RAM staging + 磁盘环），不作为服务 profile。
+  （RAM staging + 磁盘环），不作为服务 profile。已在 64 GB 主机实测：池满恢复
+  97.6% / 7.0 s、5 轮长稳、并发恢复需池与 staging 各 ≥ N 条链（见
+  [docs/upstream-branch.md](docs/upstream-branch.md) §5.6c）。
 - max-num-seqs=1：优先长上下文单请求，不按高并发路线配置。
 - Prefix Cache + Chunked Prefill：改善固定系统提示词和超长输入。
 - MTP=5 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在

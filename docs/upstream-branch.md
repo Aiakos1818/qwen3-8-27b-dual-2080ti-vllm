@@ -384,8 +384,8 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 > （而磁盘兜住多会话）的原因。
 
 本机（16 GB / 7.8 GiB shm）实测：两档都按预期拒绝启动并打印精确的 `mount -o remount` 命令；
-参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
-要等内存到位**（见 §8）。
+参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。内存升级到 62 GiB
+后本档未再实测——本次 offload 验证走的是 128K 档（§5.6c）；500K 端到端仍待做（§8）。
 
 ### 5.6b 256K offload 档（同一套两层 offload，链更短）
 
@@ -397,7 +397,53 @@ staging 是启动前预 fault 的 `/dev/shm` 硬预留，所以这档要 **~10 G
 本机 15 GiB 上 `CHECK_ONLY=1` 直接拒绝——`/dev/shm` 只有 7.7 GiB free 而 staging 要 8.5 GiB，
 `MemAvailable` 也低于 staging+4 GiB 的余量要求。128K 档（4.58 GB staging）在本机可跑，两者
 就是按这个分工选的。用途与 128K 档相同（长 prompt 的 KV 跨重启可恢复，省掉每次 ~400 s 的
-重算），只是上下文翻倍；256K 档的**真实恢复同样待内存到位**。
+重算），只是上下文翻倍；256K 档的**真实恢复未单独测**（启动已在 64 GB 主机验证，
+见 §5.6c）。
+
+### 5.6c 128K offload 档在 64 GB 主机的实测（2026-09-21）
+
+主机升级到 62 GiB RAM（`/dev/shm` 32 GiB）后，用 `..._128k_SSDx4.sh` 补齐了
+§8 里"等内存到位"的 offload 验证。该档 `MAX_MODEL_LEN=131072`、池
+`KV_CACHE_MEMORY_BYTES=3.5e9`（**旧默认 3.0e9 在 MTP n=6 下差 0.01 GiB 起不来**：
+引擎要 2.78 GiB 而可用 2.77 GiB，已把默认值改为 3.5e9）、staging 82 chunks
+（4.3 GiB）、磁盘环 4 条链（17 GiB）。启动后 `GPU KV cache size: 153,541 tokens`
+（1.17x 一个满请求），primary tier 80 chunks。
+
+**pinned 与 memlock 数值无关（实测）**：`RLIMIT_MEMLOCK=7.83 GiB` < staging，
+`offload_sizing.sh` 会打 `[warn]`，但启动日志里**没有** `cudaHostRegister failed`
+（源码注册失败必打这条 warning，`v1/kv_offload/cpu/gpu_worker.py:242`）；独立验证
+在 7.83 GiB 下注册 9 GiB 的 `/dev/shm` mmap 返回 `cudaError.success`。即 NVIDIA
+驱动对 shmem 映射的注册不走 `RLIMIT_MEMLOCK` 记账（`VmPin`/`Locked` 显示 0 也不代表
+没 pin），所以 128K/256K/500K 三档 staging 都能 pinned，**无需改 memlock**。
+
+**A→B→A 恢复（单请求，125,411-token prompt，池接近满）**：
+
+| 步骤 | cached | 用时 | tiering 命中 |
+|---|---|---|---|
+| A（冷启） | 0 / 125,411 | 139.7 s | — |
+| B（挤出 A） | 0 / 125,411 | 140.9 s | — |
+| A 重发 | **122,400（97.6%）** | **7.0 s** | `1:fs` 79 chunks（读回 4.49 GB） |
+
+命中来源看 `tiering_chunk_hits_total`（不是 `cached_tokens`），确认是磁盘层恢复，
+而非 GPU 前缀缓存冒领。
+
+**多轮长稳（5 轮 A/B 交替）**：每轮 A、B 均 `cached=122,400`，用时稳定 **7.0 s**；
+`tiering_fs_used_bytes` 恒定 **8.98 GB**（无增长/泄漏），每轮 `1:fs` 命中 +158 chunks，
+无 `promotion_allocation_failures`。
+
+**max-num-seqs > 1 并发**（`--max-num-seqs` 已改为可用 `MAX_NUM_SEQS` 覆盖，默认 1）：
+
+| 配置 | GPU 池 | staging | 并发恢复结果 |
+|---|---|---|---|
+| `MAX_NUM_SEQS=2`，池 5.0e9（218k tokens） | 218k | 1 条链（82 chunks） | **失败**：`promotion_allocation_failures=3`，两条链 `cached=0` |
+| `MAX_NUM_SEQS=2`，池 5.6e9（246k tokens） | 246k | 2 条链（164 chunks） | **成功**：并发两条各 `cached=86,496（96.6%）`，6.8 / 11.1 s，`1:fs` 命中 +114 chunks（读回 +6.48 GB），无失败 |
+
+结论：**并发恢复要求 GPU 池 ≥ N 条链、CPU staging ≥ N 条链**——staging 只配 1 条链时
+（§5.2 的"链必须完整"规则），两条链同时 promotion 会因装不下而整体作废。并发
+prefill/offload 本身在两种配置下都正常（`GPU_to_CPU` 正常落盘），失败只出现在恢复阶段。
+
+口径：MTP n=6、fp8_e4m3 KV、temperature 0、`max_tokens=8`、`enable_thinking=false`；
+原始日志 `logs/server_128k_ssdx4_*.log`，probe 脚本 `~/Temp/opencode/offload_probe.py`。
 
 ### 5.7 信息面板 `scripts/tools/monitor_kv_offload.py`
 
@@ -1447,14 +1493,16 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
 
 ## 8. 待办与未覆盖
 
-1. offload 尚未覆盖：**池接近满时的恢复**（最高优先，唯一可能 stall 的路径）、多轮
-   offload/restore 的长时间稳定性、`max-num-seqs > 1` 的并发，以及 pinned / unpinned DMA
-   的性能差（后者要 root 或 ≤8 MB 的 staging，实际做不了）。
+1. ~~池接近满时的恢复、多轮 offload/restore 长稳、`max-num-seqs > 1` 并发~~
+   已在 62 GiB 主机上用 128K 档验证（§5.6c）：单请求池满恢复 97.6%/7.0 s、5 轮长稳、
+   并发恢复需池与 staging 各 ≥ N 条链。**pinned / unpinned DMA 的性能差未做**：
+   实测 `cudaHostRegister` 不受 `RLIMIT_MEMLOCK` 限制（§5.6c），本机三档 staging 都能
+   pinned，没有 unpinned 对照组可测。
    磁盘层写满的行为已在 §5.4 实测，字节上限 + LRU 淘汰已在 §5.5 实现并实测。
 2. 磁盘层预算的**长稳**：多天运行下 mtime 作为 recency 的退化（例如备份/rsync 改写 mtime）
    尚未验证。
 3. **500K 两档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
-   （冷启 → 重发 → 跨会话换出/恢复）。
+   （冷启 → 重发 → 跨会话换出/恢复）。**仍未做**（本次 offload 验证走的是 128K 档，§5.6c）。
 
 ---
 
