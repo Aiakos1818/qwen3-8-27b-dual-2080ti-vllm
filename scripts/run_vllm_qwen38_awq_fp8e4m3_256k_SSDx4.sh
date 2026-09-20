@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 256K context (262,144), tiered KV
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 256K context (262,144), tiered KV
 # offload: RAM holds ONE full-length context (promotion staging), the disk holds
 # FOUR.
 #
@@ -33,7 +33,7 @@
 # RAM headroom: an unpinned staging that gets swapped out destroys the restore
 # path.
 #
-# Paths / model come from .env (copy config/vllm-256k-RAMx1-SSDx4.env.example).
+# Paths / model come from .env (copy config/vllm-256k-SSDx4.env.example).
 # CHECK_ONLY=1 runs the sizing checks and exits without touching anything.
 set -Eeuo pipefail
 
@@ -56,6 +56,16 @@ fi
 : "${PORT:=8000}"
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${OMP_NUM_THREADS:=8}"
+
+# --- model -----------------------------------------------------------------
+# Context here is <= the model's native 262,144, so no YaRN is needed: run the
+# released default-rope checkpoint. The -yarn512k directory differs only in
+# config.json's rope_parameters (weights are the same symlinked shards), and
+# YaRN's mscale is a constant attention scale applied at every position, so
+# within the native window it is pure precision cost with no benefit (see
+# reports/2026-09-sm75-optimization/accuracy-regression/). Override with
+# NATIVE_MODEL_PATH.
+NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH:-$(dirname "$MODEL_PATH")/Qwen3.8-27B-AWQ-INT4}"
 
 # --- geometry (measured, one chunk per block) ------------------------------
 # 1600 tokens and ~55.8 MB per chunk (both ranks' shards); the engine derives the
@@ -100,7 +110,7 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
-: "${KV_ENGINE_ID:=qwen38-27b-256k-RAMx1-SSDx4}"
+: "${KV_ENGINE_ID:=qwen38-27b-256k-SSDx4}"
 
 # --- sizing preflight ------------------------------------------------------
 # Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
@@ -124,31 +134,18 @@ if [ "${CHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
-# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
-# the yarn directory it only rewrites the shard that holds lm_head, so the
-# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
-# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
-# is appended to the export below.
-EXTRA_LD_LIBRARY_PATH=""
+# lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
+# decode throughput at no measurable acceptance cost. --disable-head8bit runs
+# the unquantised (bf16) head instead.
+HEAD8BIT=1
 for _arg in "$@"; do
   case "$_arg" in
-    --head8bit)
-      case "$MODEL_PATH" in
-        *-head8bit) ;;
-        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
-      esac
-      EXTRA_LD_LIBRARY_PATH=$(
-        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
-      )
-      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
-        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
-        exit 2
-      fi
+    --disable-head8bit)
+      HEAD8BIT=0
       ;;
     -h | --help)
-      echo "usage: $(basename "$0") [--head8bit]"
-      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      echo "usage: $(basename "$0") [--disable-head8bit]"
+      echo "  --disable-head8bit  run the bf16 lm_head checkpoint instead of the int8 variant"
       exit 0
       ;;
     *)
@@ -157,6 +154,24 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# The int8 head is a checkpoint variant: only the shard holding lm_head is
+# rewritten, the rest are symlinks. Its Humming kernel needs the venv's cu13
+# lib dir on LD_LIBRARY_PATH, which is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$NATIVE_MODEL_PATH" in
+    *-head8bit) ;;
+    *) NATIVE_MODEL_PATH="$NATIVE_MODEL_PATH-head8bit" ;;
+  esac
+  EXTRA_LD_LIBRARY_PATH=$(
+    ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+  )
+  if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+    echo "$0: --disable-head8bit: venv cu13 lib dir not found" >&2
+    exit 2
+  fi
+fi
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -178,7 +193,7 @@ KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"eng
 
 ARGS=(
   --host "$HOST" --port "$PORT"
-  --model "$MODEL_PATH"
+  --model "$NATIVE_MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
   --dtype half --tensor-parallel-size 2 --device-ids 0,1
   --kv-cache-dtype fp8_e4m3

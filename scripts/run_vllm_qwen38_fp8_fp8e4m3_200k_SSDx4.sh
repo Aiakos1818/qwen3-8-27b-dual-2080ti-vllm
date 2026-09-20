@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B FP8 (e4m3) weights + fp8_e4m3 KV, 256K context (262,144), tiered
-# KV offload: RAM holds ONE full-length context (promotion staging), the disk
-# holds FOUR.
+# Qwen3.8-27B FP8 (e4m3) weights + fp8_e4m3 KV, 200K context (204,800), MTP n=6,
+# tiered KV offload: RAM holds ONE full-length context (promotion staging), the
+# disk holds FOUR.
 #
-# The offload rung of the FP8 256K profile: a long prompt stays restorable across
+# The offload rung of the FP8 200K profile: a long prompt stays restorable across
 # restarts instead of being recomputed. The GPU-only profile
-# (run_vllm_qwen38_fp8_fp8e4m3_256k.sh) is the serving default; this one trades
+# (run_vllm_qwen38_fp8_fp8e4m3_200k.sh) is the serving default; this one trades
 # a bigger /dev/shm reservation for a warm cache.
 #
 # Why a bigger host than 15 GiB: a promoted chain is retained in the CPU tier
 # until the request consumes it, so the staging must hold one whole chain --
-# ceil(262144 / 1600) = 164 chunks at ~55.8 MB each = 9.15 GB. That is a hard
-# /dev/shm reservation, pre-faulted at startup, so it needs ~10 GB of tmpfs and
-# therefore roughly a 32 GB host (the default tmpfs is half of RAM). On the
+# ceil(204800 / 1600) = 128 chunks at ~55.8 MB each = 7.14 GB. That is a hard
+# /dev/shm reservation, pre-faulted at startup, so it needs ~8 GB of tmpfs and
+# therefore roughly a 24 GB host (the default tmpfs is half of RAM). On the
 # 15 GiB host this profile's preflight refuses to launch; the 128K offload
 # profile is the one that fits there (4.58 GB). Below the chain size, restores
 # of a full-length prompt silently yield 0 hits, which is why the staging is
 # sized to a whole chain and not less.
 #
-# Memory: FP8 weights leave less GPU headroom than AWQ, so MTP is OFF and the
-# GPU pool is 4.9e9 (>= 4,831,346,688 needed for 262,144 @ fp8_e4m3, no MTP).
-# MTP6 would need >= 5,341,052,928 and was measured to OOM with FP8 weights.
+# Memory: FP8 weights (plus the vision tower) use ~4.4 GiB/GPU more than AWQ,
+# which is exactly the room MTP6 needs. Measured: at 262,144 with MTP6 the
+# server starts but the first long request dies with CUDA OOM; hence 204,800.
+# The MTP6 KV geometry costs ~20.4 KB/token/GPU, so 204,800 needs >=
+# 4,346,707,968 (kv_pool_sizing.py); 4.4e9 is used here (~0.9 GiB headroom).
+#
+# No --head8bit option here: the FP8 checkpoint was never run through
+# scripts/tools/quantize_lm_head.py, so its lm_head stays bf16. The int8-head
+# variants (and the switch) exist only for the AWQ checkpoints.
 #
 # Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
 # restored blocks are evicted (LRU by file mtime), so the directory can never
@@ -69,21 +75,20 @@ CHUNK_TOKENS=1600
 CHUNK_BYTES=55800000
 
 # --- profile knobs ---------------------------------------------------------
-: "${MAX_MODEL_LEN:=262144}"
-: "${KV_CACHE_MEMORY_BYTES:=4900000000}"
+: "${MAX_MODEL_LEN:=204800}"
+: "${KV_CACHE_MEMORY_BYTES:=4400000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Staging: exactly one full-length context (164 chunks).
+# Staging: exactly one full-length context (128 chunks).
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
-# MTP off: FP8 weights do not leave room for the MTP6 geometry at 256K.
-: "${SPEC_NUM_TOKENS:=0}"
-# Disk tier: 4 full-length contexts (4 x 9.15 GB = 36.6 GB).
+: "${SPEC_NUM_TOKENS:=6}"
+# Disk tier: 4 full-length contexts (4 x 7.14 GB = 28.6 GB).
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
 : "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
 : "${VLLM_SSD_CLEAN_START:=0}"
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
-: "${KV_ENGINE_ID:=qwen38-27b-fp8-256k-RAMx1-SSDx4}"
+: "${KV_ENGINE_ID:=qwen38-27b-fp8-200k-SSDx4}"
 
 # --- sizing preflight ------------------------------------------------------
 vllm_clean_shm_staging "$KV_ENGINE_ID"
@@ -96,7 +101,7 @@ OFFLOAD_SSD_BYTES=$VLLM_SSD_MAX_BYTES
 OFFLOAD_SSD_CHAINS=4
 OFFLOAD_POOL_BYTES=$KV_CACHE_MEMORY_BYTES
 # fp8_e4m3, no MTP: measured 4.9e9 / 286,249 tokens on this host.
-OFFLOAD_POOL_BYTES_PER_TOKEN=17118
+OFFLOAD_POOL_BYTES_PER_TOKEN=20374
 vllm_check_offload_sizing || exit 1
 if [ "${CHECK_ONLY:-0}" = "1" ]; then
   echo "[profile] CHECK_ONLY=1: sizing checks done, not launching"
@@ -154,5 +159,5 @@ if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
 fi
 
-echo "[launch] fp8 weights + fp8_e4m3 KV, 256K RAMx1 SSDx4, model=$FP8_MODEL_PATH max_len=$MAX_MODEL_LEN pool=$KV_CACHE_MEMORY_BYTES n=$SPEC_NUM_TOKENS" >&2
+echo "[launch] fp8 weights + fp8_e4m3 KV, 200K SSDx4, model=$FP8_MODEL_PATH max_len=$MAX_MODEL_LEN pool=$KV_CACHE_MEMORY_BYTES n=$SPEC_NUM_TOKENS" >&2
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

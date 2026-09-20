@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 (default rope) + fp16 KV, 225,280 context (220K), no KV offload.
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 128K context (131,072),
+# no KV offload.
 #
-# Same KV budget as the 500.8K profile (9.6e9) but with fp16 KV, which halves
-# the per-token KV (measured ~18.6 KB fp8 -> ~37.2 KB fp16 at n=5) so the
-# reachable context drops to ~248K; 225,280 leaves ~14% headroom on the pool and
-# keeps the "at least one full-length request" check (which wants ~4% more than
-# the pool average) at 8.7e9 < 9.6e9.  Per-card VRAM is the same as the 500.8K
-# profile (~21.1 GiB), which is measured to work on this host.
-#
-# Why fp16 KV: on Turing the fp8 software dequantisation costs more than the
-# bandwidth it saves, so the attention kernel is ~18% faster with fp16 at 250K
-# (1.456 -> 1.170 ms, same harness).  n=6 is worth ~5% over n=5 at every context
-# measured.  Together they are the last two decode levers that do not need a
-# different checkpoint.
+# The short-context rung: same stack as the 256K production profile with the
+# window cut to 128K, so the KV pool and the per-card footprint drop. Note this
+# is not half of the 256K pool: the GDN/mamba state adds ~0.74 GiB of fixed
+# cost, so 131,072 needs >= 3,068,264,448 (scripts/tools/kv_pool_sizing.py);
+# 3.2e9 is used here. Use the 256K profile when the wider window is needed, and
+# the 128K/256K/500K SSDx4 rungs when the KV must survive a restart.
 #
 # Paths / model come from .env (copy config/vllm.env.example).
 set -Eeuo pipefail
@@ -34,26 +29,31 @@ fi
 : "${OMP_NUM_THREADS:=8}"
 
 # --- model -----------------------------------------------------------------
-# Context here is <= the model's native 262,144, so no YaRN is needed: run the
-# released default-rope checkpoint. The -yarn512k directory differs only in
-# config.json's rope_parameters (weights are the same symlinked shards), and
-# YaRN's mscale is a constant attention scale applied at every position, so
-# within the native window it is pure precision cost with no benefit (see
-# reports/2026-09-sm75-optimization/accuracy-regression/). Override with
-# NATIVE_MODEL_PATH.
+# 262,144 is the model's native max_position_embeddings, so no context
+# extension is needed: run the released default-rope checkpoint. The -yarn512k
+# directory differs only in config.json's rope_parameters (weights are the same
+# symlinked shards), and YaRN's mscale is a constant attention scale applied at
+# every position, so within the native window it is pure precision cost with no
+# benefit. Measured logit-level: dropping YaRN recovers 1.9%-3.6% top-1
+# agreement at short context and more at long context (see
+# reports/2026-09-sm75-optimization/accuracy-regression/). Use the -yarn512k
+# checkpoint only for >262,144. Override with NATIVE_MODEL_PATH.
 NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH:-$(dirname "$MODEL_PATH")/Qwen3.8-27B-AWQ-INT4}"
 
 # --- profile knobs ---------------------------------------------------------
 # Calibrate to the "GPU KV cache size" line after a launch;
 # scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
-: "${MAX_MODEL_LEN:=225280}"
-: "${KV_CACHE_MEMORY_BYTES:=9600000000}"
+: "${MAX_MODEL_LEN:=131072}"
+: "${KV_CACHE_MEMORY_BYTES:=3200000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Speculative depth: 5 beats 3 on decode throughput at every context measured
-# (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
-# sub-linearly with n because only the verify runs all 64 layers, while the
-# acceptance does drop (40% vs 59%). n >= 7 fails to start (verify batch out
-# of the captured shapes); n=6 measured ~5% faster again.
+# Speculative depth: 6 beats 5 (and 5 beats 3) at every context measured:
+# 31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%, 449K +5.4%.  The
+# per-round cost grows sub-linearly with n because only the verify runs all 64
+# layers while the draft head runs one, so the extra draft is largely amortised.
+# n=6 needs ~1% more KV than n=5 (extra speculative slots); the 256K/128K
+# geometry carries a little more budget for that.  n=7 does start -- the earlier
+# "fails to start" was a KV pool 0.09 GiB short -- but it is ~60% worse per
+# token, so n stays at 6.
 : "${SPEC_NUM_TOKENS:=6}"
 
 # lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
@@ -104,7 +104,9 @@ export VLLM_SM75_SPEC_SYNC_MODE="${VLLM_SM75_SPEC_SYNC_MODE:-safe}"
 # Verify spec drafts on the native FlashInfer decode path so speculative
 # decode keeps full cudagraphs (SM75 has no fused GDN decode / TRT-LLM).
 export VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE="${VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE:-1}"
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+# 262,144 is the model's own limit, so this is not strictly needed here; the
+# 500K rungs do need it. Kept so every profile shares one env block.
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 # API auth: inherit VLLM_API_KEY from the environment (empty = no auth).
 export VLLM_API_KEY="${VLLM_API_KEY:-}"
 export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
@@ -116,7 +118,7 @@ ARGS=(
   --model "$NATIVE_MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
   --dtype half --tensor-parallel-size 2 --device-ids 0,1
-  --kv-cache-dtype float16
+  --kv-cache-dtype fp8_e4m3
   --max-model-len "$MAX_MODEL_LEN"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"

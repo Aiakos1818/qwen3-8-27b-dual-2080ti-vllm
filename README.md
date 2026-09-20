@@ -33,7 +33,7 @@
 
 目标是把一套正在运行的 Qwen3.8-27B 长上下文配置完整公开：硬件、驱动、加速路径、补丁、Jinja 模板、环境变量、systemd 和完整加载参数都在这里。
 
-适合：单机双卡、单请求优先、256K（生产）/ 500K（三档：无 offload / RAM×2 / RAM×1+SSD×4）/
+适合：单机双卡、单请求优先、256K（生产）/ 500K（两档：无 offload / RAM×1+SSD×4）/
 128K（tiered offload 验证）上下文、个人/小团队 API、长文档与代码任务。
 
 不包含：模型权重、API Key、内网地址、个人目录、SSH 或隧道配置。
@@ -56,17 +56,26 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
   CUDA context（表现为 warmup 的 `torch.full` 报 `invalid argument`），清理后低 memlock 主机
   （本机 8 MB 硬顶）上 offload 档也能稳定启动。
 - **256K 生产 profile**：`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` —— 模型原生上限
-  （262,144）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
-   `..._256k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
+  （262,144）、**非 YaRN**（default rope，见下）、无 offload，池 279,147 tokens（n=6 + 5.6e9 实测；
+  n=5 + 5.3e9 时 267,842），显存 17.8 GB/卡；另有
+   `..._256k_SSDx4.sh`（同上下文 + 两层 offload，长 prompt 的 KV 跨重启可恢复，
    需 ~10 GB `/dev/shm`，即 32 GB 级主机）。
-- **FP8 权重 256K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（+ `..._RAMx1_SSDx4.sh`）
-  —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit），池 286,249 tokens（4.9e9，实测
-  1.09x 满长并发，20.7 GB/卡）。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，**慢于 AWQ**，
-  价值在保真度。FP8 权重下 MTP6 会 OOM，故该档默认关 MTP。
-- **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
-  `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
-- **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K
-  上下文 + 上游 tiering offload（RAM 1 条链 staging + 磁盘 4 条链的环），用于验证而非服务。
+  **≤262,144 一律用 default rope，不用 YaRN**：YaRN 的 `mscale` 在每个位置都生效，在原生窗口内是
+  纯精度损失、零收益（实测短上下文损失 1.9%–3.6% 的 top-1 一致率，长上下文更大）。因此 ≤256K 的
+  profile 都跑 `Qwen3.8-27B-AWQ-INT4`（非 yarn，权重与 yarn 目录相同、只差 config 的 rope），
+  **只有 >262,144 的 500K 两档才用 `-yarn512k`**。AWQ 档**默认开启 head8bit**
+  （非 yarn 对应 `models/Qwen3.8-27B-AWQ-INT4-head8bit`，yarn 对应 `…-yarn512k-head8bit`），
+  用 `--disable-head8bit` 关闭。
+- **FP8 权重 200K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_200k.sh`（+ `..._200k_SSDx4.sh`）
+  —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit）。**200K 而非 262,144**：FP8 权重比
+  AWQ 多吃 ~4.4 GB/卡，正好是 MTP6 需要的余量——实测 262,144 + MTP6 能启动但长请求 OOM
+  （峰值 21.44 GiB）。池 4.4e9 → 210,261 tokens（1.03x，21.0 GB/卡）。MTP n=6。
+  同 prompt（199,429 token）实测：**prefill 607 tok/s（与 AWQ 持平）、稳态 decode 34.8 tok/s
+  （AWQ 46.9，慢 26%）**；不开 MTP 只有 21.3 tok/s。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，
+  价值在保真度。该 checkpoint **未做 head8bit**（`lm_head` 仍是 bf16），head8bit 只在 AWQ 档可用（且默认开启）。
+- **500K 部署两档**：`..._500k.sh`（无 offload）、`..._500k_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
+- **128K 档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k.sh`（无 offload，池 3.2e9）与
+  `..._128k_SSDx4.sh`（128K + 上游 tiering offload，用于验证而非服务）。
 - **量化精度损失评测（logit 级单变量归因）**：
   [`reports/2026-09-sm75-optimization/accuracy-regression/`](reports/2026-09-sm75-optimization/accuracy-regression/README.md)
   —— 对 B0（FP8 基线）/ W4 / W4y / H8f / H8 做 top-1 一致率与 KL 分解：**短上下文由 INT4 权重主导，
@@ -102,12 +111,11 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
 - TP=2：两张卡共同加载 Qwen3.8-27B。
 - **生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）：AWQ-INT4 权重
   （SM75 没有 FP8 Tensor Core，FP8 权重要反量化走 FP16 GEMM，INT4/INT8 才是快路径，见下节）
-  + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，无需外推），启动日志可用
-  KV Cache **278,253 tokens**，显存 17.5 GB/卡。
-- **长上下文档**：500K 三档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_RAMx2.sh`、
-  `..._500k_RAMx1_SSDx4.sh`。
-- **验证档**：`..._128k_RAMx1_SSDx4.sh` 验证上游 tiering offload（RAM staging + 磁盘环），
-  不作为服务 profile。
+  + fp8_e4m3 KV Cache；`max-model-len=262144`（模型原生上限，**用 default rope，不启用 YaRN**），
+  启动日志可用 KV Cache **278,253 tokens**，显存 17.5 GB/卡。
+- **长上下文档**：500K 两档 —— `..._500k.sh`（无 offload，池 525,229）、`..._500k_SSDx4.sh`。
+- **128K 档**：`..._128k.sh`（无 offload）与 `..._128k_SSDx4.sh`；后者验证上游 tiering offload
+  （RAM staging + 磁盘环），不作为服务 profile。
 - max-num-seqs=1：优先长上下文单请求，不按高并发路线配置。
 - Prefix Cache + Chunked Prefill：改善固定系统提示词和超长输入。
 - MTP=5 + **FULL CUDA Graph**：`VLLM_FLASHINFER_NATIVE_SPEC_AS_DECODE=1` 让投机验证留在
@@ -120,10 +128,10 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
 ## 目录
 
 ~~~text
-config/       环境变量样例（基础 + 500K 三档 / 128K offload，共 4 个）
+config/       环境变量样例（基础 + 500K / 256K / 128K 的 SSDx4，共 4 个）
 docs/         打补丁、加速组件与上游分支记录（docs/patches/ 存"已评估未采纳"的补丁）
 patches/      已验证工作树导出的 vLLM / FlashQLA patch（会被套用）
-scripts/      启动 profile（256K 生产 + 500K 三档 + 128K offload 验证 + 基础路线）与硬件检查
+scripts/      启动 profile（256K 生产 + 500K 两档 + 128K 档 + 基础路线）与硬件检查
 scripts/setup/  硬件与依赖准备
 scripts/tools/  启动看护 / 精准停止、池容量测算、KV offload 信息面板（终端 + 浏览器）
 systemd/      常驻服务模板
@@ -167,7 +175,7 @@ cp config/vllm.env.example .env
 至少修改：
 
 ~~~bash
-MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 本分支各 profile 共用
+MODEL_PATH=/你的/Qwen3.8-27B-AWQ-INT4-yarn512k/模型目录   # 500K 档用；≤256K 档会推导同目录的非 yarn 版
 # 基础路线（FP8 / 180K）用：MODEL_PATH=/你的/Qwen3.8-27B-FP8/模型目录
 VLLM_PYTHON=/你的/venv/bin/python
 FLASHQLA_PATH=/你的/FlashQLA-SM70-SM75
@@ -179,9 +187,9 @@ CHAT_TEMPLATE 默认指向本仓库内的 templates/qwen3.8-froggeric-v22.3.jinj
 
 ~~~bash
 bash scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh     # 生产 profile（AWQ-INT4 / 256K / 无 offload）
-# 高精度对照：..._fp8_fp8e4m3_256k.sh（FP8 权重 / 256K / 无 MTP，慢但保真）
-# 长上下文：..._500k.sh、..._500k_RAMx2.sh、..._500k_RAMx1_SSDx4.sh
-# offload（KV 跨重启可恢复）：..._256k_RAMx1_SSDx4.sh（需 ~10 GB shm）、..._128k_RAMx1_SSDx4.sh
+# 高精度对照：..._fp8_fp8e4m3_200k.sh（FP8 权重 / 200K / MTP6，慢但保真）
+# 长上下文：..._500k.sh、..._500k_SSDx4.sh
+# offload（KV 跨重启可恢复）：..._256k_SSDx4.sh（需 ~10 GB shm）、..._128k_SSDx4.sh
 # 基础路线（FP8 / 180K）：scripts/run_qwen3.8_27b_sm75.sh
 ~~~
 
@@ -310,7 +318,7 @@ rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/psm_*
 
 ## 128K 验证档：tiered offload 要点
 
-`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` 是**验证档，不用于服务**：在 128K
+`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_SSDx4.sh` 是**验证档，不用于服务**：在 128K
 上下文上启用上游的 tiering offload（CPU staging 主层 + 磁盘 fs 二级层），在小尺度上把 offload
 的约束压出来。实测出的关键约束：
 
@@ -344,13 +352,12 @@ CPU_BYTES_TO_USE >= ceil(MAX_MODEL_LEN / 1600) × 55.8 MB
   `Job N block I/O failed`，每个请求退化为全量重算。profile 已把
   `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail` 会中止受影响请求）。
 
-- **500K 部署三档**（64 GB 主机目标）：`..._500k.sh`（无 offload）→ `..._500k_RAMx2.sh`
-  （CPU 层当 store，容 2 条满长链 32.5 GiB，需把 /dev/shm remount 到 ~36 GiB）→
-  `..._500k_RAMx1_SSDx4.sh`（RAM 只当 staging 16.3 GiB + 磁盘 4 条链的 LRU 环）。
-  三档共用同一套 KV/池参数、尺寸由 `MAX_MODEL_LEN` 推导、自带装机自检
+- **500K 部署两档**（64 GB 主机目标）：`..._500k.sh`（无 offload）→
+  `..._500k_SSDx4.sh`（RAM 只当 staging 16.3 GiB + 磁盘 4 条链的 LRU 环）。
+  两档共用同一套 KV/池参数、尺寸由 `MAX_MODEL_LEN` 推导、自带装机自检
   （`/dev/shm` 总量与**剩余**空间、可用内存；不足即拒绝启动，`CHECK_ONLY=1` 只检查）。
   见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6。
-- **256K offload 档**：`..._256k_RAMx1_SSDx4.sh` —— 同两层结构，链 9.15 GB / 磁盘环 36.6 GB，
+- **256K offload 档**：`..._256k_SSDx4.sh` —— 同两层结构，链 9.15 GB / 磁盘环 36.6 GB，
   需 ~10 GB `/dev/shm`（约 32 GB 主机）；本机 15 GiB 上用 `CHECK_ONLY=1` 会直接拒绝。
 
 > 排查提示：单请求下 A→B→A 的第三次可能被 **GPU 前缀缓存**冒领（实测出现过
@@ -467,16 +474,16 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
   净吞吐 **+21.3% / +17.5% / +6.8%**（31.5K/215K/449K；上下文越长，固定 ms 的节省占比越小）。int4（0.68 GiB、走 Marlin、省 10 ms）更快但相对误差 8.42% 把接受率
   压下 2.6~7.9 点，净收益只有 +8~10%。工具 `scripts/tools/quantize_lm_head.py`，变体
   `models/…-yarn512k-head{4,8}bit/`（只有改写过的分片是真实文件，其余是链接，共 1.3G）。
-  **已采用**：7 个 `run_vllm_qwen38_awq_*.sh` 都支持 `--head8bit` 开关启用（默认不带＝原
-  checkpoint）；开关同时把 venv 的 `nvidia/cu13/lib` 追加进 `LD_LIBRARY_PATH`，否则
-  Humming 的 NVRTC JIT 起不来。详见 docs/upstream-branch.md §6.15。
+  **已采用（默认开启）**：7 个 `run_vllm_qwen38_awq_*.sh` **默认**跑 int8 head，用
+  `--disable-head8bit` 回到原 checkpoint（bf16 head）；启用时把 venv 的 `nvidia/cu13/lib`
+  追加进 `LD_LIBRARY_PATH`，否则 Humming 的 NVRTC JIT 起不来。详见 docs/upstream-branch.md §6.15。
 - 若能接受 65K 短上下文 + FP16 KV，W8A8+MTP3 的 ~60K 首字时间进一步降到 **35.76 s（-33%）**。
 - 机理、全部变体数据、被排除的路线（TRITON_ATTN / FA2 d256 / SDPA / Triton-Turing fork）见 [reports/2026-09-sm75-optimization/](reports/2026-09-sm75-optimization/00-consolidated-report.md)。
 - **W8A8 未做业务侧质量回归，切换前请先评测。**
 
 ## 完整加载参数与用途
 
-下表是**生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）的完整参数；500K 三档只把
+下表是**生产 profile**（`scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh`）的完整参数；500K 两档只把
 `--max-model-len` / `--kv-cache-memory-bytes` 换成 500800 / 9.6e9，其中 RAM×2 与 RAM×1+SSD×4
 再叠加 tiering offload（见 [docs/upstream-branch.md](docs/upstream-branch.md) §5.6）。
 
@@ -485,7 +492,7 @@ zyYuc 的 59.1 ms 除图模式外还含路线/版本差异（它基于 vLLM 0.27
 | --dtype | half | 运行时 FP16 计算 dtype。 |
 | --tensor-parallel-size | 2 | 两张 GPU 做 Tensor Parallel。 |
 | --device-ids | 0,1 | 明确使用 GPU 0、1。 |
-| --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（`Qwen3.8-27B-AWQ-INT4-yarn512k`）。 |
+| --quantization | （不传） | 由模型 config 自动识别为 AWQ-INT4（256K 档为 `Qwen3.8-27B-AWQ-INT4`，500K 档为 `-yarn512k`）。 |
 | --kv-cache-dtype | fp8_e4m3 | 用 FP8 E4M3 存 KV Cache，降低 KV 显存。 |
 | --max-model-len | 262144 | 单请求上下文上限（模型原生 `max_position_embeddings`；500K 档为 500800）。 |
 | --gpu-memory-utilization | 0.92 | vLLM 目标使用每卡 92% 显存。 |

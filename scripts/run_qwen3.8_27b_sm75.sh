@@ -31,10 +31,17 @@ export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64"
 export PYTHONPATH="$FLASHQLA_PATH"
 
+# --- model -----------------------------------------------------------------
+# Base route = the released FP8 checkpoint (default rope, 262,144 native). 180K
+# is within the native window, so no YaRN. .env's MODEL_PATH points at the AWQ
+# yarn checkpoint, so derive the FP8 one from the same directory; override with
+# FP8_MODEL_PATH.
+FP8_MODEL_PATH="${FP8_MODEL_PATH:-$(dirname "$MODEL_PATH")/Qwen3.8-27B-FP8}"
+
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server \
   --host "$HOST" \
   --port "$PORT" \
-  --model "$MODEL_PATH" \
+  --model "$FP8_MODEL_PATH" \
   --served-model-name "$SERVED_MODEL_NAME" \
   --dtype half \
   --tensor-parallel-size 2 \

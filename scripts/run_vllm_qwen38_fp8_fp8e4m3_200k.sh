@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B FP8 (e4m3) weights + fp8_e4m3 KV, 256K context
-# (262,144 = the model's own max_position_embeddings, so no YaRN is involved).
+# Qwen3.8-27B FP8 (e4m3) weights + fp8_e4m3 KV, 200K context (204,800), MTP n=6
 #
 # This is the FP8-weight counterpart of run_vllm_qwen38_awq_fp8e4m3_256k.sh and
 # is meant as the higher-precision rung: the AWQ-INT4 checkpoint is ~4-bit,
@@ -8,13 +7,18 @@
 # so the FP8 GEMMs are dequantised to FP16 at runtime -- expect this profile to
 # be slower than the AWQ one; its value is fidelity, not throughput.
 #
-# Memory: measured on this host, FP8 weights leave ~6.4 GiB/GPU free after
-# loading, and fp8_e4m3 KV costs ~16.8 KB/token/GPU without MTP. A 262,144
-# request therefore needs >= 4,831,346,688 (kv_pool_sizing.py); 4.9e9 is used
-# here. MTP is OFF by default: the MTP6 geometry needs >= 5,341,052,928 and was
-# measured to OOM on this host with FP8 weights (269,228-token pool then a
-# failed allocation). Enable with SPEC_NUM_TOKENS=6 only after re-checking the
-# pool against the actual free memory.
+# No --head8bit option here: the FP8 checkpoint was never run through
+# scripts/tools/quantize_lm_head.py, so its lm_head stays bf16. The int8-head
+# variants (and the switch) exist only for the AWQ checkpoints.
+#
+# Why 200K and not the native 262,144: FP8 weights (plus the vision tower) use
+# ~4.4 GiB/GPU more than AWQ, which is exactly the room MTP6 needs. Measured on
+# this host: at 262,144 with MTP6 the server starts (pool 5,342,000,000) but the
+# first long request dies with CUDA OOM (peak 21.44 GiB, 23.75 MiB free). The
+# MTP6 KV geometry costs ~20.4 KB/token/GPU (block 1632, mamba_blocks 24), so
+# 204,800 needs >= 4,346,707,968 (kv_pool_sizing.py); 4.4e9 is used here, leaving
+# ~0.9 GiB headroom. Use the AWQ 256K profile if you need the full window; use
+# this one when fidelity matters more and 200K is enough.
 #
 # Paths come from .env; the FP8 checkpoint is derived from MODEL_PATH's
 # directory (override with FP8_MODEL_PATH).
@@ -48,10 +52,10 @@ fi
 # --- profile knobs ---------------------------------------------------------
 # Calibrate to the "GPU KV cache size" line after a launch;
 # scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
-: "${MAX_MODEL_LEN:=262144}"
-: "${KV_CACHE_MEMORY_BYTES:=4900000000}"
+: "${MAX_MODEL_LEN:=204800}"
+: "${KV_CACHE_MEMORY_BYTES:=4400000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-: "${SPEC_NUM_TOKENS:=0}"
+: "${SPEC_NUM_TOKENS:=6}"
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
