@@ -88,7 +88,7 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
 : "${VLLM_SSD_CLEAN_START:=0}"
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
-: "${KV_ENGINE_ID:=qwen38-27b-fp8-200k-RAMx1-SSDx4}"
+: "${KV_ENGINE_ID:=qwen38-27b-fp8-200k-SSDx4}"
 
 # --- sizing preflight ------------------------------------------------------
 vllm_clean_shm_staging "$KV_ENGINE_ID"
@@ -159,5 +159,5 @@ if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
 fi
 
-echo "[launch] fp8 weights + fp8_e4m3 KV, 256K RAMx1 SSDx4, model=$FP8_MODEL_PATH max_len=$MAX_MODEL_LEN pool=$KV_CACHE_MEMORY_BYTES n=$SPEC_NUM_TOKENS" >&2
+echo "[launch] fp8 weights + fp8_e4m3 KV, 200K SSDx4, model=$FP8_MODEL_PATH max_len=$MAX_MODEL_LEN pool=$KV_CACHE_MEMORY_BYTES n=$SPEC_NUM_TOKENS" >&2
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

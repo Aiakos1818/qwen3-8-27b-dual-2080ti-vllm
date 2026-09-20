@@ -27,7 +27,7 @@ Usage:
   monitor_kv_offload.py --port 8001 -d 2
   monitor_kv_offload.py --once
   monitor_kv_offload.py --json --count 5
-  monitor_kv_offload.py --log 'logs/server_128k_RAMx1_SSDx4_*.log'
+  monitor_kv_offload.py --log 'logs/server_128k_SSDx4_*.log'
 """
 
 from __future__ import annotations

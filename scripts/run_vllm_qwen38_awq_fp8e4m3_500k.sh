@@ -41,31 +41,18 @@ fi
 # but it is ~60% worse per token, so n stays at 5-6.
 : "${SPEC_NUM_TOKENS:=6}"
 
-# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
-# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
-# the yarn directory it only rewrites the shard that holds lm_head, so the
-# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
-# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
-# is appended to the export below.
-EXTRA_LD_LIBRARY_PATH=""
+# lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
+# decode throughput at no measurable acceptance cost. --disable-head8bit runs
+# the unquantised (bf16) head instead.
+HEAD8BIT=1
 for _arg in "$@"; do
   case "$_arg" in
-    --head8bit)
-      case "$MODEL_PATH" in
-        *-head8bit) ;;
-        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
-      esac
-      EXTRA_LD_LIBRARY_PATH=$(
-        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
-      )
-      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
-        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
-        exit 2
-      fi
+    --disable-head8bit)
+      HEAD8BIT=0
       ;;
     -h | --help)
-      echo "usage: $(basename "$0") [--head8bit]"
-      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      echo "usage: $(basename "$0") [--disable-head8bit]"
+      echo "  --disable-head8bit  run the bf16 lm_head checkpoint instead of the int8 variant"
       exit 0
       ;;
     *)
@@ -74,6 +61,24 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# The int8 head is a checkpoint variant: only the shard holding lm_head is
+# rewritten, the rest are symlinks. Its Humming kernel needs the venv's cu13
+# lib dir on LD_LIBRARY_PATH, which is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$MODEL_PATH" in
+    *-head8bit) ;;
+    *) MODEL_PATH="$MODEL_PATH-head8bit" ;;
+  esac
+  EXTRA_LD_LIBRARY_PATH=$(
+    ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+  )
+  if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+    echo "$0: --disable-head8bit: venv cu13 lib dir not found" >&2
+    exit 2
+  fi
+fi
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"

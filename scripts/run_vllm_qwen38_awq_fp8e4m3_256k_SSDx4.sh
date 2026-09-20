@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 500.8K context, tiered KV offload:
-# RAM holds ONE full-length context (promotion staging), the disk holds FOUR.
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 256K context (262,144), tiered KV
+# offload: RAM holds ONE full-length context (promotion staging), the disk holds
+# FOUR.
 #
-# Why a 64 GB host: a promoted chain is retained in the CPU tier and stays pinned
+# The offload rung of the 256K context, for hosts that want a long prompt to stay
+# restorable across restarts instead of being recomputed. The GPU-only 256K
+# profile is the serving default; this one trades a bigger /dev/shm reservation
+# for a warm cache.
+#
+# Why a bigger host than 15 GiB: a promoted chain is retained in the CPU tier
 # until the request consumes it, so the staging must hold one whole chain —
-# ceil(500800 / 1600) = 313 chunks at ~55.8 MB each = 17.5 GB, +10% headroom for
-# the tier's own LRU = 19.2 GB. That is a hard /dev/shm reservation, pre-faulted
-# at startup, and the default tmpfs is 50% of RAM: 32 GB would leave it 0.3 GiB
-# short of a single chain, 64 GB leaves it comfortable (32 GiB). Below the chain
-# size, restores of a full-length prompt silently yield 0 hits.
-#
-# Top rung of the three 500K profiles: 500k (GPU only, no offload) →
-# 500k_RAMx2 (CPU tier as the store, two contexts) → this one (RAM staging +
-# disk ring, the only rung that keeps several long sessions restorable).
+# ceil(262144 / 1600) = 164 chunks at ~55.8 MB each = 9.15 GB. That is a hard
+# /dev/shm reservation, pre-faulted at startup, so it needs ~10 GB of tmpfs and
+# therefore roughly a 32 GB host (the default tmpfs is half of RAM). On the
+# 15 GiB host this profile's preflight refuses to launch; the 128K offload
+# profile is the one that fits there (4.58 GB). Below the chain size, restores
+# of a full-length prompt silently yield 0 hits, which is why the staging is
+# sized to a whole chain and not less.
 #
 # Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
 # restored blocks are evicted (LRU by file mtime), so the directory can never
 # fill the partition; the newest four full-length contexts stay restorable, and
 # the RAM tier only has to hold the one being promoted.
-#
-# Validated at the mechanism level on a small run (40K prompts, 61-chunk RAM
-# tier): A -> B -> A restored 94% in 3 s from the offload tier, and the disk
-# ring/byte budget behaves as documented in docs/upstream-branch.md 5.5.
 #
 # This profile targets the upstream-based branch (2080ti_dual_qwen38-27B) and uses only
 # upstream knobs: prefix caching plus upstream's tiered offload.
@@ -33,7 +33,7 @@
 # RAM headroom: an unpinned staging that gets swapped out destroys the restore
 # path.
 #
-# Paths / model come from .env (copy config/vllm-500k-RAMx1-SSDx4.env.example).
+# Paths / model come from .env (copy config/vllm-256k-SSDx4.env.example).
 # CHECK_ONLY=1 runs the sizing checks and exits without touching anything.
 set -Eeuo pipefail
 
@@ -57,6 +57,16 @@ fi
 : "${CUDA_HOME:=/usr/local/cuda}"
 : "${OMP_NUM_THREADS:=8}"
 
+# --- model -----------------------------------------------------------------
+# Context here is <= the model's native 262,144, so no YaRN is needed: run the
+# released default-rope checkpoint. The -yarn512k directory differs only in
+# config.json's rope_parameters (weights are the same symlinked shards), and
+# YaRN's mscale is a constant attention scale applied at every position, so
+# within the native window it is pure precision cost with no benefit (see
+# reports/2026-09-sm75-optimization/accuracy-regression/). Override with
+# NATIVE_MODEL_PATH.
+NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH:-$(dirname "$MODEL_PATH")/Qwen3.8-27B-AWQ-INT4}"
+
 # --- geometry (measured, one chunk per block) ------------------------------
 # 1600 tokens and ~55.8 MB per chunk (both ranks' shards); the engine derives the
 # real kv_bytes_per_chunk from the canonical layout, which lands slightly under
@@ -67,28 +77,27 @@ CHUNK_BYTES=55800000
 # --- profile knobs ---------------------------------------------------------
 # Calibrate to the "GPU KV cache size" line after a launch;
 # scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
-# 9.6e9 pool -> 525,229 tokens (measured / logs), i.e. ~1.05x of one 500.8K
-# request at ~17.9 KiB/token.
-: "${MAX_MODEL_LEN:=500800}"
-: "${KV_CACHE_MEMORY_BYTES:=9600000000}"
+# 5.3e9 pool -> 278,253 tokens (measured / logs), i.e. ~1.06x of one 262,144
+# request.
+: "${MAX_MODEL_LEN:=262144}"
+: "${KV_CACHE_MEMORY_BYTES:=5600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Staging: exactly one full-length context (313 chunks). It only has to hold the
+# Staging: exactly one full-length context (164 chunks). It only has to hold the
 # chain being promoted, so no headroom is needed; every stored context also lives
 # on disk. Costs /dev/shm and RAM in full — pre-faulted before the engine starts.
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
-# Speculative depth: 5 beats 3 on decode throughput at every context measured
-# (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
-# sub-linearly with n because only the verify runs all 64 layers, while the
-# acceptance does drop (40% vs 59%). n=6 is faster again at every context
-# measured (31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%,
-# 449K +5.4%), so the 500K rungs default to it: the 9.6e9 pool still covers a
-# full 500,800 request (509,877 tokens measured at n=6).
-# n=7 does start -- the earlier "fails to start" was a KV pool 0.09 GiB short --
-# but it is ~60% worse per token, so n stays at 5-6.
+# Speculative depth: 6 beats 5 (and 5 beats 3) at every context measured:
+# 31.5K +4.8%, 215K +13% together with fp16 KV, 250K +4.7%, 449K +5.4%.  The
+# per-round cost grows sub-linearly with n because only the verify runs all 64
+# layers while the draft head runs one, so the extra draft is largely amortised.
+# n=6 needs ~1% more KV than n=5 (extra speculative slots); the 256K/128K
+# geometry carries a little more budget for that.  n=7 does start -- the earlier
+# "fails to start" was a KV pool 0.09 GiB short -- but it is ~60% worse per
+# token, so n stays at 6.
 : "${SPEC_NUM_TOKENS:=6}"
-# Disk tier: 4 full-length contexts (4 x 17.5 GB = 69.9 GB).
+# Disk tier: 4 full-length contexts (4 x 9.15 GB = 36.6 GB).
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
 : "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
 # Keep the directory across restarts (the budget reclaims what it needs, and the
@@ -101,7 +110,7 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
-: "${KV_ENGINE_ID:=qwen38-27b-500k-RAMx1-SSDx4}"
+: "${KV_ENGINE_ID:=qwen38-27b-256k-SSDx4}"
 
 # --- sizing preflight ------------------------------------------------------
 # Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
@@ -125,31 +134,18 @@ if [ "${CHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
-# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
-# the yarn directory it only rewrites the shard that holds lm_head, so the
-# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
-# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
-# is appended to the export below.
-EXTRA_LD_LIBRARY_PATH=""
+# lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
+# decode throughput at no measurable acceptance cost. --disable-head8bit runs
+# the unquantised (bf16) head instead.
+HEAD8BIT=1
 for _arg in "$@"; do
   case "$_arg" in
-    --head8bit)
-      case "$MODEL_PATH" in
-        *-head8bit) ;;
-        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
-      esac
-      EXTRA_LD_LIBRARY_PATH=$(
-        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
-      )
-      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
-        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
-        exit 2
-      fi
+    --disable-head8bit)
+      HEAD8BIT=0
       ;;
     -h | --help)
-      echo "usage: $(basename "$0") [--head8bit]"
-      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      echo "usage: $(basename "$0") [--disable-head8bit]"
+      echo "  --disable-head8bit  run the bf16 lm_head checkpoint instead of the int8 variant"
       exit 0
       ;;
     *)
@@ -158,6 +154,24 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# The int8 head is a checkpoint variant: only the shard holding lm_head is
+# rewritten, the rest are symlinks. Its Humming kernel needs the venv's cu13
+# lib dir on LD_LIBRARY_PATH, which is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$NATIVE_MODEL_PATH" in
+    *-head8bit) ;;
+    *) NATIVE_MODEL_PATH="$NATIVE_MODEL_PATH-head8bit" ;;
+  esac
+  EXTRA_LD_LIBRARY_PATH=$(
+    ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+  )
+  if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+    echo "$0: --disable-head8bit: venv cu13 lib dir not found" >&2
+    exit 2
+  fi
+fi
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -179,7 +193,7 @@ KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"eng
 
 ARGS=(
   --host "$HOST" --port "$PORT"
-  --model "$MODEL_PATH"
+  --model "$NATIVE_MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
   --dtype half --tensor-parallel-size 2 --device-ids 0,1
   --kv-cache-dtype fp8_e4m3

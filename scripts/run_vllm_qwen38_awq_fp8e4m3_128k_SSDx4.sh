@@ -1,40 +1,21 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 256K context (262,144), tiered KV
-# offload: RAM holds ONE full-length context (promotion staging), the disk holds
-# FOUR.
+# Qwen3.8-27B AWQ-INT4 (default rope) + fp8_e4m3 KV, 128K context, tiered KV offload:
+# RAM holds ONE full context (promotion staging), the disk holds FOUR.
 #
-# The offload rung of the 256K context, for hosts that want a long prompt to stay
-# restorable across restarts instead of being recomputed. The GPU-only 256K
-# profile is the serving default; this one trades a bigger /dev/shm reservation
-# for a warm cache.
-#
-# Why a bigger host than 15 GiB: a promoted chain is retained in the CPU tier
-# until the request consumes it, so the staging must hold one whole chain —
-# ceil(262144 / 1600) = 164 chunks at ~55.8 MB each = 9.15 GB. That is a hard
-# /dev/shm reservation, pre-faulted at startup, so it needs ~10 GB of tmpfs and
-# therefore roughly a 32 GB host (the default tmpfs is half of RAM). On the
-# 15 GiB host this profile's preflight refuses to launch; the 128K offload
-# profile is the one that fits there (4.58 GB). Below the chain size, restores
-# of a full-length prompt silently yield 0 hits, which is why the staging is
-# sized to a whole chain and not less.
-#
-# Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
-# restored blocks are evicted (LRU by file mtime), so the directory can never
-# fill the partition; the newest four full-length contexts stay restorable, and
-# the RAM tier only has to hold the one being promoted.
+# Purpose: validate upstream's tiered offload on SM75 at a realistic context.
+# The GPU pool holds ~1.1x of one full 128K request, so a second session
+# forces eviction and the evicted chain has to be restored from the CPU/disk
+# tier.
 #
 # This profile targets the upstream-based branch (2080ti_dual_qwen38-27B) and uses only
 # upstream knobs: prefix caching plus upstream's tiered offload.
 #
-# Hosts whose RLIMIT_MEMLOCK is below CPU_BYTES_TO_USE fail cudaHostRegister for
-# the staging region. That is tolerated (unpinned DMA), but only with the
-# sticky-error fix in vllm/v1/kv_offload/cpu/gpu_worker.py (commit bf78fc276) —
-# without it the JIT warmup dies with "CUDA error: invalid argument". Keep real
-# RAM headroom: an unpinned staging that gets swapped out destroys the restore
-# path.
+# Hosts whose RLIMIT_MEMLOCK is below CPU_BYTES_TO_USE fail cudaHostRegister
+# for the staging region. That is tolerated (unpinned DMA), but only with the
+# sticky-error fix in vllm/v1/kv_offload/cpu/gpu_worker.py (commit bf78fc276)
+# — without it the JIT warmup dies with "CUDA error: invalid argument".
 #
-# Paths / model come from .env (copy config/vllm-256k-RAMx1-SSDx4.env.example).
-# CHECK_ONLY=1 runs the sizing checks and exits without touching anything.
+# Paths / model come from .env (copy config/vllm-128k-SSDx4.env.example).
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
@@ -75,16 +56,19 @@ CHUNK_TOKENS=1600
 CHUNK_BYTES=55800000
 
 # --- profile knobs ---------------------------------------------------------
-# Calibrate to the "GPU KV cache size" line after a launch;
-# scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
-# 5.3e9 pool -> 278,253 tokens (measured / logs), i.e. ~1.06x of one 262,144
-# request.
-: "${MAX_MODEL_LEN:=262144}"
-: "${KV_CACHE_MEMORY_BYTES:=5600000000}"
+# 3.0e9 pool ≈ 164K tokens ≈ 1.25x of one full 128K request at fp8_e4m3
+# (~17.8 KiB/token). Calibrate against the "GPU KV cache size" line after a
+# launch; scripts/tools/kv_pool_sizing.py reports the pool a profile needs.
+: "${MAX_MODEL_LEN:=131072}"
+: "${KV_CACHE_MEMORY_BYTES:=3000000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# Staging: exactly one full-length context (164 chunks). It only has to hold the
-# chain being promoted, so no headroom is needed; every stored context also lives
-# on disk. Costs /dev/shm and RAM in full — pre-faulted before the engine starts.
+# Promoted chunks are retained in the CPU tier, so it has to hold a whole
+# chain: ceil(MAX_MODEL_LEN / 1600) chunks at ~55.8 MB each (measured, one
+# chunk per block). 128K -> 82 chunks -> 4.58e9: exactly one context, which is
+# all the promotion staging needs (every stored context also lives on disk).
+# Below that, an evicted full-length session silently restores nothing. Costs
+# /dev/shm and RAM in full, so a smaller MAX_MODEL_LEN is the cheaper way to
+# stay honest.
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 : "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
@@ -97,68 +81,38 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # "fails to start" was a KV pool 0.09 GiB short -- but it is ~60% worse per
 # token, so n stays at 6.
 : "${SPEC_NUM_TOKENS:=6}"
-# Disk tier: 4 full-length contexts (4 x 9.15 GB = 36.6 GB).
+# Disk tier. VLLM_SSD_MAX_BYTES caps what the tier keeps on disk: past the
+# budget the least recently restored blocks are evicted (LRU by file mtime), so
+# the directory can never fill the filesystem (0 = no cap, upstream behavior).
+# Four full-length 128K contexts = 18.3 GB (~17 GiB): the newest four sessions
+# (or prompt variants) stay restorable while older ones age out of the ring.
+# The directory is kept across restarts (the budget reclaims what it needs, and
+# the eviction order is read back from the files' mtimes). Set
+# VLLM_SSD_CLEAN_START=1 to wipe it for a fresh start.
 : "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
 : "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
-# Keep the directory across restarts (the budget reclaims what it needs, and the
-# eviction order is read back from the files' mtimes). Set 1 to wipe it.
 : "${VLLM_SSD_CLEAN_START:=0}"
-# A KV load failure (missing/short file on disk) either recomputes the affected
-# tokens or fails the request (vLLM's default). Recompute is the safer choice
-# for offload: the disk tier is best-effort, and 0-hit degradation beats an
-# aborted request.
-: "${KV_LOAD_FAILURE_POLICY:=recompute}"
 # Stable engine id: names the /dev/shm staging file and the SSD session dir.
 # Give every profile its own id; two instances must not share one.
-: "${KV_ENGINE_ID:=qwen38-27b-256k-RAMx1-SSDx4}"
+# A KV load failure (missing/short file on disk) either recomputes the
+# affected tokens or fails the request (vLLM's default). Recompute is the safer
+# choice for offload: the disk tier is best-effort, and 0-hit degradation beats
+# an aborted request.
+: "${KV_LOAD_FAILURE_POLICY:=recompute}"
+: "${KV_ENGINE_ID:=qwen38-27b-128k-SSDx4}"
 
-# --- sizing preflight ------------------------------------------------------
-# Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
-# refuses to launch when the host cannot back the pre-faulted /dev/shm staging
-# region — the mount's total size, its *free* space (a stale or another
-# instance's staging file can eat it), and physical headroom — and warns when a
-# capacity target is undersized. CHECK_ONLY=1 stops after the checks.
-vllm_clean_shm_staging "$KV_ENGINE_ID"
-OFFLOAD_LABEL="staging"
-OFFLOAD_STAGING_BYTES=$CPU_BYTES_TO_USE
-OFFLOAD_CHAIN_BYTES=$CHAIN_BYTES
-OFFLOAD_CHAIN_CHUNKS=$CHAIN_CHUNKS
-OFFLOAD_RAM_CHAINS=1
-OFFLOAD_SSD_BYTES=$VLLM_SSD_MAX_BYTES
-OFFLOAD_SSD_CHAINS=4
-OFFLOAD_POOL_BYTES=$KV_CACHE_MEMORY_BYTES
-OFFLOAD_POOL_BYTES_PER_TOKEN=18278
-vllm_check_offload_sizing || exit 1
-if [ "${CHECK_ONLY:-0}" = "1" ]; then
-  echo "[profile] CHECK_ONLY=1: sizing checks done, not launching"
-  exit 0
-fi
-
-# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
-# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
-# the yarn directory it only rewrites the shard that holds lm_head, so the
-# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
-# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
-# is appended to the export below.
-EXTRA_LD_LIBRARY_PATH=""
+# lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
+# decode throughput at no measurable acceptance cost. --disable-head8bit runs
+# the unquantised (bf16) head instead.
+HEAD8BIT=1
 for _arg in "$@"; do
   case "$_arg" in
-    --head8bit)
-      case "$NATIVE_MODEL_PATH" in
-        *-head8bit) ;;
-        *) NATIVE_MODEL_PATH="${NATIVE_MODEL_PATH}-head8bit" ;;
-      esac
-      EXTRA_LD_LIBRARY_PATH=$(
-        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
-      )
-      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
-        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
-        exit 2
-      fi
+    --disable-head8bit)
+      HEAD8BIT=0
       ;;
     -h | --help)
-      echo "usage: $(basename "$0") [--head8bit]"
-      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      echo "usage: $(basename "$0") [--disable-head8bit]"
+      echo "  --disable-head8bit  run the bf16 lm_head checkpoint instead of the int8 variant"
       exit 0
       ;;
     *)
@@ -167,6 +121,24 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# The int8 head is a checkpoint variant: only the shard holding lm_head is
+# rewritten, the rest are symlinks. Its Humming kernel needs the venv's cu13
+# lib dir on LD_LIBRARY_PATH, which is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$NATIVE_MODEL_PATH" in
+    *-head8bit) ;;
+    *) NATIVE_MODEL_PATH="$NATIVE_MODEL_PATH-head8bit" ;;
+  esac
+  EXTRA_LD_LIBRARY_PATH=$(
+    ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+  )
+  if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+    echo "$0: --disable-head8bit: venv cu13 lib dir not found" >&2
+    exit 2
+  fi
+fi
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -223,6 +195,28 @@ fi
 mkdir -p "$VLLM_SSD_ROOT"
 if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
   rm -rf "${VLLM_SSD_ROOT:?}"/*
+fi
+
+# --- sizing preflight ------------------------------------------------------
+# Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
+# refuses to launch when the host cannot back the pre-faulted /dev/shm staging
+# region — the mount's total size, its *free* space (a stale or another
+# instance's staging file can eat it), and physical headroom — and warns when a
+# capacity target is undersized. CHECK_ONLY=1 stops after the checks.
+vllm_clean_shm_staging "$KV_ENGINE_ID"
+OFFLOAD_LABEL="staging"
+OFFLOAD_STAGING_BYTES=$CPU_BYTES_TO_USE
+OFFLOAD_CHAIN_BYTES=$CHAIN_BYTES
+OFFLOAD_CHAIN_CHUNKS=$CHAIN_CHUNKS
+OFFLOAD_RAM_CHAINS=1
+OFFLOAD_SSD_BYTES=$VLLM_SSD_MAX_BYTES
+OFFLOAD_SSD_CHAINS=4
+OFFLOAD_POOL_BYTES=$KV_CACHE_MEMORY_BYTES
+OFFLOAD_POOL_BYTES_PER_TOKEN=18278
+vllm_check_offload_sizing || exit 1
+if [ "${CHECK_ONLY:-0}" = "1" ]; then
+  echo "[profile] CHECK_ONLY=1: sizing checks done, not launching"
+  exit 0
 fi
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

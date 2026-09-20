@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
-# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 500.8K context, RAM-only KV offload
-# sized for TWO full-length contexts (CPU tier as the store, no secondary tier).
+# Qwen3.8-27B AWQ-INT4 + YARN + fp8_e4m3 KV, 500.8K context, tiered KV offload:
+# RAM holds ONE full-length context (promotion staging), the disk holds FOUR.
 #
-# The rung between "no offload" and "RAM + SSD": the CPU tier alone keeps whole
-# chains, so an evicted session is restored from RAM without touching the disk
-# (faster than the SSD rung: PCIe-bound instead of disk-bound). Its size is the
-# whole point: 2 x ceil(500800 / 1600) chunks = 626 chunks at ~55.8 MB each =
-# 34.9 GB, i.e. two full-length contexts can be resident at once and either can
-# be restored. Everything else is still recomputed, and a third session evicts
-# the least recently restored one (RAM-only keeps no second copy anywhere).
+# Why a 64 GB host: a promoted chain is retained in the CPU tier and stays pinned
+# until the request consumes it, so the staging must hold one whole chain —
+# ceil(500800 / 1600) = 313 chunks at ~55.8 MB each = 17.5 GB, +10% headroom for
+# the tier's own LRU = 19.2 GB. That is a hard /dev/shm reservation, pre-faulted
+# at startup, and the default tmpfs is 50% of RAM: 32 GB would leave it 0.3 GiB
+# short of a single chain, 64 GB leaves it comfortable (32 GiB). Below the chain
+# size, restores of a full-length prompt silently yield 0 hits.
 #
-# That tier is a hard /dev/shm reservation, pre-faulted at startup, and the
-# default tmpfs is 50% of RAM: a 64 GB host defaults to 32 GiB, which is 0.6 GB
-# short of two chains — remount /dev/shm to ~36 GiB (the check below prints the
-# exact command). RAM headroom still matters: 34.9 GB of staging + the engine
-# fits a 64 GB host, but not a smaller one.
+# Top rung of the three 500K profiles: 500k (GPU only, no offload) →
+# 500k_RAMx2 (CPU tier as the store, two contexts) → this one (RAM staging +
+# disk ring, the only rung that keeps several long sessions restorable).
 #
-# Validated on a small-scale run (40K prompts, 2 x 26-chunk chains, 61-chunk
-# tier): A -> B -> A restored 36,800/39,170 (94%) in 3 s with 1.44 GB of
-# CPU_to_GPU traffic and zero disk traffic.
+# Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
+# restored blocks are evicted (LRU by file mtime), so the directory can never
+# fill the partition; the newest four full-length contexts stay restorable, and
+# the RAM tier only has to hold the one being promoted.
+#
+# Validated at the mechanism level on a small run (40K prompts, 61-chunk RAM
+# tier): A -> B -> A restored 94% in 3 s from the offload tier, and the disk
+# ring/byte budget behaves as documented in docs/upstream-branch.md 5.5.
 #
 # This profile targets the upstream-based branch (2080ti_dual_qwen38-27B) and uses only
-# upstream knobs: prefix caching plus upstream's tiered offload with an empty
-# secondary tier list.
+# upstream knobs: prefix caching plus upstream's tiered offload.
 #
 # Hosts whose RLIMIT_MEMLOCK is below CPU_BYTES_TO_USE fail cudaHostRegister for
 # the staging region. That is tolerated (unpinned DMA), but only with the
@@ -31,7 +33,7 @@
 # RAM headroom: an unpinned staging that gets swapped out destroys the restore
 # path.
 #
-# Paths / model come from .env (copy config/vllm-500k-RAMx2.env.example).
+# Paths / model come from .env (copy config/vllm-500k-SSDx4.env.example).
 # CHECK_ONLY=1 runs the sizing checks and exits without touching anything.
 set -Eeuo pipefail
 
@@ -70,12 +72,12 @@ CHUNK_BYTES=55800000
 : "${MAX_MODEL_LEN:=500800}"
 : "${KV_CACHE_MEMORY_BYTES:=9600000000}"
 : "${GPU_MEMORY_UTILIZATION:=0.92}"
-# CPU tier: both the store and the promotion staging. Sized for two full-length
-# chains (2 x CHAIN_CHUNKS x CHUNK_BYTES = 34.9 GB), so two long sessions can be
-# resident and either one restored. Costs /dev/shm and RAM in full.
+# Staging: exactly one full-length context (313 chunks). It only has to hold the
+# chain being promoted, so no headroom is needed; every stored context also lives
+# on disk. Costs /dev/shm and RAM in full — pre-faulted before the engine starts.
 CHAIN_CHUNKS=$(( (MAX_MODEL_LEN + CHUNK_TOKENS - 1) / CHUNK_TOKENS ))
 CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
-: "${CPU_BYTES_TO_USE:=$(( 2 * CHAIN_BYTES ))}"
+: "${CPU_BYTES_TO_USE:=$(( 1 * CHAIN_BYTES ))}"
 # Speculative depth: 5 beats 3 on decode throughput at every context measured
 # (2026-09-18: 31.5K +21%, 128K +23%, 250K +37%). The per-round cost grows
 # sub-linearly with n because only the verify runs all 64 layers, while the
@@ -86,12 +88,20 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # n=7 does start -- the earlier "fails to start" was a KV pool 0.09 GiB short --
 # but it is ~60% worse per token, so n stays at 5-6.
 : "${SPEC_NUM_TOKENS:=6}"
-# A KV load failure cannot really happen without a disk tier; recompute keeps
-# the two offload rungs identical and is the safer default anyway.
+# Disk tier: 4 full-length contexts (4 x 17.5 GB = 69.9 GB).
+: "${VLLM_SSD_ROOT:=/home/aiakos/Qwen3.8-27B-Deploy/ssd_kv}"
+: "${VLLM_SSD_MAX_BYTES:=$(( 4 * CHAIN_BYTES ))}"
+# Keep the directory across restarts (the budget reclaims what it needs, and the
+# eviction order is read back from the files' mtimes). Set 1 to wipe it.
+: "${VLLM_SSD_CLEAN_START:=0}"
+# A KV load failure (missing/short file on disk) either recomputes the affected
+# tokens or fails the request (vLLM's default). Recompute is the safer choice
+# for offload: the disk tier is best-effort, and 0-hit degradation beats an
+# aborted request.
 : "${KV_LOAD_FAILURE_POLICY:=recompute}"
-# Stable engine id: names the /dev/shm staging file. Give every profile its own
-# id; two instances must not share one.
-: "${KV_ENGINE_ID:=qwen38-27b-500k-RAMx2}"
+# Stable engine id: names the /dev/shm staging file and the SSD session dir.
+# Give every profile its own id; two instances must not share one.
+: "${KV_ENGINE_ID:=qwen38-27b-500k-SSDx4}"
 
 # --- sizing preflight ------------------------------------------------------
 # Shared with the other offload profiles (scripts/tools/offload_sizing.sh). It
@@ -100,13 +110,13 @@ CHAIN_BYTES=$(( CHAIN_CHUNKS * CHUNK_BYTES ))
 # instance's staging file can eat it), and physical headroom — and warns when a
 # capacity target is undersized. CHECK_ONLY=1 stops after the checks.
 vllm_clean_shm_staging "$KV_ENGINE_ID"
-OFFLOAD_LABEL="RAM tier"
+OFFLOAD_LABEL="staging"
 OFFLOAD_STAGING_BYTES=$CPU_BYTES_TO_USE
 OFFLOAD_CHAIN_BYTES=$CHAIN_BYTES
 OFFLOAD_CHAIN_CHUNKS=$CHAIN_CHUNKS
-OFFLOAD_RAM_CHAINS=2
-OFFLOAD_SSD_BYTES=0
-OFFLOAD_SSD_CHAINS=0
+OFFLOAD_RAM_CHAINS=1
+OFFLOAD_SSD_BYTES=$VLLM_SSD_MAX_BYTES
+OFFLOAD_SSD_CHAINS=4
 OFFLOAD_POOL_BYTES=$KV_CACHE_MEMORY_BYTES
 OFFLOAD_POOL_BYTES_PER_TOKEN=18278
 vllm_check_offload_sizing || exit 1
@@ -115,31 +125,18 @@ if [ "${CHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# Optional: --head8bit runs the int8 lm_head checkpoint variant (docs section
-# 6.15): +17~21% net decode throughput at no measurable acceptance cost.  Like
-# the yarn directory it only rewrites the shard that holds lm_head, so the
-# unchanged shards are symlinks; nothing is copied.  It runs through the Humming
-# kernel, whose NVRTC JIT needs the venv's cu13 lib dir on LD_LIBRARY_PATH, which
-# is appended to the export below.
-EXTRA_LD_LIBRARY_PATH=""
+# lm_head int8 is ON by default (docs/upstream-branch.md 6.15): +17~21% net
+# decode throughput at no measurable acceptance cost. --disable-head8bit runs
+# the unquantised (bf16) head instead.
+HEAD8BIT=1
 for _arg in "$@"; do
   case "$_arg" in
-    --head8bit)
-      case "$MODEL_PATH" in
-        *-head8bit) ;;
-        *) MODEL_PATH="${MODEL_PATH}-head8bit" ;;
-      esac
-      EXTRA_LD_LIBRARY_PATH=$(
-        ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
-      )
-      if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
-        echo "$0: --head8bit: venv cu13 lib dir not found" >&2
-        exit 2
-      fi
+    --disable-head8bit)
+      HEAD8BIT=0
       ;;
     -h | --help)
-      echo "usage: $(basename "$0") [--head8bit]"
-      echo "  --head8bit  run the int8 lm_head checkpoint variant (docs/upstream-branch.md 6.15)"
+      echo "usage: $(basename "$0") [--disable-head8bit]"
+      echo "  --disable-head8bit  run the bf16 lm_head checkpoint instead of the int8 variant"
       exit 0
       ;;
     *)
@@ -148,6 +145,24 @@ for _arg in "$@"; do
       ;;
   esac
 done
+
+# The int8 head is a checkpoint variant: only the shard holding lm_head is
+# rewritten, the rest are symlinks. Its Humming kernel needs the venv's cu13
+# lib dir on LD_LIBRARY_PATH, which is appended to the export below.
+EXTRA_LD_LIBRARY_PATH=""
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$MODEL_PATH" in
+    *-head8bit) ;;
+    *) MODEL_PATH="$MODEL_PATH-head8bit" ;;
+  esac
+  EXTRA_LD_LIBRARY_PATH=$(
+    ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
+  )
+  if [ -z "$EXTRA_LD_LIBRARY_PATH" ] || [ ! -d "$EXTRA_LD_LIBRARY_PATH" ]; then
+    echo "$0: --disable-head8bit: venv cu13 lib dir not found" >&2
+    exit 2
+  fi
+fi
 
 export OMP_NUM_THREADS CUDA_HOME
 export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
@@ -165,7 +180,7 @@ export PATH="$CUDA_HOME/bin:$(dirname "$VLLM_PYTHON"):$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${EXTRA_LD_LIBRARY_PATH:+:$EXTRA_LD_LIBRARY_PATH}"
 export PYTHONPATH="$FLASHQLA_PATH"
 
-KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[]}}"
+KV_XFER="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"engine_id\":\"$KV_ENGINE_ID\",\"kv_load_failure_policy\":\"$KV_LOAD_FAILURE_POLICY\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":$CPU_BYTES_TO_USE,\"eviction_policy\":\"lru\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$VLLM_SSD_ROOT\",\"max_bytes\":$VLLM_SSD_MAX_BYTES}]}}"
 
 ARGS=(
   --host "$HOST" --port "$PORT"
@@ -199,7 +214,11 @@ if [ -n "${CHAT_TEMPLATE:-}" ]; then
   ARGS+=(--chat-template "$CHAT_TEMPLATE")
 fi
 
-# The staging file is re-opened by a fixed engine id (it is never unlinked), so
-# drop any stale one before the engine picks it up.
+# A fixed engine id names the run's SSD session dir; leave its contents alone
+# unless asked to start clean, so a restart can still restore blocks.
+mkdir -p "$VLLM_SSD_ROOT"
+if [ "$VLLM_SSD_CLEAN_START" = "1" ]; then
+  rm -rf "${VLLM_SSD_ROOT:?}"/*
+fi
 
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

@@ -93,10 +93,9 @@ tilelang 降级回去。
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_256k.sh` | 生产档：256K（模型原生上限），无 offload，5.3e9 池 |
 | `scripts/run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 长上下文基础档：500.8K 上下文，无 offload，9.6e9 池 |
 | `scripts/run_vllm_qwen38_awq_fp16_225k.sh` | **速度取向档**：225,280 上下文 + **fp16 KV + n=6**，用与 500K 档同样的 9.6e9 预算（fp16 使池降到 252,223 token）；215K 实测比 fp8/n=5 快 **+13%**（§6.14） |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 4 条链的环），**本文主要验证对象** |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` | 256K + 同样两层 offload（staging 9.15 GB，需 ~32 GB 主机） |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | 500K + 纯 RAM offload（CPU 层即 store，2 条链） |
-| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 500K + RAM staging（1 条链）+ 磁盘 4 条链的环 |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_128k_SSDx4.sh` | 128K 上下文 + 上游两层 offload（RAM 1 条链 staging + 磁盘 4 条链的环），**本文主要验证对象** |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_256k_SSDx4.sh` | 256K + 同样两层 offload（staging 9.15 GB，需 ~32 GB 主机） |
+| `scripts/run_vllm_qwen38_awq_fp8e4m3_500k_SSDx4.sh` | 500K + RAM staging（1 条链）+ 磁盘 4 条链的环 |
 | `config/vllm*.env.example` | 各档配置模板（无 offload 的 256K/500K 档用 `vllm.env.example`） |
 
 profile 命名规律：`<模型>_<量化>_<上下文>[_RAMx<N>[_SSDx<M>]]` —— 后缀即容量
@@ -148,7 +147,7 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 ③ head 变体（由 scripts/tools/quantize_lm_head.py 从 ② 生成）
    models/…-yarn512k-head8bit/   1.3G   3 真 + 15 链接 → ①      【已采用】
         真：config.json（新增 head group, num_bits=8）、index、file1（lm_head 变 int8 packed）
-        ← 启动加 --head8bit ⇒ MODEL_PATH 换成 ${MODEL_PATH}-head8bit
+        ← 默认启用（--disable-head8bit 关闭）⇒ MODEL_PATH 换成 ${MODEL_PATH}-head8bit
    models/…-yarn512k-head4bit/   702M   3 真 + 15 链接 → ①      【未采用】
         真：同上，但 head 并入 group_0（num_bits=4）；只能用临时 launcher 跑
 
@@ -176,7 +175,7 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 | 使用者 | 读的目录 |
 |---|---|
 | `.env` 的 `MODEL_PATH`；7 个 `run_vllm_qwen38_awq_*.sh` 默认 | ② yarn512k |
-| 上述任一 profile 加 `--head8bit` | ③ head8bit |
+| 上述任一 profile（默认；`--disable-head8bit` 可关） | ③ head8bit |
 | `experiments/run_500k_head4bit.sh`（head4bit launcher） | ③ head4bit |
 | 遗留 `run_qwen3.8_27b_sm75.sh`（基础路线） | ④ FP8（需手动指 `MODEL_PATH`） |
 | `quantize_lm_head.py --src/--dst` | ② → ③（也可拿 ⑤ 当 src，保证从 pristine 源出发） |
@@ -190,11 +189,11 @@ MTP acceptance ~79%、工具调用模板与 `qwen3_xml` parser 正常。
 | ③ head8bit / head4bit | 1.3G / 702M | 1.3G / 702M |
 | ④ FP8 | 29G | 29G |
 | ⑤ backup | 20G（**假象**） | **22.2MB**（权重是硬链接） |
-| 合计 | 51G | **部署真正需要的只有 ①+② = 20G**；开 `--head8bit` 再 +1.3G |
+| 合计 | 51G | **部署真正需要的只有 ①+② = 20G**；head8bit（默认开）再 +1.3G |
 
 **三条容易踩的**：
 
-1. **变体目录名不能改**：`--head8bit` 是 `${MODEL_PATH}-head8bit` 推导出来的，改名即弄坏开关。
+1. **变体目录名不能改**：head8bit 的目录由 `${MODEL_PATH}-head8bit` 推导，改名即弄坏开关。
 2. `du -sh model-backup-awq-int4` 显示 20G 是硬链接未跨目录去重的假象，真实只有 22.2MB。
 3. 备份**不被 head8bit 使用**（变体的符号链接指向活的 ①），它只是"改动前的退路"；而
    `models/Qwen3.8-27B-FP8` 目前**没有副本**。
@@ -326,7 +325,7 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 ---
 
-### 5.6 500K 部署三档（64 GB 主机目标）
+### 5.6 500K 部署两档（64 GB 主机目标）
 
 三个 profile 共用同一套 KV/池参数（`MAX_MODEL_LEN=500800`、`KV_CACHE_MEMORY_BYTES=9.6e9`
 → 525,229 tokens = 1.05×），只有 offload 档位不同：
@@ -334,8 +333,7 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 | 档 | 脚本 | tier 配置 | 容量语义 |
 |---|---|---|---|
 | 500k | `run_vllm_qwen38_awq_fp8e4m3_500k.sh` | 无 offload | 只有 GPU 池；重复的长 prompt 全量重算 |
-| 500k_RAMx2 | `run_vllm_qwen38_awq_fp8e4m3_500k_RAMx2.sh` | `TieringOffloadingSpec` + `secondary_tiers: []` | CPU 层**就是 store**：2 条满长链 = 626 chunks = **32.5 GiB**；恢复只走 PCIe（不经磁盘）；淘汰即丢 |
-| 500k_RAMx1_SSDx4 | `run_vllm_qwen38_awq_fp8e4m3_500k_RAMx1_SSDx4.sh` | 同上 + `fs` secondary（`max_bytes`） | RAM 只做晋升 staging（1 条链 = 313 chunks = **16.3 GiB**），磁盘是 **4 条链的 LRU 环**（65.1 GiB）；唯一能保住多个长会话、且跨重启保留的档 |
+| 500k_SSDx4 | `run_vllm_qwen38_awq_fp8e4m3_500k_SSDx4.sh` | 同上 + `fs` secondary（`max_bytes`） | RAM 只做晋升 staging（1 条链 = 313 chunks = **16.3 GiB**），磁盘是 **4 条链的 LRU 环**（65.1 GiB）；唯一能保住多个长会话、且跨重启保留的档 |
 
 尺寸全部由 `MAX_MODEL_LEN` 推导（`CHAIN_CHUNKS = ceil(MAX_MODEL_LEN/1600)`、
 `CHAIN_BYTES = CHAIN_CHUNKS × 55.8 MB`），改上下文长度会自动跟随；
@@ -343,9 +341,7 @@ profile 已把 `kv_load_failure_policy` 设为 `recompute`（vLLM 默认 `fail`�
 
 **RAM 是硬开销**：tier 是 `/dev/shm` 上启动前预 fault 的 mmap，而 tmpfs 默认 = RAM 的 50%：
 
-- `RAMx1_SSDx4`：16.3 GiB ✓ 直接落在 64 GB 主机的 32 GiB tmpfs 内，**无需改系统**；
-- `RAMx2`：32.5 GiB **略超**默认 32 GiB → 需 `mount -o remount,size=36864M /dev/shm`
-  （自检会打印精确命令）。
+- `SSDx4`：16.3 GiB ✓ 直接落在 64 GB 主机的 32 GiB tmpfs 内，**无需改系统**；
 
 **装机自检**（三个 offload profile 共用 `scripts/tools/offload_sizing.sh`）：
 
@@ -384,8 +380,8 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 （正好是那条链），磁盘文件数不变 → 证明"空 secondary 的 tiering = 纯 RAM 档"可用。
 
 > 注意 tier 必须装得下**同时要命中的链**：同一轮里 43-chunk tier 因 A+B 需 52 chunks 而
-> 互相挤出 → 0 命中（与 §5.2 的"链必须完整"是同一条规则）。这就是 `RAMx2` 按 2 条链配、
-> `RAMx1_SSDx4` 的 RAM 只当 staging（而磁盘兜住多会话）的原因。
+> 互相挤出 → 0 命中（与 §5.2 的"链必须完整"是同一条规则）。这就是 `SSDx4` 的 RAM 只当 staging
+> （而磁盘兜住多会话）的原因。
 
 本机（16 GB / 7.8 GiB shm）实测：两档都按预期拒绝启动并打印精确的 `mount -o remount` 命令；
 参数在 vLLM 侧解析正常（日志确认 `max_model_len: 500800` 与 tier 配置）。**真实 500K 恢复
@@ -393,7 +389,7 @@ cmdline 里的 `engine_id` 删自己的文件并打印前后用量。
 
 ### 5.6b 256K offload 档（同一套两层 offload，链更短）
 
-`run_vllm_qwen38_awq_fp8e4m3_256k_RAMx1_SSDx4.sh` 把同一套两层 offload 用在 256K：
+`run_vllm_qwen38_awq_fp8e4m3_256k_SSDx4.sh` 把同一套两层 offload 用在 256K：
 `MAX_MODEL_LEN=262144`、池 5.3e9 → 267,842 tokens（n=5 实测；n=3 时 278,253，≈1.06× 一个满请求），链 =
 `ceil(262144/1600)` = **164 chunks = 9.15 GB**，磁盘是 4 条链的 **36.6 GB** LRU 环。
 
@@ -954,7 +950,7 @@ flashinfer 的 decode kernel；lm_head 的 vocab 248K GEMV 占 15%。
    **18 分钟**（1088 s）。
 3. decode 每 token 成本 ×1.77，与每次 attention 的 KV 读量 448/250 = 1.79× **几乎完全一致**——再次
    印证长上下文解码是 KV 带宽受限，而不是别的。
-4. 未做：offload 三档（`RAMx1_SSDx4` 16.3 GiB / `RAMx2` 32.5 GiB staging，需 64 GB 主机）；
+4. 未做：offload 档（`SSDx4` staging 16.3 GiB，需 64 GB 主机）；
    n 在 449K 下的最优值（接受率略高于 250K，理论上更大 n 更划算，但每换一次 n 需重启 + 18 min
    prefill）。
 
@@ -1102,17 +1098,17 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   - greedy 输出两者都变（int4 第 223 字符、int8 第 370 字符起，都是语义等价的改写），
     说明 head 量化**确实改变输出分布**，不是无损 —— int8 的扰动小得多。
 
-  **默认（不带开关）仍是原 checkpoint（head 为 bf16）**，`--head8bit` 才启用 int8。
+  **现在默认就跑 int8**（`--disable-head8bit` 回到 bf16 原 checkpoint）。
   两个变体目录和工具都留着；int4 变体没有开关，只能用临时 launcher
   `experiments/run_500k_head4bit.sh` 跑。
 
   **下一步候选**：
 
-  1. ~~采用 int8~~ **已采用（2026-09-19）**：不改脚本、不加脚本，7 个
-     `run_vllm_qwen38_awq_*.sh` profile 都接受 `--head8bit` 开关 —— 它把 `MODEL_PATH`
-     追加 `-head8bit`，并把 venv 的 `nvidia/cu13/lib` 追加到 `LD_LIBRARY_PATH`。启动日志
-     出现 `Using HummingLinearKernel` 即生效（启动多约 2 分钟）。默认（不带开关）仍是原
-     checkpoint。仍建议在业务流量上先跑一遍质量回归。
+  1. ~~采用 int8~~ **已采用（2026-09-19），2026-09-20 起改为默认开启**：7 个
+     `run_vllm_qwen38_awq_*.sh` profile 默认把 `MODEL_PATH` 追加 `-head8bit`，并把 venv 的
+     `nvidia/cu13/lib` 追加到 `LD_LIBRARY_PATH`；`--disable-head8bit` 回到原 checkpoint。
+     启动日志出现 `Using HummingLinearKernel` 即生效（启动多约 2 分钟）。仍建议在业务流量上
+     先跑一遍质量回归。
   2. int4 的**更细 MSE 搜索**或 GPTQ 式误差补偿：把 8.42% 压到接近 int8 的水平，同时
      保住 10 ms 的收益（理论收益上限最高，但要校准 Hessian）。
   3. head 量化后每卡空出的显存（int8 ~0.4 GB、int4 ~1.15 GB）可以再换成 KV 预算。
@@ -1263,7 +1259,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   `VLLM_SM75_SPEC_SYNC_MODE`；其余 8 个（gdn、flashinfer、qwen3_5_mtp、采样、
   input_processor…）两个 runner 共用。
 
-  **方法**：同一 profile（256K + MTP n=6 + `--head8bit` + fp8 KV）、同一 batch 长度
+  **方法**：同一 profile（256K + MTP n=6 + head8bit + fp8 KV）、同一 batch 长度
   （31.2K，`--word-counts 30000 --max-tokens 256 --runs 3`）。bench 的 prompt **seed 是确定的**
   （`seed = word_count*100 + run`），所以 V1/V2 是**逐条同 prompt**；V2 基线直接取 §6.15 同口径
   的既有数据。V1 跑两组以隔离我们自己的补丁：`VLLM_SM75_SPEC_SYNC_MODE=safe`（生产值，V1 下每
@@ -1316,7 +1312,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   - 前置条件：`--reasoning-parser` / `--reasoning-config` 必须启用（否则请求带该字段直接
     `VLLMValidationError`）。
 
-  **实测**（256K profile + MTP n=6 + `--head8bit`，V2；`reasoning_tokens` 取自服务端 usage）：
+  **实测**（256K profile + MTP n=6 + head8bit，V2；`reasoning_tokens` 取自服务端 usage）：
 
   | 探针 | budget | max_tokens | reasoning tokens | content | finish_reason |
   |---|---:|---:|---:|---:|---|
@@ -1375,7 +1371,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   393216 ✅（397,806，21.9/22.5 GiB）→ **上限约 ~400K**；超过 262144 必须 YaRN。FP16 KV 上限减半（~200K）。
 
   **新增 profile**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_200k.sh`（FP8 权重 + fp8_e4m3 KV，MTP n=6）
-  与 `..._fp8_fp8e4m3_200k_RAMx1_SSDx4.sh`（同上下文 + 两层 offload）。
+  与 `..._fp8_fp8e4m3_200k_SSDx4.sh`（同上下文 + 两层 offload）。
 
   **FP8 档为什么是 200K 而不是 262,144**：FP8 权重（含视觉塔）比 AWQ 多吃 ~4.4 GiB/卡，正好是
   MTP6 需要的余量。实测 262,144 + MTP6 用池 5,342,000,000 **能启动**（KV 266,394 tokens，21.95 GiB/卡），
@@ -1405,7 +1401,7 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
   位置都生效的常数注意力缩放（≈1.14×），在原生窗口内是纯精度损失。因此本分支把 ≤256K 的 profile
   （256K 生产 / 256K offload / 128K offload / 225K fp16 / 基础路线）改为跑同目录的
   `Qwen3.8-27B-AWQ-INT4`（default rope；两个目录权重相同，只差 config 的 `rope_parameters`），
-  **只有 >262,144 的 500K 三档保留 `-yarn512k`**。基础路线同时改为推导 `Qwen3.8-27B-FP8`
+  **只有 >262,144 的 500K 两档保留 `-yarn512k`**。基础路线同时改为推导 `Qwen3.8-27B-FP8`
   （它本就传 `--quantization fp8`，与 .env 的 AWQ 路径不一致）。非 YaRN 的 head8bit 变体
   `models/Qwen3.8-27B-AWQ-INT4-head8bit` 已按同一软链方式补齐（config 取 default rope、
   其余与 `-yarn512k-head8bit` 同源）。
@@ -1442,8 +1438,8 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
    磁盘层写满的行为已在 §5.4 实测，字节上限 + LRU 淘汰已在 §5.5 实现并实测。
 2. 磁盘层预算的**长稳**：多天运行下 mtime 作为 recency 的退化（例如备份/rsync 改写 mtime）
    尚未验证。
-3. **500K 三档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
-   （冷启 → 重发 → 跨会话换出/恢复），并把 `RAMx2` 的 `/dev/shm` remount 纳入装机清单。
+3. **500K 两档的端到端**（§5.6）：内存到位后在 64 GB 主机上各跑一次
+   （冷启 → 重发 → 跨会话换出/恢复）。
 
 ---
 
@@ -1489,7 +1485,7 @@ git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <
 | `v1/kv_offload/tiering/fs/manager.py` | `backpressure_detector` + `_job_block_counts`（#50045） | `max_bytes`/`evict_retries` + `_store_batch`/quota | 并集：#50045 进来，字节预算+LRU 保留 |
 | `v1/kv_offload/cpu/gpu_worker.py`（两笔各一次） | 上游已重写 | 粘性错误修复 | 丢弃我们的两笔（被取代） |
 
-**验证**（256K profile + MTP n=6 + `--head8bit` + fp8 KV）：
+**验证**（256K profile + MTP n=6 + head8bit + fp8 KV）：
 
 - import 冒烟通过；163 笔里的 C++ 改动只涉及 CPU 算子与 `libtorch_stable`/sm100，**现有 5 个 `.so`
   未出现 ABI 断**。日志里的 `Failed to import the DeepSelect extension (vllm._deepselect_C)` **与本次
@@ -1522,4 +1518,4 @@ git branch -f <生产线分支> tmp-sync && git push --force-with-lease aiakos <
 
 - 数据：`experiments/ab_{old,new}6.json`（配对）、`ab_rebased.json`、`bench_{old,new}6.out`。
 - 尚未覆盖：settle 后还没跑**全量档位验证**（各 profile 的 KV 池核对、offload 套件、长稳），
-  以及 500K 三档端到端（仍受 64 GB 内存阻塞，§8）。
+  以及 500K 两档端到端（仍受 64 GB 内存阻塞，§8）。
