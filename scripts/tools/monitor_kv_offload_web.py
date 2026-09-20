@@ -9,14 +9,14 @@ identical either way, so this imports the collector instead of duplicating it an
 serves one live page over HTTP.
 
 Usage:
-  monitor_kv_offload_web.py                        # http://127.0.0.1:8199
+  monitor_kv_offload_web.py                        # http://127.0.0.1:8100
   monitor_kv_offload_web.py --port 9000 -d 2
   monitor_kv_offload_web.py --vllm-port 8001
   monitor_kv_offload_web.py --host 0.0.0.0         # LAN, no authentication
   monitor_kv_offload_web.py --start                # background; --stop to end it
   monitor_kv_offload_web.py --status               # pid / liveness / /healthz
   monitor_kv_offload_web.py --stop                 # SIGTERM the panel on --port
-  curl -s localhost:8199/api/snapshot | python3 -m json.tool
+  curl -s localhost:8100/api/snapshot | python3 -m json.tool
 
 --start forks into the background (``setsid`` plus stdout/stderr redirection),
 writes ``~/.cache/kv-offload-panel/panel-<port>.pid`` and appends stdout/stderr
@@ -76,9 +76,10 @@ from monitor_kv_offload import (  # noqa: E402
 # --------------------------------------------------------------------------
 
 # The panel serves one port per instance, so state is keyed by that port: two
-# panels (8199, 9000) coexist and --stop targets exactly one. Kept outside the
+# panels (8100, 9000) coexist and --stop targets exactly one. Kept outside the
 # repository so the daemon leaves no tracked files behind.
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "kv-offload-panel")
+DEFAULT_PORT = 8100
 
 
 def _state_paths(port: int) -> tuple[str, str]:
@@ -107,6 +108,25 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _argv_port(argv: list[str]) -> int:
+    """The serving port an argv implies, mirroring argparse's own default.
+
+    A panel started without --port gets DEFAULT_PORT, so the guard must accept
+    that too -- requiring a literal ``--port`` in argv would make `--stop` fail
+    for every default-port instance. Both ``--port N`` and ``--port=N`` count.
+    """
+    port = DEFAULT_PORT
+    for index, token in enumerate(argv):
+        value = None
+        if token == "--port" and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif token.startswith("--port="):
+            value = token.split("=", 1)[1]
+        if value is not None and value.lstrip("-").isdigit():
+            port = int(value)
+    return port
+
+
 def _pid_is_ours(pid: int, port: int) -> bool:
     """Refuse a stale pidfile: the pid must be this script serving this port.
 
@@ -125,11 +145,7 @@ def _pid_is_ours(pid: int, port: int) -> bool:
     me = os.path.basename(os.path.abspath(__file__))
     if not any(os.path.basename(tok) == me for tok in argv[1:]):
         return False
-    return any(
-        tok == "--port" and argv[i + 1] == str(port)
-        for i, tok in enumerate(argv)
-        if i + 1 < len(argv)
-    )
+    return _argv_port(argv) == port
 
 
 def stop_panel(port: int) -> int:
@@ -900,9 +916,14 @@ def self_test() -> int:
         ("degraded_note", bool(empty["note"]) and empty["tables"] == []),
         ("page_self_contained", "http://" not in PAGE and "https://" not in PAGE
          and 'fetch("/api/view"' in PAGE),
-        ("state_paths", _state_paths(8199)[0].endswith("panel-8199.pid")
-         and _state_paths(8199)[1].endswith("panel-8199.log")),
+        ("state_paths", _state_paths(8100)[0].endswith("panel-8100.pid")
+         and _state_paths(8100)[1].endswith("panel-8100.log")),
         ("pidfile_missing", _read_pid(os.path.join(STATE_DIR, "does-not-exist.pid")) is None),
+        # --stop must recognise an instance started with the default port, where
+        # argv carries no --port at all; both flag spellings count.
+        ("argv_port_default", _argv_port(["python3", "monitor_kv_offload_web.py"]) == DEFAULT_PORT),
+        ("argv_port_split", _argv_port(["python3", "x.py", "--port", "9000"]) == 9000),
+        ("argv_port_equals", _argv_port(["python3", "x.py", "--port=9001"]) == 9001),
     ]
     ok = True
     for name, good in checks:
@@ -964,7 +985,8 @@ def main() -> int:
         epilog=__doc__,
     )
     ap.add_argument("--host", default="127.0.0.1", help="bind address (default localhost)")
-    ap.add_argument("--port", type=int, default=8199, help="serving port (default 8199)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help=f"serving port (default {DEFAULT_PORT})")
     ap.add_argument("--vllm-port", type=int, default=8000, help="vLLM port to observe")
     ap.add_argument("--vllm-url", default=None, help="vLLM base url (overrides port)")
     ap.add_argument("--pid", type=int, default=None, help="engine pid (default: by port)")

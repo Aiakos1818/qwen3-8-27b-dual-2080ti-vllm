@@ -447,7 +447,7 @@ python3 scripts/tools/monitor_kv_offload.py --no-chunks --log 'logs/server_128k_
 **不引用任何外部资源**（离线主机可用）：
 
 ~~~bash
-python3 scripts/tools/monitor_kv_offload_web.py                   # http://127.0.0.1:8199/
+python3 scripts/tools/monitor_kv_offload_web.py                   # http://127.0.0.1:8100/
 python3 scripts/tools/monitor_kv_offload_web.py --port 9000 -d 2
 python3 scripts/tools/monitor_kv_offload_web.py --vllm-port 8001 --log 'logs/server_128k_*.log'
 python3 scripts/tools/monitor_kv_offload_web.py --host 0.0.0.0     # 局域网（无鉴权，慎用）
@@ -460,7 +460,7 @@ python3 scripts/tools/monitor_kv_offload_web.py --self-test
 - **后台运行**：`--start` 先 `fork` 再 `setsid`（在采样线程和 HTTP server 创建**之前**，避免
   fork 出半初始化的锁），父进程等子进程写好 pid 后退出并打印 `started (pid N) log ...`；子进程
   把 stdout/stderr 追加到日志、stdin 接 `/dev/null`。状态按**服务端口**区分：pidfile
-  `~/.cache/kv-offload-panel/panel-<port>.pid`、日志 `panel-<port>.log`，因此 8199 与 9000 两个面板
+  `~/.cache/kv-offload-panel/panel-<port>.pid`、日志 `panel-<port>.log`，因此 8100 与 9000 两个面板
   可并存，`--stop` 精确命中其一。前台模式（不带 `--start`）同样写 pidfile，`--stop` 对两种模式都有效。
 - **`--stop` 不靠模式匹配**：读 pidfile → SIGTERM → 最多等 10 s → 删 pidfile；发信号前用
   `/proc/<pid>/cmdline` 校验该 pid 确实是"本脚本 + 该 `--port`"，防 pidfile 过期/pid 复用时误杀
@@ -485,7 +485,7 @@ python3 scripts/tools/monitor_kv_offload_web.py --self-test
   实测（500K 档、单请求）：live **54.0 tok/s**（4 s 窗口 216 tok），独立测量 56.2 tok/s，
   历史均值 46.6 tok/s（16 请求 / 64.4 s），MTP 接受率 68.1% → ≈3.04 tok/step。
 - 默认只绑 `127.0.0.1`（payload 含本机路径）；远端用 SSH 隧道
-  `ssh -L 8199:127.0.0.1:8199 <host>`。`--host 0.0.0.0` 无鉴权，启动时会打印警告。
+  `ssh -L 8100:127.0.0.1:8100 <host>`。`--host 0.0.0.0` 无鉴权，启动时会打印警告。
 - 只读（除自己的 pidfile/日志）：只对 vLLM 发 GET，只读 `/proc`、`/dev/shm`、`/proc/meminfo`、
   `nvidia-smi` 与磁盘层文件；唯一的写入是 `~/.cache/kv-offload-panel/` 下的 pidfile 与日志。
 - 实测：`/api/view` 3 条进度条（GPU 0.0% / CPU 0.0% / fs 54.2%）、5 张表、13 行 CONFIG、
