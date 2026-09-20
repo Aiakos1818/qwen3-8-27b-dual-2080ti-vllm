@@ -8,6 +8,10 @@
 # so the FP8 GEMMs are dequantised to FP16 at runtime -- expect this profile to
 # be slower than the AWQ one; its value is fidelity, not throughput.
 #
+# No --head8bit option here: the FP8 checkpoint was never run through
+# scripts/tools/quantize_lm_head.py, so its lm_head stays bf16. The int8-head
+# variants (and the switch) exist only for the AWQ checkpoints.
+#
 # Memory: measured on this host, FP8 weights leave ~6.4 GiB/GPU free after
 # loading, and fp8_e4m3 KV costs ~16.8 KB/token/GPU without MTP. A 262,144
 # request therefore needs >= 4,831,346,688 (kv_pool_sizing.py); 4.9e9 is used

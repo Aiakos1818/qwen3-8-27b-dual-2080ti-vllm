@@ -68,7 +68,8 @@ vLLM `main` 上（vLLM 侧对应分支 `2080ti_dual_qwen38-27B`）：
 - **FP8 权重 256K 档**：`scripts/run_vllm_qwen38_fp8_fp8e4m3_256k.sh`（+ `..._RAMx1_SSDx4.sh`）
   —— 保留发布版 FP8 权重的高精度对照档（AWQ 档是 ~4-bit），池 286,249 tokens（4.9e9，实测
   1.09x 满长并发，20.7 GB/卡）。SM75 无 FP8 tensor core，GEMM 反量化走 FP16，**慢于 AWQ**，
-  价值在保真度。FP8 权重下 MTP6 会 OOM，故该档默认关 MTP。
+  价值在保真度。FP8 权重下 MTP6 会 OOM，故该档默认关 MTP。该 checkpoint **未做 head8bit**
+  处理（`lm_head` 仍是 bf16），`--head8bit` 只在 AWQ 档可用。
 - **500K 部署三档**：`..._500k.sh`（无 offload）、`..._500k_RAMx2.sh`（CPU 层当 store）、
   `..._500k_RAMx1_SSDx4.sh`（RAM staging + 磁盘 LRU 环）。
 - **128K 验证档**：`scripts/run_vllm_qwen38_awq_fp8e4m3_128k_RAMx1_SSDx4.sh` —— 128K

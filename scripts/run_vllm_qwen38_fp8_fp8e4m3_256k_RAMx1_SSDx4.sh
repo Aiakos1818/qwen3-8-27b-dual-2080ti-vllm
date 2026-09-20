@@ -22,6 +22,10 @@
 # GPU pool is 4.9e9 (>= 4,831,346,688 needed for 262,144 @ fp8_e4m3, no MTP).
 # MTP6 would need >= 5,341,052,928 and was measured to OOM with FP8 weights.
 #
+# No --head8bit option here: the FP8 checkpoint was never run through
+# scripts/tools/quantize_lm_head.py, so its lm_head stays bf16. The int8-head
+# variants (and the switch) exist only for the AWQ checkpoints.
+#
 # Disk tier: a 4-context ring. Past VLLM_SSD_MAX_BYTES the least recently
 # restored blocks are evicted (LRU by file mtime), so the directory can never
 # fill the partition; the newest four full-length contexts stay restorable, and
