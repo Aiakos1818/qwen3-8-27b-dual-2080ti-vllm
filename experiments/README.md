@@ -93,6 +93,15 @@
 语料 `corpus/` 与原始 npz `raw/` **不入库**（体积大，见 `.gitignore`），可由 `tokenize_corpus.py`
 与 `run_logit_eval.py` 重建。
 
+### §6.21 decode 侧内核 / 投机 A/B
+| 文件 | 说明 |
+|---|---|
+| `run_kernel_ab.sh` | 参数化 launcher：`LINEAR_BACKEND`（auto/humming/triton）、`SPEC_METHOD`（mtp/ngram_gpu）、`RUNNER_V2`、`ENABLE_THINKING` |
+| `kernel_ab_bench.py` | 一次生成、按 `步数=gen−accepted` 折算 ms/verify 步；`--task open/repeat/extract` 或 `--messages-json` 打真实会话 |
+| `oc_session_prompt.py` | 从 opencode SQLite 重建真实会话为 chat 请求（token 预算内从末尾填充、角色交替），供 `kernel_ab_bench.py --messages-json` 使用 |
+
+原始 JSON 与日志不入库，见 `~/Temp/opencode/kernel-ab/`。
+
 ## 数据文件
 
 `*.json` / `*.out` 是各实验的原始测量输出，供 `docs/upstream-branch.md` 引用核对。

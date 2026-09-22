@@ -1484,6 +1484,72 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
 
   ---
 
+  ### 6.21 decode 侧两个新杠杆的实测：主干 W4A16 内核消融（Marlin vs Humming）与 ngram_gpu 投机（2026-09-23）
+
+  **口径**：双 2080 Ti / TP2、`--max-num-seqs 1`、MTP n=6、AWQ-INT4（compressed-tensors WNA16，
+  group 32）+ head int8、fp8_e4m3 KV、FULL+PIECEWISE cudagraph。指标是 **ms/verify 步**：
+  `步数 = generation_tokens − accepted_tokens`（每步产出 `1+接受` 个 token，对 MTP 与 ngram 都成立）；
+  不用稳态 tok/s（温度 1.0 采样噪声）。每点 2~3 run。
+
+  **A. 主干 W4A16 内核：Marlin 仍是最优，Humming 不更快**
+
+  用 `--linear-backend` 强制内核。SM75 上能实现 AWQ（uint4 + zero-point、group 32、fp16 激活）的
+  候选只有 Marlin / TritonW4A16 / Humming；其余被挡：Machete 与 CutlassW4A8 要 sm90，Conch 要 sm80
+  且 group 只认 {-1,128}，AllSpark 无 zero-point，Exllama 的类型表不含带 zp 的 `uint4`。
+  故只测 Humming（head int8 两腿都走 Humming——带 zp 的 uint8 只有它有 kernel；主干是唯一变量）。
+
+  | 上下文 | 主干 Marlin | 主干 Humming | 差 |
+  |---|---:|---:|---:|
+  | 32K ms/步（接受率 ~36%） | **45.02** | 46.17 | **+2.6%** |
+  | 128K ms/步（接受率 ~37%） | **54.76** | 57.51 | **+5.0%** |
+  | 128K ms/token | **16.87** | 17.97 | +6.5% |
+
+  上下文越长差距越大（GEMM 占比升高时暴露的是 Humming 的劣势）。§6.15 里"Humming 带宽效率接近
+  Marlin"只对 int8 head 那一层成立，**不能外推到 int4 主干；主干继续用 Marlin**。
+
+  **B. ngram_gpu 投机：只在"抄上下文"型输出上赢，规划/设计类会腰斩**
+
+  `method: ngram_gpu`（GPU 版 n-gram 投机，torch.compile 张量实现，无需 draft 模型）**不被 V2 runner
+  支持**（`Value error, Model Runner V2 does not yet support: speculative method 'ngram_gpu'`），必须走 V1。
+  因此 MTP 基线也在 V1 下重测，另列 V2 生产数字参照。k=6、`prompt_lookup_max=4,min=2`。
+
+  合成负载（32K、thinking off，三类任务）：
+
+  | 负载 | MTP k6（V2，生产） | MTP k6（V1） | ngram_gpu k6（V1） | ngram/V1 |
+  |---|---:|---:|---:|---:|
+  | open（随机词分析，不抄） | 64.9 | 47.1 | 32.2 | 0.68× |
+  | repeat（逐字复述） | 109.1 | 97.7 | **199.5** | **2.04×** |
+  | extract（抽取引用） | 124.2 | 108.4 | **178.4** | **1.65×** |
+
+  接受率：repeat 100%（k=6 全接受、每步稳出 7 token）、extract 81.6%、open 0.5%。
+  ngram_gpu 的 ms/步反而更低（repeat 35.1 vs MTP V1 52.2，因为没有 draft 前向），
+  **输赢完全由接受率决定**。
+
+  真实会话负载（`experiments/oc_session_prompt.py` 从 opencode SQLite 重建
+  `ses_f3a2d0dc2ffe7MbWIi0Cagvic3`「MiniMax chain v3 脚本支持负面提示」，最近 9 条 ≈ **29.4K token**，
+  末尾是真实请求"设计 skill/chain 工作流方案"，thinking 开）：
+
+  | 方案 | tok/s | ms/步 | token/步 | 接受率 |
+  |---|---:|---:|---:|---:|
+  | MTP k6（V2，生产） | 65.4 | 45.8 | 3.00 | 33.3% |
+  | MTP k6（V1） | 64.1 | 53.5 | 3.43 | 40.0% |
+  | ngram_gpu k6（V1） | 36.1 | 31.5 | 1.14 | **2.3%** |
+
+  **结论**：ngram_gpu 的收益完全取决于输出是否抄上下文——逐字复述 2×、抽取引用 1.65×，而真实的
+  规划/设计类会话只有 2.3% 接受率、**0.55×**。日常会话以新生成（规划/设计/调试/解释）为主，
+  且它强制 V1（对 MTP 比 V2 慢 10~20%/步，§6.18），叠加后更不划算 → **ngram_gpu 不采纳**；
+  若将来出现高比例的"文档/代码原样搬"型流量再单独评估。
+
+  **附带工具修复**：`scripts/tools/wait_server.sh` 原先只匹配 engine/worker 类崩溃；配置校验失败
+  （pydantic `ValidationError` / `Value error, ... not support`，发生在建 engine 之前、进程直接退出）
+  会一直等到超时。已补这组致命模式，并加可选第 4 参数 `launcher_pid`（进程已退出即判失败）。
+
+  **复现**：`experiments/run_kernel_ab.sh`（参数化 launcher：`LINEAR_BACKEND` / `SPEC_METHOD` /
+  `RUNNER_V2` / `ENABLE_THINKING`）、`experiments/kernel_ab_bench.py`（ms/步）、
+  `experiments/oc_session_prompt.py`（真实会话 → chat 请求）。
+
+  ---
+
 ## 7. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |
