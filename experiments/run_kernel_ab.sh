@@ -9,9 +9,14 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -P "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+# .env sets MODEL_PATH unconditionally; honour an explicit override.
+MODEL_PATH_IN="${MODEL_PATH:-}"
 if [ -f "$REPO_ROOT/.env" ]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
+fi
+if [ -n "$MODEL_PATH_IN" ]; then
+  MODEL_PATH="$MODEL_PATH_IN"
 fi
 
 : "${MODEL_PATH:?set MODEL_PATH in .env}"
@@ -33,11 +38,15 @@ fi
 : "${PROMPT_LOOKUP_MAX:=4}"
 : "${ENABLE_THINKING:=1}"
 
+: "${HEAD8BIT:=1}"
+
 EXTRA_LD_LIBRARY_PATH=""
-case "$MODEL_PATH" in
-  *-head8bit) ;;
-  *) MODEL_PATH="$MODEL_PATH-head8bit" ;;
-esac
+if [ "$HEAD8BIT" = 1 ]; then
+  case "$MODEL_PATH" in
+    *-head8bit) ;;
+    *) MODEL_PATH="$MODEL_PATH-head8bit" ;;
+  esac
+fi
 EXTRA_LD_LIBRARY_PATH=$(
   ls -d "$(dirname "$(dirname "$VLLM_PYTHON")")"/lib/python*/site-packages/nvidia/cu13/lib 2>/dev/null | head -1
 )

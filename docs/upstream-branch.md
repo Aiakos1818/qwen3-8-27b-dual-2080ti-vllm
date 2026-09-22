@@ -1550,6 +1550,46 @@ float16`、`SPEC_NUM_TOKENS=6`、`MAX_MODEL_LEN=225280`，KV 预算仍 9.6e9）�
 
   ---
 
+  ### 6.22 重训 MTP 头跨量化目标不迁移：接受率 A/B（2026-09-23）
+
+  **动机**：§6.21 把主干内核与投机方法测完后，社区出现"重训 MTP 头"这条路
+  （`rwmacy/qwen3.8-27b-mtp-head-v8-b70` 为 Qwen3.8-27B-FP8、`xkm/...-mtp-head-retrained` 为
+  bf16 target，均声称比 stock 头 +5~7%）。本机是 AWQ-INT4，直接拿来测接受率。
+
+  **方法**：下载 `rwmacy` 的 `mtp-bf16.safetensors`（15 张量，与 stock **同名/同形状/同为 BF16**）。
+  构造变体目录 `models/Qwen3.8-27B-AWQ-INT4-yarn512k-head8bit-mtpv8`：只重写含 `mtp.*` 的
+  `model-00005`（599 张量里替换 15 个），int8 lm_head（shard1）、主干、config、index 全部软链——
+  **唯一变量是 MTP 头**。为让接受率可比，改用**贪心**（`--temp 0`）：spec decoding 精确，两腿的
+  target token 流相同；32K、同 prompt/task/seed，k 由启动时固定（`SPEC_NUM_TOKENS`）。
+
+  **结果（贪心接受率）**：
+
+  | k | 负载 | stock 头 | 重训头 | Δ |
+  |---:|---|---:|---:|---:|
+  | 3 | open | 53.4% | 53.4% | +0.0 |
+  | 3 | repeat | **91.7%** | 86.8% | −4.9 |
+  | 3 | extract | 93.9% | 93.0% | −0.9 |
+  | 6 | open | 31.5% | 31.1% | −0.4 |
+  | 6 | repeat | **67.7%** | 58.6% | **−9.1** |
+  | 6 | extract | 77.7% | 73.4% | −4.3 |
+
+  tok/s 同向（k=6 repeat 108.0 → 96.3）。
+
+  **结论**：该头在 **FP8 target** 的 hidden states 上 warm-start fine-tune，其 +5~7% 只在匹配
+  target 上成立；换到 AWQ-INT4 后 hidden 分布偏移把收益吃光还倒亏——与 §6.17 DFlash2 同一条教训：
+  **draft/头不能跨量化目标迁移**。k=3（其训练区间 `ttt_length=4`）基本打平，k=6 外推到训练深度
+  之外退化更明显。**不采纳**。
+
+  **自训头的预期收益（评估后放弃）**：若在 AWQ-INT4 target 上按同一 recipe 自采 hidden、重训，
+  按公开增量（接受率 +3~4 点）与我们实测的传导式 `tokens/step = 1 + k·acc`（`ms/step` 与接受率
+  基本无关）估算：k=6 开放生成 ≈+7%、抄写型 ≈+4%，**典型 +3~5% 端到端 decode**（保守 +1~4%，
+  悲观 0）；成本约 1~2 天工程量。收益是个位数、且只影响单并发 decode，**判定不值得，放弃该路线**。
+
+  **复现**：`experiments/run_kernel_ab.sh`（`MODEL_PATH_IN` 覆盖 `.env` 的模型路径 + `HEAD8BIT=0`
+  只换 MTP 不换 lm_head）、`experiments/kernel_ab_bench.py --temp 0`。变体目录与下载头均为一次性产物，已清理。
+
+  ---
+
 ## 7. 已知问题与注意事项
 
 | 问题 | 说明 / 处置 |

@@ -60,7 +60,9 @@ def build_prompt(task, rng, words, seed):
     )
 
 
-def run(url, model, key, words, max_tokens, nspec, seed, task="open", messages=None):
+def run(
+    url, model, key, words, max_tokens, nspec, seed, task="open", messages=None, temp=0.6
+):
     if messages is None:
         rng = random.Random(seed)
         messages = [{"role": "user", "content": build_prompt(task, rng, words, seed)}]
@@ -69,7 +71,7 @@ def run(url, model, key, words, max_tokens, nspec, seed, task="open", messages=N
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.6,
+            "temperature": temp,
             "top_p": 0.95,
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -166,6 +168,13 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--nspec", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument(
+        "--temp",
+        type=float,
+        default=0.6,
+        help="0 = greedy. Use greedy for head/kernel A/B: the target token stream "
+        "is then identical across legs, so acceptance is comparable.",
+    )
     ap.add_argument("--task", default="open", choices=["open", "repeat", "extract"])
     ap.add_argument(
         "--messages-json",
@@ -192,6 +201,7 @@ def main():
         a.seed,
         task,
         messages,
+        a.temp,
     )
     if m is None:
         print(f"prompt_tokens={p}  generated={gen}  (no decode samples)")

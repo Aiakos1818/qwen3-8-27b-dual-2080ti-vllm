@@ -102,6 +102,14 @@
 
 原始 JSON 与日志不入库，见 `~/Temp/opencode/kernel-ab/`。
 
+### §6.22 重训 MTP 头跨量化目标 A/B
+| 文件 | 说明 |
+|---|---|
+| `run_kernel_ab.sh` | 复用 §6.21 launcher：`MODEL_PATH_IN` 覆盖 `.env` 的模型路径、`HEAD8BIT=0` 只换 MTP 而不换 int8 lm_head |
+| `kernel_ab_bench.py` | 复用；新增 `--temp 0`（贪心）——换头/换内核的接受率 A/B 必须贪心，否则两腿 target token 流不同、接受率不可比 |
+
+可变体模型目录与下载的重训头为一次性产物，不入库、已清理。
+
 ## 数据文件
 
 `*.json` / `*.out` 是各实验的原始测量输出，供 `docs/upstream-branch.md` 引用核对。
