@@ -41,6 +41,7 @@ unauthenticated, so an SSH tunnel is the better way to reach it remotely.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import signal
@@ -245,6 +246,52 @@ def _daemonize(port: int) -> None:
 # --------------------------------------------------------------------------
 
 
+# How many samples the timeline keeps. At the default 5 s tick this is a 20
+# minute window; the browser redraws the whole buffer each refresh, so the cost
+# stays flat as history grows.
+HISTORY_POINTS = 240
+
+
+def history_point(metrics, prev, cfg, interval, elapsed):
+    """One timeline row, or None while /metrics is unreachable.
+
+    Levels come from the current scrape; rates are counter deltas over one
+    interval, so the first sample (no ``prev``) carries levels only. Keeping the
+    shape identical to ``build_view`` means the curves and the tables cannot
+    disagree about what "decode tok/s" means.
+    """
+    if metrics is None:
+        return None
+
+    def level(name, **labels):
+        return metrics.get(name, **labels)
+
+    def rate(name, **labels):
+        if prev is None:
+            return None
+        now = metrics.counter(name, **labels)
+        before = prev.counter(name, **labels)
+        if now is None or before is None:
+            return None
+        return max(now - before, 0.0) / interval
+
+    fs_used = level("vllm:kv_offload_tiering_fs_used_bytes")
+    return {
+        "t": round(elapsed, 1),
+        "gen": rate("vllm:generation_tokens_total"),
+        "prompt": rate("vllm:prompt_tokens_total"),
+        "gpu": level("vllm:kv_cache_usage_perc"),
+        "cpu": level("vllm:kv_offload_cpu_cache_usage_perc"),
+        "fs": (fs_used / cfg.fs_max_bytes)
+        if (fs_used is not None and cfg.fs_max_bytes)
+        else None,
+        "store": rate("vllm:kv_offload_total_bytes", transfer_type="GPU_to_CPU"),
+        "load": rate("vllm:kv_offload_total_bytes", transfer_type="CPU_to_GPU"),
+        "running": level("vllm:num_requests_running"),
+        "waiting": level("vllm:num_requests_waiting"),
+    }
+
+
 def _chunk_count(nbytes: int | None, cfg) -> str:
     if not nbytes or not cfg.chunk_bytes:
         return "?"
@@ -254,7 +301,8 @@ def _chunk_count(nbytes: int | None, cfg) -> str:
     return f"{count:,.0f} chunks"
 
 
-def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick, updated):
+def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick, updated,
+               history=None):
     """Everything the page needs, pre-formatted (so the JS stays dumb)."""
 
     def counter(name, **labels):
@@ -585,6 +633,7 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         "config": [(str(k), str(v)) for k, v in config],
         "bars": bars,
         "tables": tables,
+        "history": list(history or []),
         "chunks": chunks,
         "log": log_text,
         "footer": (
@@ -611,6 +660,9 @@ class Sampler:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.prev: Metrics | None = None
+        # Written only by the sampling thread and copied into each view, so the
+        # HTTP threads never observe a half-updated buffer.
+        self.history: deque = deque(maxlen=HISTORY_POINTS)
 
     def sample(self) -> None:
         args = self.args
@@ -625,6 +677,11 @@ class Sampler:
         shm = shm_stats()
         health = log_health(args.log)
         self.tick += 1
+        point = history_point(
+            metrics, self.prev, cfg, args.interval, time.time() - self.started
+        )
+        if point is not None:
+            self.history.append(point)
         snapshot = {
             "_tick": self.tick,
             "_elapsed": round(time.time() - self.started, 2),
@@ -663,6 +720,7 @@ class Sampler:
             args.interval,
             self.tick,
             time.time(),
+            history=self.history,
         )
         with self.lock:
             self.snapshot, self.view = snapshot, view
@@ -736,6 +794,13 @@ td.v { text-align:right; white-space:pre-wrap; word-break:break-word; }
 .scroll td { font-size:12px; color:var(--dim); }
 pre { margin:0; white-space:pre-wrap; word-break:break-all; color:var(--dim); }
 footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
+#charts { grid-column:1/-1; }
+.chart { margin-top:8px; }
+.chart-head { display:flex; justify-content:space-between; gap:14px;
+              color:var(--dim); font-size:11px; }
+.chart-live { text-align:right; white-space:nowrap; overflow:hidden; }
+.chart canvas { display:block; width:100%; height:96px; margin-top:4px;
+                background:#0d1014; border:1px solid var(--line); border-radius:4px; }
 @media (max-width:720px) { main { grid-template-columns:1fr; } }
 </style>
 </head>
@@ -754,12 +819,18 @@ footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
   <section><h2>Chunks on disk</h2><div class="bar-sub" id="chunks-summary">…</div>
     <div class="scroll"><table id="chunks"></table></div></section>
   <section><h2>Log</h2><pre id="log">…</pre></section>
+  <section id="charts"><h2>Timeline</h2>
+    <div class="chart"><div class="chart-head"><span>Throughput (tok/s)</span><span class="chart-live" id="legend-throughput"></span></div><canvas id="chart-throughput"></canvas></div>
+    <div class="chart"><div class="chart-head"><span>Cache occupancy</span><span class="chart-live" id="legend-cache"></span></div><canvas id="chart-cache"></canvas></div>
+    <div class="chart"><div class="chart-head"><span>Offload transfer (B/s)</span><span class="chart-live" id="legend-offload"></span></div><canvas id="chart-offload"></canvas></div>
+    <div class="chart"><div class="chart-head"><span>Requests</span><span class="chart-live" id="legend-requests"></span></div><canvas id="chart-requests"></canvas></div>
+  </section>
 </main>
 <footer id="footer"></footer>
 <script>
 "use strict";
 const el = (id) => document.getElementById(id);
-let paused = false, period = 5000;
+let paused = false, period = 5000, lastHistory = [];
 
 const esc = (s) => String(s ?? "?").replace(/[&<>]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -775,6 +846,98 @@ function barHtml(b) {
          `<span>${frac === null ? "?" : (100 * frac).toFixed(1) + "%"}</span></div>` +
          `<div class="bar ${cls}"><i style="width:${width}%"></i></div>` +
          `<div class="bar-sub">${esc(b.text)}</div>`;
+}
+
+const CHARTS = [
+  { id: "chart-throughput", legend: "legend-throughput", percent: false,
+    series: [{ key: "gen", name: "decode", color: "#5aa9e6" },
+             { key: "prompt", name: "prefill", color: "#5fb37a" }] },
+  { id: "chart-cache", legend: "legend-cache", percent: true,
+    series: [{ key: "gpu", name: "GPU KV", color: "#5aa9e6" },
+             { key: "cpu", name: "CPU tier", color: "#d9a441" },
+             { key: "fs", name: "fs tier", color: "#c678dd" }] },
+  { id: "chart-offload", legend: "legend-offload", percent: false,
+    series: [{ key: "store", name: "GPU→CPU", color: "#5aa9e6" },
+             { key: "load", name: "CPU→GPU", color: "#5fb37a" }] },
+  { id: "chart-requests", legend: "legend-requests", percent: false,
+    series: [{ key: "running", name: "running", color: "#5fb37a" },
+             { key: "waiting", name: "waiting", color: "#d96a5f" }] },
+];
+
+function valFmt(v, percent) {
+  if (v === null || v === undefined) return "—";
+  if (percent) return (100 * v).toFixed(0) + "%";
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(1) + "G";
+  if (a >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  return v.toFixed(1);
+}
+
+// Hand-drawn sparkline: one canvas per chart, x is sample index, nulls break
+// the line so a stalled scrape shows a gap instead of a fake straight edge.
+function drawChart(chart, history) {
+  const cv = el(chart.id);
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 300, h = cv.clientHeight || 96;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const padT = 6, padB = 6, padL = 2, padR = 2;
+  const iw = Math.max(1, w - padL - padR), ih = Math.max(1, h - padT - padB);
+  let max = chart.percent ? 1 : 0;
+  if (!chart.percent) {
+    for (const s of chart.series)
+      for (const p of history) {
+        const v = p[s.key];
+        if (v !== null && v !== undefined) max = Math.max(max, v);
+      }
+  }
+  if (!(max > 0)) max = 1;
+
+  ctx.strokeStyle = "#272d38"; ctx.lineWidth = 1;
+  for (let g = 0; g <= 2; g++) {
+    const y = Math.round(padT + ih * g / 2) + 0.5;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + iw, y); ctx.stroke();
+  }
+
+  const n = history.length;
+  const xAt = (i) => padL + (n <= 1 ? 0 : iw * i / (n - 1));
+  const yAt = (v) => padT + ih * (1 - Math.min(Math.max(v, 0), max) / max);
+  for (const s of chart.series) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < n; i++) {
+      const v = history[i][s.key];
+      if (v === null || v === undefined) { pen = false; continue; }
+      const x = xAt(i), y = yAt(v);
+      if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+    }
+    ctx.stroke();
+  }
+
+  ctx.font = "10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+  ctx.fillStyle = "#8b95a5"; ctx.textAlign = "right"; ctx.textBaseline = "top";
+  ctx.fillText("max " + valFmt(max, chart.percent), padL + iw, padT);
+
+  const legend = el(chart.legend);
+  if (legend) legend.innerHTML = chart.series.map((s) => {
+    let last;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const v = history[i][s.key];
+      if (v !== null && v !== undefined) { last = v; break; }
+    }
+    return `<span style="color:${s.color}">${esc(s.name)} ` +
+           `${esc(valFmt(last, chart.percent))}</span>`;
+  }).join("   ");
+}
+
+function drawCharts(history) {
+  for (const chart of CHARTS) drawChart(chart, history || []);
 }
 
 async function tick() {
@@ -800,6 +963,8 @@ async function tick() {
       `<td class="k">${esc(r[2])}</td></tr>`).join("");
     el("log").textContent = v.log;
     el("footer").textContent = v.footer;
+    lastHistory = v.history || [];
+    drawCharts(lastHistory);
   } catch (e) {
     el("note").textContent = "获取失败: " + e.message;
     el("note").className = "err";
@@ -811,6 +976,11 @@ async function tick() {
 el("pause").addEventListener("change", (e) => {
   paused = e.target.checked;
   if (!paused) tick();
+});
+let resizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => drawCharts(lastHistory), 150);
 });
 tick();
 </script>
@@ -891,6 +1061,7 @@ def self_test() -> int:
     def table_of(view_, title):
         return {t["title"]: t for t in view_["tables"]}[title]
 
+    point = history_point(after, before, cfg, 5.0, 12.0)
     rates = dict(table_of(rate_view, "Throughput")["rows"])
     live_row = rates["decode (live, 5s window)"]
     first_live = table_of(view, "Throughput")["rows"][0][1]
@@ -913,6 +1084,12 @@ def self_test() -> int:
         ),
         ("tier_row", table_of(view, "Tiering")["rows"][0][0] == "1:fs"),
         ("chunk_row", view["chunks"]["rows"][0][1] == "1.0 KiB"),
+        # Timeline: same delta the Throughput table reports, levels absent from
+        # the stub scrape stay null, and no scrape means no point at all.
+        ("history_rate", point["gen"] == 40.0),
+        ("history_level", point["gpu"] is None and point["store"] is None),
+        ("history_none", history_point(None, None, cfg, 5.0, 0.0) is None),
+        ("history_default", view["history"] == []),
         ("degraded_note", bool(empty["note"]) and empty["tables"] == []),
         ("page_self_contained", "http://" not in PAGE and "https://" not in PAGE
          and 'fetch("/api/view"' in PAGE),
