@@ -3,7 +3,7 @@
 
 The terminal monitor prints text frames: ideal for --once, --json, --append and
 for grepping, but a character grid is a poor surface for *looking* at the state.
-A browser brings mouse wheel, resize and scrolling for free, and cards and bars
+A browser brings mouse wheel, resize and scrolling for free, and cards and charts
 cost nothing to draw. The genuinely hard part -- collecting the numbers -- is
 identical either way, so this imports the collector instead of duplicating it and
 serves one live page over HTTP.
@@ -27,7 +27,7 @@ it runs in the foreground and Ctrl-C ends it -- the pidfile is still written so
 
 Endpoints:
   GET /               the panel (inline CSS/JS, no external resources)
-  GET /api/view       the tables and bars the page renders
+  GET /api/view       the tables and charts the page renders
   GET /api/snapshot   raw sample, same shape as the terminal --json output
   GET /healthz        liveness
 
@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import json
+import math
 import os
 import signal
 import sys
@@ -69,7 +70,6 @@ from monitor_kv_offload import (  # noqa: E402
     ratio_pct,
     scan_chunks,
     shm_stats,
-    throughput,
 )
 
 # --------------------------------------------------------------------------
@@ -302,7 +302,7 @@ def _chunk_count(nbytes: int | None, cfg) -> str:
 
 
 def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick, updated,
-               history=None):
+               history=None, started=None):
     """Everything the page needs, pre-formatted (so the JS stays dumb)."""
 
     def counter(name, **labels):
@@ -316,9 +316,12 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
     def hist(name, **labels):
         return metrics.hist(name, **labels) if metrics is not None else (None, None)
 
+    def hold_pct(x: float | None) -> str:
+        return "?" if x is None or not math.isfinite(x) else f"{100.0 * x:.1f}%"
+
     note = ""
     tables: list[dict] = []
-    bars: list[dict] = []
+    chart_legend: dict = {}
     headline = "decode —"   # stays empty when /metrics is unreachable
 
     if metrics is None:
@@ -377,6 +380,7 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
                 "vllm:num_requests_waiting_by_reason", "reason"
             )
         )
+
         seen = metrics.labels_of("vllm:request_success_total", "finished_reason")
         ordered = [r for r in ("stop", "length", "abort", "error") if r in seen] + [
             r for r in seen if r not in ("stop", "length", "abort", "error")
@@ -392,57 +396,18 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         ext_q = counter("vllm:external_prefix_cache_queries") or 0.0
         prompt_cached = counter("vllm:prompt_tokens_cached") or 0.0
 
-        def transfer(direction: str) -> str:
-            nbytes = counter("vllm:kv_offload_total_bytes", transfer_type=direction)
-            seconds = counter("vllm:kv_offload_total_time", transfer_type=direction)
-            count, total = hist("vllm:kv_offload_size", transfer_type=direction)
-            mean = f"   mean {fmt_bytes(total / count)}" if count else ""
-            return (
-                f"{fmt_bytes(nbytes)} in {seconds or 0:.2f} s"
-                f" ({throughput(nbytes, seconds)})   transfers {fmt_int(count)}{mean}"
-            )
-
         cpu_usage = metrics.get("vllm:kv_offload_cpu_cache_usage_perc")
         cpu_write = metrics.get("vllm:kv_offload_cpu_cache_write_usage_perc")
         cpu_read = metrics.get("vllm:kv_offload_cpu_cache_read_usage_perc")
-
-        bars = [
-            {
-                "label": "GPU KV cache",
-                "frac": metrics.get("vllm:kv_cache_usage_perc"),
-                "text": (
-                    f"{fmt_int((metrics.get('vllm:kv_cache_usage_perc') or 0) * (cfg.pool_tokens or 0))}"
-                    f" / {fmt_int(cfg.pool_tokens)} tok   {fmt_int(cfg.gpu_blocks)} blocks"
-                    f"   prompt cached {fmt_int(prompt_cached)}"
-                ),
-            },
-            {
-                "label": "CPU (primary) tier",
-                "frac": cpu_usage,
-                "text": (
-                    f"{fmt_bytes((cpu_usage or 0) * (cfg.cpu_bytes or 0))}"
-                    f" / {fmt_bytes(cfg.cpu_bytes)}   write-hold {ratio_pct(cpu_write)}"
-                    f"   read-hold {ratio_pct(cpu_read)}"
-                ),
-            },
-        ]
         fs_used = metrics.get("vllm:kv_offload_tiering_fs_used_bytes")
-        if fs_used is not None or cfg.fs_max_bytes:
-            bars.append(
-                {
-                    "label": "fs (disk) tier quota",
-                    "frac": (
-                        fs_used / cfg.fs_max_bytes
-                        if (fs_used and cfg.fs_max_bytes)
-                        else None
-                    ),
-                    "text": (
-                        f"{fmt_bytes(fs_used)} / {fmt_bytes(cfg.fs_max_bytes)}"
-                        f"   files {disk.count} ({fmt_bytes(disk.bytes)})"
-                        f"   evictions {fmt_int(counter('vllm:kv_offload_tiering_fs_evictions') or 0)}"
-                        f"   skipped {fmt_bytes(counter('vllm:kv_offload_tiering_fs_skipped_store_bytes') or 0)}"
-                    ),
-                }
+
+        # The GPU KV chart draws the percentage; the legend carries the absolute
+        # usage a percentage alone does not say. CPU/fs tier usage lives in the
+        # Resources table, not on a chart.
+        if cfg.pool_tokens:
+            chart_legend["gpu"] = (
+                f"{fmt_int((metrics.get('vllm:kv_cache_usage_perc') or 0) * cfg.pool_tokens)}"
+                f" / {fmt_int(cfg.pool_tokens)} tok"
             )
 
         tier_rows = []
@@ -477,11 +442,10 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
             tier_rows = [("—", "还没有 tiering 指标（尚未发生 offload）")]
 
         # Throughput. The engine exports token *counters*, not a rate, so the
-        # live rate is the counter delta over one sampling interval; the first
-        # sample has no previous scrape, and dividing the whole history by the
-        # interval would be nonsense, so it is left empty there.
+        # live rate is the counter delta over one sampling interval (drawn by
+        # the timeline charts); the first sample has no previous scrape, and
+        # dividing the whole history by the interval would be nonsense.
         window_gen = delta("vllm:generation_tokens_total")
-        window_prompt = delta("vllm:prompt_tokens_total")
         live = prev is not None
         gen_count, gen_sum = hist("vllm:request_generation_tokens")
         _, decode_sum = hist("vllm:request_decode_time_seconds")
@@ -493,16 +457,6 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
             return f"{value:,.1f} {suffix}" if value is not None else "—"
 
         throughput_rows = [
-            (
-                f"decode (live, {interval:g}s window)",
-                f"{rate(window_gen / interval if live else None)}"
-                f"   {fmt_int(window_gen) if live else '—'} tok in window",
-            ),
-            (
-                f"prefill (live, {interval:g}s window)",
-                f"{rate(window_prompt / interval if live else None)}"
-                f"   {fmt_int(window_prompt) if live else '—'} tok in window",
-            ),
             (
                 "decode (finished requests)",
                 f"{rate(avg_decode)}"
@@ -547,9 +501,16 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
             ),
             ("MemAvailable", fmt_bytes(mem_available())),
             (
-                "disk tier dir",
-                f"{fmt_bytes(disk.bytes)}   {disk.count} chunk file(s)"
-                f"   tick {interval:.1f}s",
+                "CPU tier",
+                f"{fmt_bytes((cpu_usage or 0) * (cfg.cpu_bytes or 0))} / {fmt_bytes(cfg.cpu_bytes)}"
+                f"   write-hold {hold_pct(cpu_write)}   read-hold {hold_pct(cpu_read)}",
+            ),
+            (
+                "fs tier",
+                f"{fmt_bytes(fs_used)} / {fmt_bytes(cfg.fs_max_bytes)}"
+                f"   files {disk.count} ({fmt_bytes(disk.bytes)})"
+                f"   evictions {fmt_int(counter('vllm:kv_offload_tiering_fs_evictions') or 0)}"
+                f"   skipped {fmt_bytes(counter('vllm:kv_offload_tiering_fs_skipped_store_bytes') or 0)}",
             ),
         ]
 
@@ -579,13 +540,6 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
                         f"   last {interval:.0f}s: +{fmt_int(delta('vllm:external_prefix_cache_hits'))} hits",
                     ),
                     ("prompt tokens cached", fmt_int(prompt_cached)),
-                ],
-            },
-            {
-                "title": "Transfers (connector)",
-                "rows": [
-                    ("Store GPU→CPU", transfer("GPU_to_CPU")),
-                    ("Load CPU→GPU", transfer("CPU_to_GPU")),
                 ],
             },
             {"title": "Tiering", "rows": tier_rows},
@@ -628,10 +582,11 @@ def build_view(cfg, metrics, prev, gpus, shm, disk, health, url, interval, tick,
         "tick": tick,
         "updated": time.strftime("%H:%M:%S", time.localtime(updated)),
         "interval": interval,
+        "started": started,
         "note": note,
         "headline": headline,
         "config": [(str(k), str(v)) for k, v in config],
-        "bars": bars,
+        "chart_legend": chart_legend,
         "tables": tables,
         "history": list(history or []),
         "chunks": chunks,
@@ -721,6 +676,7 @@ class Sampler:
             self.tick,
             time.time(),
             history=self.history,
+            started=self.started,
         )
         with self.lock:
             self.snapshot, self.view = snapshot, view
@@ -772,7 +728,7 @@ h2 { margin:0 0 8px; font-size:11px; letter-spacing:1px; color:var(--dim);
 .headline { color:var(--accent); font-weight:600; }
 .meta { color:var(--dim); }
 main { display:grid; gap:14px; padding:14px 16px 8px;
-       grid-template-columns:repeat(auto-fit,minmax(360px,1fr));
+       grid-template-columns:1fr;
        align-items:start; }
 section { background:var(--card); border:1px solid var(--line);
           border-radius:8px; padding:12px 14px; }
@@ -780,28 +736,28 @@ table { width:100%; border-collapse:collapse; }
 td { padding:2px 0; vertical-align:top; }
 td.k { color:var(--dim); white-space:nowrap; padding-right:14px; }
 td.v { text-align:right; white-space:pre-wrap; word-break:break-word; }
-.bar-head { display:flex; justify-content:space-between; color:var(--dim);
-            margin-top:8px; }
-.bar { height:8px; margin:4px 0; border:1px solid var(--line); border-radius:4px;
-       background:#0d1014; overflow:hidden; }
-.bar > i { display:block; height:100%; background:var(--accent); width:0; }
-.bar.ok > i { background:var(--ok); } .bar.warn > i { background:var(--warn); }
-.bar.bad > i { background:var(--bad); }
-.bar-sub { color:var(--dim); }
-.err { color:var(--bad); } .stale { color:var(--warn); }
-.scroll { max-height:46vh; overflow:auto; border-top:1px solid var(--line);
-          margin-top:8px; }
-.scroll td { font-size:12px; color:var(--dim); }
-pre { margin:0; white-space:pre-wrap; word-break:break-all; color:var(--dim); }
-footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
-#charts { grid-column:1/-1; }
-.chart { margin-top:8px; }
-.chart-head { display:flex; justify-content:space-between; gap:14px;
-              color:var(--dim); font-size:11px; }
-.chart-live { text-align:right; white-space:nowrap; overflow:hidden; }
-.chart canvas { display:block; width:100%; height:96px; margin-top:4px;
-                background:#0d1014; border:1px solid var(--line); border-radius:4px; }
-@media (max-width:720px) { main { grid-template-columns:1fr; } }
+ .bar-sub { color:var(--dim); }
+ .err { color:var(--bad); } .stale { color:var(--warn); }
+ pre { margin:0; white-space:pre-wrap; word-break:break-all; color:var(--dim); }
+ /* Config halves and the Status card's two columns: side by side on desktop,
+    stacked on phones. */
+ .cfg-2col { display:grid; grid-template-columns:1fr 1fr; gap:0 28px; }
+ .status-2col { display:grid; grid-template-columns:1fr 1fr; gap:0 28px; }
+ .tbl-title { color:var(--dim); font-size:11px; letter-spacing:1px;
+              text-transform:uppercase; margin:12px 0 4px; }
+ .status-half > .tbl-title:first-child { margin-top:0; }
+ @media (max-width:720px) { .cfg-2col, .status-2col { grid-template-columns:1fr; }
+                            .chart-grid { grid-template-columns:1fr; } }
+ footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
+ #charts { grid-column:1/-1; }
+ .chart-grid { display:grid; gap:12px;
+               grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); }
+ .chart-head { display:flex; justify-content:space-between; gap:14px;
+               color:var(--dim); font-size:13px; align-items:baseline; }
+ .chart-head > span:first-child { font-size:14px; color:var(--fg); }
+ .chart-live { text-align:right; white-space:nowrap; overflow:hidden; }
+ .chart canvas { display:block; width:100%; height:150px; margin-top:6px;
+                 background:#0d1014; border:1px solid var(--line); border-radius:4px; }
 </style>
 </head>
 <body>
@@ -814,54 +770,44 @@ footer { padding:6px 16px 24px; color:var(--dim); font-size:12px; }
   <span class="meta" id="note"></span>
 </header>
 <main>
-  <section><h2>Config</h2><table id="config"></table></section>
-  <section><h2>Status</h2><div id="bars"></div><div id="status"></div></section>
-  <section><h2>Chunks on disk</h2><div class="bar-sub" id="chunks-summary">…</div>
-    <div class="scroll"><table id="chunks"></table></div></section>
-  <section><h2>Log</h2><pre id="log">…</pre></section>
-  <section id="charts"><h2>Timeline</h2>
-    <div class="chart"><div class="chart-head"><span>Throughput (tok/s)</span><span class="chart-live" id="legend-throughput"></span></div><canvas id="chart-throughput"></canvas></div>
-    <div class="chart"><div class="chart-head"><span>Cache occupancy</span><span class="chart-live" id="legend-cache"></span></div><canvas id="chart-cache"></canvas></div>
-    <div class="chart"><div class="chart-head"><span>Offload transfer (B/s)</span><span class="chart-live" id="legend-offload"></span></div><canvas id="chart-offload"></canvas></div>
-    <div class="chart"><div class="chart-head"><span>Requests</span><span class="chart-live" id="legend-requests"></span></div><canvas id="chart-requests"></canvas></div>
+  <section id="cfg"><h2>Config</h2><div id="config" class="cfg-2col"></div></section>
+  <section id="status"><h2>Status</h2>
+    <div class="status-2col">
+      <div class="status-half">
+        <div class="tbl-title">Throughput</div><table id="t-throughput"></table>
+        <div class="tbl-title">Requests</div><table id="t-requests"></table>
+        <div class="tbl-title">Cache</div><table id="t-cache"></table>
+      </div>
+      <div class="status-half">
+        <div class="tbl-title">Tiering</div><table id="t-tiering"></table>
+        <div class="tbl-title">Resources</div><table id="t-resources"></table>
+      </div>
+    </div>
   </section>
+  <section id="charts"><h2>Timeline</h2><div class="chart-grid">
+    <div class="chart"><div class="chart-head"><span>Decode (tok/s)</span><span class="chart-live" id="legend-decode"></span></div><canvas id="chart-decode"></canvas></div>
+    <div class="chart"><div class="chart-head"><span>Prefill (tok/s)</span><span class="chart-live" id="legend-prefill"></span></div><canvas id="chart-prefill"></canvas></div>
+    <div class="chart"><div class="chart-head"><span>GPU KV cache</span><span class="chart-live" id="legend-gpu"></span></div><canvas id="chart-gpu"></canvas></div>
+  </div></section>
 </main>
 <footer id="footer"></footer>
 <script>
 "use strict";
 const el = (id) => document.getElementById(id);
-let paused = false, period = 5000, lastHistory = [];
+let paused = false, period = 5000, lastHistory = [], lastStarted = null, lastDetail = {};
 
 const esc = (s) => String(s ?? "?").replace(/[&<>]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 const pairRows = (pairs) => pairs.map(([k, v]) =>
   `<tr><td class="k">${esc(k)}</td><td class="v">${esc(v)}</td></tr>`).join("");
 
-function barHtml(b) {
-  const frac = (b.frac === null || b.frac === undefined) ? null
-             : Math.max(0, Math.min(1, b.frac));
-  const cls = frac === null ? "" : frac > 0.9 ? "bad" : frac > 0.7 ? "warn" : "ok";
-  const width = frac === null ? 0 : (100 * frac).toFixed(2);
-  return `<div class="bar-head"><span>${esc(b.label)}</span>` +
-         `<span>${frac === null ? "?" : (100 * frac).toFixed(1) + "%"}</span></div>` +
-         `<div class="bar ${cls}"><i style="width:${width}%"></i></div>` +
-         `<div class="bar-sub">${esc(b.text)}</div>`;
-}
-
 const CHARTS = [
-  { id: "chart-throughput", legend: "legend-throughput", percent: false,
-    series: [{ key: "gen", name: "decode", color: "#5aa9e6" },
-             { key: "prompt", name: "prefill", color: "#5fb37a" }] },
-  { id: "chart-cache", legend: "legend-cache", percent: true,
-    series: [{ key: "gpu", name: "GPU KV", color: "#5aa9e6" },
-             { key: "cpu", name: "CPU tier", color: "#d9a441" },
-             { key: "fs", name: "fs tier", color: "#c678dd" }] },
-  { id: "chart-offload", legend: "legend-offload", percent: false,
-    series: [{ key: "store", name: "GPU→CPU", color: "#5aa9e6" },
-             { key: "load", name: "CPU→GPU", color: "#5fb37a" }] },
-  { id: "chart-requests", legend: "legend-requests", percent: false,
-    series: [{ key: "running", name: "running", color: "#5fb37a" },
-             { key: "waiting", name: "waiting", color: "#d96a5f" }] },
+  { id: "chart-decode", legend: "legend-decode", percent: false,
+    series: [{ key: "gen", name: "decode", color: "#5aa9e6" }] },
+  { id: "chart-prefill", legend: "legend-prefill", percent: false,
+    series: [{ key: "prompt", name: "prefill", color: "#5fb37a" }] },
+  { id: "chart-gpu", legend: "legend-gpu", percent: true, detail: "gpu",
+    series: [{ key: "gpu", name: "GPU KV", color: "#5aa9e6" }] },
 ];
 
 function valFmt(v, percent) {
@@ -874,19 +820,32 @@ function valFmt(v, percent) {
   return v.toFixed(1);
 }
 
+const pad2 = (n) => String(n).padStart(2, "0");
+const fmtClock = (ms) => {
+  const d = new Date(ms);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+};
+
+// Round the data max up to a clean axis bound (1/2/5 x 10^k).
+function niceMax(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  const m = v / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
 // Hand-drawn sparkline: one canvas per chart, x is sample index, nulls break
 // the line so a stalled scrape shows a gap instead of a fake straight edge.
-function drawChart(chart, history) {
+function drawChart(chart, history, started, detail) {
   const cv = el(chart.id);
   if (!cv) return;
   const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth || 300, h = cv.clientHeight || 96;
+  const w = cv.clientWidth || 600, h = cv.clientHeight || 150;
   cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
   const ctx = cv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  const padT = 6, padB = 6, padL = 2, padR = 2;
+  const padL = 48, padR = 10, padT = 8, padB = 22;
   const iw = Math.max(1, w - padL - padR), ih = Math.max(1, h - padT - padB);
   let max = chart.percent ? 1 : 0;
   if (!chart.percent) {
@@ -897,11 +856,16 @@ function drawChart(chart, history) {
       }
   }
   if (!(max > 0)) max = 1;
+  if (!chart.percent) max = niceMax(max);
 
+  ctx.font = "12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
   ctx.strokeStyle = "#272d38"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#8b95a5"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
   for (let g = 0; g <= 2; g++) {
+    const val = max * (2 - g) / 2;
     const y = Math.round(padT + ih * g / 2) + 0.5;
     ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + iw, y); ctx.stroke();
+    ctx.fillText(valFmt(val, chart.percent), padL - 6, y);
   }
 
   const n = history.length;
@@ -920,24 +884,33 @@ function drawChart(chart, history) {
     ctx.stroke();
   }
 
-  ctx.font = "10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
-  ctx.fillStyle = "#8b95a5"; ctx.textAlign = "right"; ctx.textBaseline = "top";
-  ctx.fillText("max " + valFmt(max, chart.percent), padL + iw, padT);
+  // X axis: wall-clock time of the first and last sample (started = panel epoch).
+  if (started && n > 1) {
+    ctx.fillStyle = "#8b95a5"; ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillText(fmtClock((started + history[0].t) * 1000), padL, padT + ih + 6);
+    ctx.textAlign = "right";
+    ctx.fillText(fmtClock((started + history[n - 1].t) * 1000), padL + iw, padT + ih + 6);
+  }
 
   const legend = el(chart.legend);
-  if (legend) legend.innerHTML = chart.series.map((s) => {
-    let last;
-    for (let i = history.length - 1; i >= 0; i--) {
-      const v = history[i][s.key];
-      if (v !== null && v !== undefined) { last = v; break; }
-    }
-    return `<span style="color:${s.color}">${esc(s.name)} ` +
-           `${esc(valFmt(last, chart.percent))}</span>`;
-  }).join("   ");
+  if (legend) {
+    legend.innerHTML = chart.series.map((s) => {
+      let last;
+      for (let i = history.length - 1; i >= 0; i--) {
+        const v = history[i][s.key];
+        if (v !== null && v !== undefined) { last = v; break; }
+      }
+      return `<span style="color:${s.color}">${esc(s.name)} ` +
+             `${esc(valFmt(last, chart.percent))}</span>`;
+    }).join("   ");
+    if (chart.detail && detail && detail[chart.detail])
+      legend.innerHTML += ` <span>· ${esc(detail[chart.detail])}</span>`;
+  }
 }
 
-function drawCharts(history) {
-  for (const chart of CHARTS) drawChart(chart, history || []);
+function drawCharts(history, started, detail) {
+  for (const chart of CHARTS) drawChart(chart, history || [], started, detail || {});
 }
 
 async function tick() {
@@ -952,19 +925,22 @@ async function tick() {
     el("clock").textContent = `更新 ${v.updated} · tick ${v.tick}`;
     el("note").textContent = v.note || "";
     el("note").className = v.note ? "err" : "meta";
-    el("config").innerHTML = pairRows(v.config);
-    el("bars").innerHTML = v.bars.map(barHtml).join("");
-    el("status").innerHTML = v.tables.map((t) =>
-      `<div class="bar-sub" style="margin-top:8px">${esc(t.title)}</div>` +
-      `<table>${pairRows(t.rows)}</table>`).join("");
-    el("chunks-summary").textContent = v.chunks.summary;
-    el("chunks").innerHTML = v.chunks.rows.map((r) =>
-      `<tr><td class="k">${esc(r[0])}</td><td class="v">${esc(r[1])}</td>` +
-      `<td class="k">${esc(r[2])}</td></tr>`).join("");
-    el("log").textContent = v.log;
-    el("footer").textContent = v.footer;
+    el("config").innerHTML = (() => {
+      const rows = v.config, mid = Math.ceil(rows.length / 2);
+      return `<table>${pairRows(rows.slice(0, mid))}</table>` +
+             `<table>${pairRows(rows.slice(mid))}</table>`;
+    })();
     lastHistory = v.history || [];
-    drawCharts(lastHistory);
+    lastStarted = v.started ?? null;
+    lastDetail = v.chart_legend || {};
+    const TABLE_IDS = { "Throughput":"t-throughput", "Requests":"t-requests",
+                        "Cache":"t-cache", "Tiering":"t-tiering", "Resources":"t-resources" };
+    v.tables.forEach((t) => {
+      const id = TABLE_IDS[t.title];
+      if (id) el(id).innerHTML = pairRows(t.rows);
+    });
+    el("footer").textContent = v.footer;
+    drawCharts(lastHistory, lastStarted, lastDetail);
   } catch (e) {
     el("note").textContent = "获取失败: " + e.message;
     el("note").className = "err";
@@ -980,7 +956,7 @@ el("pause").addEventListener("change", (e) => {
 let resizeTimer;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => drawCharts(lastHistory), 150);
+  resizeTimer = setTimeout(() => drawCharts(lastHistory, lastStarted, lastDetail), 150);
 });
 tick();
 </script>
@@ -1034,6 +1010,7 @@ def self_test() -> int:
         cfg, Metrics(SELF_TEST_METRICS), None, [(0, 1, 2)],
         (10, 20, [(5, 1, "/dev/shm/vllm_offload_e.mmap")]),
         disk, {"path": "log", "errors": 0, "last": "-"}, "http://x", 5.0, 1, now,
+        started=now - 10,
     )
     empty = build_view(
         cfg, None, None, [], (0, 0, []), DiskChunks(), None, "http://x", 5.0, 1, now
@@ -1063,21 +1040,29 @@ def self_test() -> int:
 
     point = history_point(after, before, cfg, 5.0, 12.0)
     rates = dict(table_of(rate_view, "Throughput")["rows"])
-    live_row = rates["decode (live, 5s window)"]
-    first_live = table_of(view, "Throughput")["rows"][0][1]
+    first_row = table_of(view, "Throughput")["rows"][0][1]
+    titles = [t["title"] for t in view["tables"]]
+    res_rows = dict(table_of(view, "Resources")["rows"])
+    req_rows = dict(table_of(view, "Requests")["rows"])
 
     checks = [
         ("config_rows", len(view["config"]) >= 12),
-        ("throughput_live", "40.0 tok/s" in live_row and "200 tok in window" in live_row),
         ("throughput_avg", "50.0 tok/s" in rates["decode (finished requests)"]),
         ("throughput_mtp", "50.0%" in rates["spec decode (MTP)"]),
         ("headline", rate_view["headline"] == "decode 40.0 tok/s"),
         # With no previous scrape there is no window rate to report.
-        ("throughput_first_sample", first_live.startswith("—") and "tok/s" not in first_live),
-        ("bars", [b["label"] for b in view["bars"]] == [
-            "GPU KV cache", "CPU (primary) tier", "fs (disk) tier quota"]),
-        ("gpu_frac", round(view["bars"][0]["frac"], 3) == 0.5),
-        ("tables", len(view["tables"]) == 6),
+        ("throughput_first_sample", first_row.startswith("—") and "tok/s" not in first_row),
+        # No occupancy bars; only the GPU KV chart keeps a legend. CPU/fs tier
+        # usage and request counts live in the tables, not on a chart.
+        ("no_bars", "bars" not in view and "chart_legend" in view),
+        ("chart_legend_gpu", view["chart_legend"].get("gpu") == "500 / 1,000 tok"),
+        ("no_chart_legend_cpu_fs", "cpu" not in view["chart_legend"] and "fs" not in view["chart_legend"]),
+        ("req_running", req_rows.get("running") == "1"),
+        ("req_waiting", req_rows.get("waiting") == "0"),
+        ("cpu_tier_row", res_rows.get("CPU tier", "").startswith("250 B / 1000 B")),
+        ("fs_tier_row", res_rows.get("fs tier", "").startswith("2.0 KiB / 2.0 KiB")),
+        ("no_transfers_table", "Transfers (connector)" not in titles),
+        ("tables", len(view["tables"]) == 5),
         (
             "external_hits",
             "60 / 100" in dict(table_of(view, "Cache")["rows"])["external (offload)"],
@@ -1090,9 +1075,31 @@ def self_test() -> int:
         ("history_level", point["gpu"] is None and point["store"] is None),
         ("history_none", history_point(None, None, cfg, 5.0, 0.0) is None),
         ("history_default", view["history"] == []),
+        ("view_started", view["started"] == now - 10),
         ("degraded_note", bool(empty["note"]) and empty["tables"] == []),
-        ("page_self_contained", "http://" not in PAGE and "https://" not in PAGE
-         and 'fetch("/api/view"' in PAGE),
+        (
+            "page_self_contained",
+            "http://" not in PAGE and "https://" not in PAGE
+            and 'fetch("/api/view"' in PAGE
+            and "chart-decode" in PAGE and "chart-gpu" in PAGE
+            and "chart-cpu" not in PAGE and "chart-fs" not in PAGE
+            and "chart-requests" not in PAGE and "chart-offload" not in PAGE
+            and "drawCharts(lastHistory, lastStarted, lastDetail)" in PAGE,
+        ),
+        # Status is one card again, its five tables in two internal columns
+        # (Throughput/Requests/Cache left, Tiering/Resources right).
+        (
+            "status_single_card",
+            '<h2>Status</h2>' in PAGE and 'id="status"' in PAGE
+            and 'class="status-2col"' in PAGE
+            and all(f'id="t-{name}"' in PAGE for name in
+                    ("throughput", "requests", "cache", "tiering", "resources")),
+        ),
+        # Every card takes a full row; the Log and Chunks cards are removed
+        # for now (the view still carries their data, only the cards are gone).
+        ("full_width_rows",
+            "grid-template-columns:1fr" in PAGE and 'id="log"' not in PAGE
+            and 'id="chunks"' not in PAGE and "chunks-summary" not in PAGE),
         ("state_paths", _state_paths(8100)[0].endswith("panel-8100.pid")
          and _state_paths(8100)[1].endswith("panel-8100.log")),
         ("pidfile_missing", _read_pid(os.path.join(STATE_DIR, "does-not-exist.pid")) is None),
